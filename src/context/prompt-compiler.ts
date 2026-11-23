@@ -1,5 +1,10 @@
 import type { ActiveAmbientEntry, LiveNudgeEntry } from '../beats/beat-engine.js';
-import type { NarrativePacing, ResolvedControlRoomConfig } from '../config/control-room-config.js';
+import type {
+  CustomPromptBlockSpec,
+  NarrativePacing,
+  ResolvedControlRoomConfig,
+  StFormatTemplates,
+} from '../config/control-room-config.js';
 import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import type { ChatMessage } from '../gateway/types.js';
@@ -33,7 +38,27 @@ export interface CardPersonaInput {
   name: string;
   description: string;
   scenario?: string;
+  personality?: string;
   systemPrompt?: string;
+}
+
+/**
+ * Player character persona metadata rendered in the dedicated `[PERSONA]` section.
+ */
+export interface UserPersonaInput {
+  readonly name: string;
+  readonly description: string;
+}
+
+/**
+ * Context accepted by {@link expandPromptMacros} for deterministic macro expansion.
+ */
+export interface PromptMacroContext {
+  readonly state: WorldState;
+  readonly cardPersona: CardPersonaInput;
+  readonly userPersona?: UserPersonaInput | null;
+  readonly config?: ResolvedControlRoomConfig;
+  readonly original?: string;
 }
 
 /**
@@ -51,6 +76,7 @@ export interface CompilePromptInput {
   state: WorldState;
   config: ResolvedControlRoomConfig;
   cardPersona: CardPersonaInput;
+  readonly userPersona?: { readonly name: string; readonly description: string } | null;
   liveNudges?: readonly LiveNudgeEntry[];
   activeAmbient?: readonly ActiveAmbientEntry[];
   loreContents?: ReadonlyMap<string, string> | Readonly<Record<string, string>>;
@@ -92,6 +118,58 @@ const BUILTIN_SECTION_IDS = new Set([
 const CYOA_PROMPT_INSTRUCTION =
   'At the end of your response, provide 2-4 concise, distinct player action choices (CYOA options) grounded in the current scene.';
 
+function mergeDefinedBudgets(
+  target: Partial<SectionTokenBudgets>,
+  source?: Partial<SectionTokenBudgets>
+): void {
+  if (source === undefined || typeof source !== 'object' || source === null) {
+    return;
+  }
+  if (source.system !== undefined) {
+    target.system = source.system;
+  }
+  if (source.card !== undefined) {
+    target.card = source.card;
+  }
+  if (source.state !== undefined) {
+    target.state = source.state;
+  }
+  if (source.combatOutcome !== undefined) {
+    target.combatOutcome = source.combatOutcome;
+  }
+  if (source.plot !== undefined) {
+    target.plot = source.plot;
+  }
+  if (source.world !== undefined) {
+    target.world = source.world;
+  }
+  if (source.totalMaxTokens !== undefined) {
+    target.totalMaxTokens = source.totalMaxTokens;
+  }
+}
+
+function resolveCompilerBudgets(
+  config: ResolvedControlRoomConfig,
+  explicitBudgets?: Partial<SectionTokenBudgets>
+): SectionTokenBudgets {
+  const merged: Partial<SectionTokenBudgets> = {};
+
+  const maxCtx = config.generation?.maxContextTokens;
+  if (typeof maxCtx === 'number' && Number.isFinite(maxCtx) && maxCtx > 0) {
+    const rawMaxTokens = config.generation?.maxTokens;
+    const responseReserve =
+      typeof rawMaxTokens === 'number' && Number.isFinite(rawMaxTokens) && rawMaxTokens >= 0
+        ? rawMaxTokens
+        : 512;
+    merged.totalMaxTokens = Math.max(256, Math.floor(maxCtx) - Math.floor(responseReserve));
+  }
+
+  mergeDefinedBudgets(merged, config.tokenBudgets);
+  mergeDefinedBudgets(merged, explicitBudgets);
+
+  return resolveBudgetsSafe(merged);
+}
+
 function resolveBudgetsSafe(partial?: Partial<SectionTokenBudgets>): SectionTokenBudgets {
   const clampBudget = (value: number | undefined, fallback: number): number => {
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -118,12 +196,156 @@ function resolveBudgetsSafe(partial?: Partial<SectionTokenBudgets>): SectionToke
   return resolved;
 }
 
+function resolveUserMacroName(ctx: PromptMacroContext): string {
+  const personaName =
+    typeof ctx.userPersona?.name === 'string' ? ctx.userPersona.name.trim() : '';
+  if (personaName.length > 0) {
+    return personaName;
+  }
+
+  const charId = ctx.state.player.characterId;
+  if (typeof charId === 'string' && isSafeRecordKey(charId)) {
+    const linkedChar = getOwnSafe(ctx.state.entities.characters, charId);
+    const linkedName = typeof linkedChar?.name === 'string' ? linkedChar.name.trim() : '';
+    if (linkedName.length > 0) {
+      return linkedName;
+    }
+  }
+
+  const playerName =
+    typeof ctx.state.player.name === 'string' ? ctx.state.player.name.trim() : '';
+  if (playerName.length > 0) {
+    return playerName;
+  }
+
+  return 'Player';
+}
+
+const PROMPT_MACRO_PATTERN = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}|<(BOT|USER)>/gi;
+
+/**
+ * Pure, deterministic SillyTavern-compatible macro expander.
+ * Supports case-insensitive `{{char}}`/`<BOT>`, `{{user}}`/`<USER>`, `{{persona}}`,
+ * `{{description}}`, `{{scenario}}`, `{{personality}}`, `{{original}}`, and
+ * `state.clocks`-derived `{{time}}`, `{{date}}`, `{{day}}` without wall-clock access.
+ * Unknown macros are left intact.
+ */
+export function expandPromptMacros(text: string, ctx: PromptMacroContext): string {
+  if (typeof text !== 'string' || text.length === 0) {
+    return '';
+  }
+
+  const charName =
+    typeof ctx.cardPersona?.name === 'string' ? ctx.cardPersona.name.trim() : '';
+  const userName = resolveUserMacroName(ctx);
+  const personaDesc =
+    typeof ctx.userPersona?.description === 'string' ? ctx.userPersona.description.trim() : '';
+  const cardDesc =
+    typeof ctx.cardPersona?.description === 'string' ? ctx.cardPersona.description.trim() : '';
+  const cardScenario =
+    typeof ctx.cardPersona?.scenario === 'string' ? ctx.cardPersona.scenario.trim() : '';
+  const cardPersonality =
+    typeof ctx.cardPersona?.personality === 'string' ? ctx.cardPersona.personality.trim() : '';
+  const originalText = typeof ctx.original === 'string' ? ctx.original : '';
+
+  const clocks = ctx.state.clocks;
+  const clockSlot = typeof clocks?.slot === 'string' ? clocks.slot : '';
+  const clockDay = typeof clocks?.day === 'number' && Number.isFinite(clocks.day) ? clocks.day : 1;
+  const clockDate =
+    typeof clocks?.inGameDate === 'string' && clocks.inGameDate.trim().length > 0
+      ? clocks.inGameDate.trim()
+      : `Day ${clockDay}`;
+
+  return text.replace(
+    PROMPT_MACRO_PATTERN,
+    (match, braceName: string | undefined, angleTag: string | undefined): string => {
+      if (angleTag !== undefined) {
+        const upperTag = angleTag.toUpperCase();
+        if (upperTag === 'BOT') {
+          return charName;
+        }
+        if (upperTag === 'USER') {
+          return userName;
+        }
+        return match;
+      }
+
+      if (braceName === undefined) {
+        return match;
+      }
+
+      switch (braceName.toLowerCase()) {
+        case 'char':
+          return charName;
+        case 'user':
+          return userName;
+        case 'persona':
+          return personaDesc;
+        case 'description':
+          return cardDesc;
+        case 'scenario':
+          return cardScenario;
+        case 'personality':
+          return cardPersonality;
+        case 'original':
+          return originalText;
+        case 'time':
+          return clockSlot;
+        case 'date':
+          return clockDate;
+        case 'day':
+          return String(clockDay);
+        default:
+          return match;
+      }
+    }
+  );
+}
+
 function isSectionUnlocked(config: ResolvedControlRoomConfig, sectionId: string): boolean {
   return (
     isSafeRecordKey(sectionId) &&
     getOwnSafe(config.unlockedPromptSections, sectionId) === true &&
     Object.hasOwn(config.basePrompts, sectionId)
   );
+}
+
+function hasNonEmptyUserPersona(userPersona: UserPersonaInput | null | undefined): boolean {
+  if (userPersona === undefined || userPersona === null) {
+    return false;
+  }
+  const name = typeof userPersona.name === 'string' ? userPersona.name.trim() : '';
+  const description =
+    typeof userPersona.description === 'string' ? userPersona.description.trim() : '';
+  return name.length > 0 || description.length > 0;
+}
+
+function buildUserPersonaSection(
+  userPersona: UserPersonaInput | null | undefined,
+  macroCtx?: PromptMacroContext
+): string {
+  if (userPersona === undefined || userPersona === null) {
+    return '';
+  }
+  const name = typeof userPersona.name === 'string' ? userPersona.name.trim() : '';
+  const rawDescription =
+    typeof userPersona.description === 'string' ? userPersona.description.trim() : '';
+  const description =
+    rawDescription.length > 0 && macroCtx !== undefined
+      ? expandPromptMacros(rawDescription, macroCtx).trim()
+      : rawDescription;
+
+  const lines: string[] = [];
+  if (name.length > 0) {
+    lines.push(`Name: ${name}`);
+  }
+  if (description.length > 0) {
+    lines.push(description);
+  }
+  if (lines.length === 0) {
+    return '';
+  }
+  return `[PERSONA]\n${lines.join('\n')}`;
 }
 
 function buildCoreRefereeSystemPrompt(
@@ -191,19 +413,95 @@ function buildGameSystemRulesSection(
   return `[GAME_SYSTEM_RULES]\n${rules.join('\n')}`;
 }
 
-function buildCardSection(cardPersona: CardPersonaInput): string {
+function buildCardSection(
+  cardPersona: CardPersonaInput,
+  macroCtx?: PromptMacroContext,
+  stFormatTemplates?: StFormatTemplates
+): string {
+  const expandField = (text: string): string => {
+    if (macroCtx === undefined) {
+      return text.trim();
+    }
+    const fieldCtx: PromptMacroContext = {
+      ...macroCtx,
+      cardPersona: {
+        ...macroCtx.cardPersona,
+        description: '',
+        scenario: '',
+        personality: '',
+      },
+    };
+    return expandPromptMacros(text, fieldCtx).trim();
+  };
+
+  const resolvedDescription =
+    cardPersona.description.trim().length > 0 ? expandField(cardPersona.description) : '';
+  const resolvedPersonality =
+    typeof cardPersona.personality === 'string' && cardPersona.personality.trim().length > 0
+      ? expandField(cardPersona.personality)
+      : '';
+  const resolvedScenario =
+    typeof cardPersona.scenario === 'string' && cardPersona.scenario.trim().length > 0
+      ? expandField(cardPersona.scenario)
+      : '';
+  const resolvedSystemPrompt =
+    typeof cardPersona.systemPrompt === 'string' && cardPersona.systemPrompt.trim().length > 0
+      ? expandField(cardPersona.systemPrompt)
+      : '';
+
+  const formatCtx: PromptMacroContext | undefined =
+    macroCtx !== undefined
+      ? {
+          ...macroCtx,
+          cardPersona: {
+            ...cardPersona,
+            description: resolvedDescription,
+            personality: resolvedPersonality,
+            scenario: resolvedScenario,
+            systemPrompt: resolvedSystemPrompt,
+          },
+        }
+      : undefined;
+
   const lines: string[] = [];
   if (cardPersona.name.trim().length > 0) {
     lines.push(`Name: ${cardPersona.name.trim()}`);
   }
-  if (cardPersona.description.trim().length > 0) {
-    lines.push(`Description: ${cardPersona.description.trim()}`);
+  if (resolvedDescription.length > 0) {
+    lines.push(`Description: ${resolvedDescription}`);
   }
-  if (typeof cardPersona.scenario === 'string' && cardPersona.scenario.trim().length > 0) {
-    lines.push(`Scenario: ${cardPersona.scenario.trim()}`);
+  if (resolvedPersonality.length > 0) {
+    const personalityFormat = stFormatTemplates?.personalityFormat;
+    if (
+      typeof personalityFormat === 'string' &&
+      personalityFormat.trim().length > 0 &&
+      formatCtx !== undefined
+    ) {
+      const formatted = expandPromptMacros(personalityFormat, formatCtx).trim();
+      if (formatted.length > 0) {
+        lines.push(formatted);
+      }
+    } else {
+      lines.push(`Personality: ${resolvedPersonality}`);
+    }
   }
-  if (typeof cardPersona.systemPrompt === 'string' && cardPersona.systemPrompt.trim().length > 0) {
-    lines.push(`Card Instructions: ${cardPersona.systemPrompt.trim()}`);
+  if (resolvedScenario.length > 0) {
+    const scenarioFormat = stFormatTemplates?.scenarioFormat;
+    if (
+      typeof scenarioFormat === 'string' &&
+      scenarioFormat.trim().length > 0 &&
+      formatCtx !== undefined
+    ) {
+      const formatted = expandPromptMacros(scenarioFormat, formatCtx).trim();
+      if (formatted.length > 0) {
+        lines.push(formatted);
+      }
+    } else {
+      lines.push(`Scenario: ${resolvedScenario}`);
+    }
+  }
+  if (resolvedSystemPrompt.length > 0) {
+    lines.push(`Card Instructions: ${resolvedSystemPrompt}`);
   }
   if (lines.length === 0) {
     return '';
@@ -316,12 +614,44 @@ function collectInjectedPromptsBySection(
   return { bySection, extraSections };
 }
 
+function getCustomBlockSpec(
+  config: ResolvedControlRoomConfig,
+  sectionId: string
+): CustomPromptBlockSpec | undefined {
+  if (!isSafeRecordKey(sectionId) || config.customPromptBlocks === undefined) {
+    return undefined;
+  }
+  return getOwnSafe(config.customPromptBlocks, sectionId);
+}
+
+function normalizeBlockRole(role: unknown): ChatMessage['role'] {
+  if (role === 'user' || role === 'assistant' || role === 'system') {
+    return role;
+  }
+  return 'system';
+}
+
+function normalizeInjectionDepth(depth: unknown): number {
+  if (typeof depth === 'number' && Number.isFinite(depth) && depth >= 0) {
+    return Math.floor(depth);
+  }
+  return 0;
+}
+
+interface InChatBlockEntry {
+  id: string;
+  role: ChatMessage['role'];
+  depth: number;
+  text: string;
+}
+
 function buildEffectiveSectionOrder(
   baseOrder: readonly string[],
   options: {
     includePlotFallback: boolean;
     includeCyoaExtraSection: boolean;
     extraScriptSections: readonly string[];
+    extraCustomRelativeSections: readonly string[];
     hasTranscript: boolean;
   }
 ): string[] {
@@ -366,6 +696,16 @@ function buildEffectiveSectionOrder(
     insertBeforeAnchor('cyoa', ['transcript_window', 'latest_input']);
   }
 
+  for (const customSection of options.extraCustomRelativeSections) {
+    if (
+      customSection !== 'transcript_window' &&
+      customSection !== 'latest_input' &&
+      !seen.has(customSection)
+    ) {
+      insertBeforeAnchor(customSection, ['transcript_window', 'latest_input']);
+    }
+  }
+
   for (const scriptSection of options.extraScriptSections) {
     if (
       scriptSection !== 'transcript_window' &&
@@ -398,9 +738,11 @@ function appendScriptTexts(baseText: string, additions: readonly string[] | unde
   return `${baseText}\n${extra}`;
 }
 
-function countMergedSystemTokens(
+function countRelativeSectionTokens(
   effectiveOrder: readonly string[],
-  sectionTexts: ReadonlyMap<string, string>
+  sectionTexts: ReadonlyMap<string, string>,
+  config: ResolvedControlRoomConfig,
+  inChatSectionIds: ReadonlySet<string>
 ): number {
   let total = 0;
   let buffer: string[] = [];
@@ -413,17 +755,51 @@ function countMergedSystemTokens(
   };
 
   for (const sectionId of effectiveOrder) {
-    if (sectionId === 'transcript_window' || sectionId === 'latest_input') {
+    if (
+      sectionId === 'transcript_window' ||
+      sectionId === 'latest_input' ||
+      inChatSectionIds.has(sectionId)
+    ) {
       flush();
       continue;
     }
     const text = sectionTexts.get(sectionId);
-    if (text !== undefined && text.trim().length > 0) {
+    if (text === undefined || text.trim().length === 0) {
+      continue;
+    }
+    const spec = getCustomBlockSpec(config, sectionId);
+    const role = spec !== undefined ? normalizeBlockRole(spec.role) : 'system';
+    if (role === 'user' || role === 'assistant') {
+      flush();
+      total += estimateTokens(text);
+    } else {
       buffer.push(text);
     }
   }
   flush();
   return total;
+}
+
+function countTotalFixedTokens(
+  effectiveOrder: readonly string[],
+  sectionTexts: ReadonlyMap<string, string>,
+  inChatBlocks: readonly InChatBlockEntry[],
+  config: ResolvedControlRoomConfig,
+  inChatSectionIds: ReadonlySet<string>
+): number {
+  const relativeTokens = countRelativeSectionTokens(
+    effectiveOrder,
+    sectionTexts,
+    config,
+    inChatSectionIds
+  );
+  let inChatTokens = 0;
+  for (const entry of inChatBlocks) {
+    if (entry.text.trim().length > 0) {
+      inChatTokens += estimateTokens(entry.text);
+    }
+  }
+  return relativeTokens + inChatTokens;
 }
 
 /**
@@ -452,6 +828,22 @@ export function validateCompilePromptInput(
     }
     if (typeof input.cardPersona.description !== 'string') {
       acc.add('cardPersona.description', 'INVALID_TYPE', 'cardPersona.description must be a string');
+    }
+  }
+  if (input.userPersona !== undefined && input.userPersona !== null) {
+    if (typeof input.userPersona !== 'object' || Array.isArray(input.userPersona)) {
+      acc.add('userPersona', 'INVALID_TYPE', 'userPersona must be an object or null');
+    } else {
+      if (typeof input.userPersona.name !== 'string') {
+        acc.add('userPersona.name', 'INVALID_TYPE', 'userPersona.name must be a string');
+      }
+      if (typeof input.userPersona.description !== 'string') {
+        acc.add(
+          'userPersona.description',
+          'INVALID_TYPE',
+          'userPersona.description must be a string'
+        );
+      }
     }
   }
   if (!Array.isArray(input.recentTranscript)) {
@@ -674,9 +1066,12 @@ function renderWorldSection(
 function shedExcessSystemTokens(
   effectiveOrder: readonly string[],
   sectionTexts: Map<string, string>,
+  inChatBlocks: InChatBlockEntry[],
+  config: ResolvedControlRoomConfig,
+  inChatSectionIds: ReadonlySet<string>,
   totalMaxTokens: number,
   latestInputTokens: number
-): { systemTokens: number; shedDroppedCount: number } {
+): { fixedTokens: number; shedDroppedCount: number } {
   const shedPriorityOrder = [
     'world',
     'plot',
@@ -690,33 +1085,73 @@ function shedExcessSystemTokens(
     'system',
   ];
 
-  // Append any custom/script sections so they can also be shed if totalMaxTokens is ultra-tight
+  // Append any custom/script relative sections so they can also be shed if totalMaxTokens is ultra-tight
   const customKeys = effectiveOrder
     .filter(
       (id) =>
         id !== 'transcript_window' &&
         id !== 'latest_input' &&
+        !inChatSectionIds.has(id) &&
         !shedPriorityOrder.includes(id)
     )
     .reverse();
 
-  let systemTokens = countMergedSystemTokens(effectiveOrder, sectionTexts);
-  if (systemTokens + latestInputTokens <= totalMaxTokens) {
-    return { systemTokens, shedDroppedCount: 0 };
+  let fixedTokens = countTotalFixedTokens(
+    effectiveOrder,
+    sectionTexts,
+    inChatBlocks,
+    config,
+    inChatSectionIds
+  );
+  if (fixedTokens + latestInputTokens <= totalMaxTokens) {
+    return { fixedTokens, shedDroppedCount: 0 };
   }
 
-  const allowedSystemTokens = Math.max(0, totalMaxTokens - latestInputTokens);
+  const allowedFixedTokens = Math.max(0, totalMaxTokens - latestInputTokens);
   let shedDroppedCount = 0;
 
+  // Shed in_chat blocks first (lowest priority / most recent injections first)
+  for (let i = inChatBlocks.length - 1; i >= 0; i -= 1) {
+    if (fixedTokens <= allowedFixedTokens) {
+      break;
+    }
+    const entry = inChatBlocks[i];
+    if (entry === undefined || entry.text.trim().length === 0) {
+      continue;
+    }
+    const excess = fixedTokens - allowedFixedTokens;
+    const currentTokens = estimateTokens(entry.text);
+    const targetTokens = Math.max(0, currentTokens - excess);
+    if (targetTokens <= 0) {
+      entry.text = '';
+      shedDroppedCount += 1;
+    } else {
+      const clipped = clipTextToTokenBudget(entry.text, targetTokens);
+      if (clipped.trim().length === 0) {
+        entry.text = '';
+        shedDroppedCount += 1;
+      } else {
+        entry.text = clipped;
+      }
+    }
+    fixedTokens = countTotalFixedTokens(
+      effectiveOrder,
+      sectionTexts,
+      inChatBlocks,
+      config,
+      inChatSectionIds
+    );
+  }
+
   for (const shedKey of [...customKeys, ...shedPriorityOrder]) {
-    if (systemTokens <= allowedSystemTokens) {
+    if (fixedTokens <= allowedFixedTokens) {
       break;
     }
     const existing = sectionTexts.get(shedKey);
     if (existing === undefined) {
       continue;
     }
-    const excess = systemTokens - allowedSystemTokens;
+    const excess = fixedTokens - allowedFixedTokens;
     const currentTokens = estimateTokens(existing);
     const targetTokens = Math.max(0, currentTokens - excess);
     if (targetTokens <= 0) {
@@ -731,10 +1166,16 @@ function shedExcessSystemTokens(
         sectionTexts.set(shedKey, clipped);
       }
     }
-    systemTokens = countMergedSystemTokens(effectiveOrder, sectionTexts);
+    fixedTokens = countTotalFixedTokens(
+      effectiveOrder,
+      sectionTexts,
+      inChatBlocks,
+      config,
+      inChatSectionIds
+    );
   }
 
-  return { systemTokens, shedDroppedCount };
+  return { fixedTokens, shedDroppedCount };
 }
 
 function fitRecentTranscriptWindow(
@@ -771,6 +1212,8 @@ function fitRecentTranscriptWindow(
   };
 }
 
+const ORIGINAL_MACRO_PATTERN = /\{\{\s*original\s*\}\}/i;
+
 /**
  * Compile the narrator LLM prompt payload from WorldState, ResolvedControlRoomConfig,
  * beat nudges/ambient lore, episodic Chronicle memories, script injections, and recent
@@ -778,7 +1221,7 @@ function fitRecentTranscriptWindow(
  */
 export function compileNarratorPrompt(input: CompilePromptInput): CompiledPromptResult {
   const { state, config } = input;
-  const budgets = resolveBudgetsSafe(input.budgets);
+  const budgets = resolveCompilerBudgets(config, input.budgets);
   const effectiveCapabilities = resolveEffectiveCapabilities(
     state.capabilities,
     config.capabilities
@@ -802,36 +1245,124 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
   const includePlotFallback =
     directorNudgeText.length > 0 || hasBeatsNudges || scriptBySection.has('plot');
 
+  const inChatSectionIds = new Set<string>();
+  const customBlockKeysSorted =
+    config.customPromptBlocks !== undefined
+      ? Object.keys(config.customPromptBlocks)
+          .filter(isSafeRecordKey)
+          .sort(compareStringsDeterministic)
+      : [];
+  const extraCustomRelativeSections: string[] = [];
+  for (const blockId of customBlockKeysSorted) {
+    const spec = getCustomBlockSpec(config, blockId);
+    if (spec === undefined) {
+      continue;
+    }
+    if (spec.injectionPosition === 'in_chat') {
+      inChatSectionIds.add(blockId);
+    } else if (getOwnSafe(config.unlockedPromptSections, blockId) !== false) {
+      extraCustomRelativeSections.push(blockId);
+    }
+  }
+
   const effectiveOrder = buildEffectiveSectionOrder(config.syspromptSectionOrder, {
     includePlotFallback,
     includeCyoaExtraSection,
-    extraScriptSections,
+    extraScriptSections: extraScriptSections.filter((id) => !inChatSectionIds.has(id)),
+    extraCustomRelativeSections,
     hasTranscript: input.recentTranscript.length > 0,
   });
 
   const hasCardSlot = effectiveOrder.includes('card');
+  const hasUserPersona = hasNonEmptyUserPersona(input.userPersona);
+  const stFormatTemplates = config.generation?.stFormatTemplates;
+  const baseMacroCtx: PromptMacroContext = {
+    state,
+    cardPersona: input.cardPersona,
+    userPersona: input.userPersona,
+    config,
+  };
+
+  const expandScriptList = (list: readonly string[] | undefined): string[] | undefined => {
+    if (list === undefined || list.length === 0) {
+      return undefined;
+    }
+    return list.map((item) => expandPromptMacros(item, baseMacroCtx));
+  };
+
+  const getStockBaseline = (sectionId: string): string => {
+    switch (sectionId) {
+      case 'system': {
+        const hasMechanical =
+          effectiveCapabilities.combatMode !== 'disabled' ||
+          effectiveCapabilities.progression !== 'disabled';
+        return buildCoreRefereeSystemPrompt(cyoaEnabled, hasMechanical);
+      }
+      case 'narrative_pacing':
+        return buildNarrativePacingInstruction(config.tuningDials.narrativePacing);
+      case 'game_system_rules':
+        return buildGameSystemRulesSection(config, effectiveCapabilities);
+      case 'persona':
+        if (hasUserPersona) {
+          return buildUserPersonaSection(input.userPersona, baseMacroCtx);
+        }
+        if (!hasCardSlot) {
+          return buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates);
+        }
+        return '';
+      case 'card':
+        return buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates);
+      case 'cyoa':
+        return CYOA_PROMPT_INSTRUCTION;
+      case 'state':
+        return renderStateSection(input, budgets, undefined).text;
+      case 'combat_outcome':
+        return renderCombatOutcomeSection(input, effectiveCapabilities, budgets, undefined).text;
+      case 'plot':
+        return renderPlotSection(input, effectiveCapabilities, budgets, directorNudgeText, undefined)
+          .text;
+      case 'world':
+        return renderWorldSection(input, effectiveCapabilities, budgets, undefined).text;
+      default:
+        return '';
+    }
+  };
+
   const sectionTexts = new Map<string, string>();
 
   for (const sectionId of effectiveOrder) {
-    if (sectionId === 'transcript_window' || sectionId === 'latest_input') {
+    if (
+      sectionId === 'transcript_window' ||
+      sectionId === 'latest_input' ||
+      inChatSectionIds.has(sectionId)
+    ) {
       continue;
     }
 
     if (sectionId === 'cyoa' && includeCyoaExtraSection) {
       sectionTexts.set(
         'cyoa',
-        appendScriptTexts(CYOA_PROMPT_INSTRUCTION, scriptBySection.get('cyoa'))
+        appendScriptTexts(CYOA_PROMPT_INSTRUCTION, expandScriptList(scriptBySection.get('cyoa')))
       );
       continue;
     }
 
     if (!BUILTIN_SECTION_IDS.has(sectionId)) {
+      const spec = getCustomBlockSpec(config, sectionId);
       const unlockedFlag = getOwnSafe(config.unlockedPromptSections, sectionId);
-      const customBase =
+      if (spec !== undefined && unlockedFlag === false) {
+        continue;
+      }
+      const rawCustomBase =
         unlockedFlag !== false && Object.hasOwn(config.basePrompts, sectionId)
           ? (getOwnSafe(config.basePrompts, sectionId) ?? '')
           : '';
-      const combined = appendScriptTexts(customBase, scriptBySection.get(sectionId));
+      const expandedBase =
+        rawCustomBase.length > 0 ? expandPromptMacros(rawCustomBase, baseMacroCtx) : '';
+      const combined = appendScriptTexts(
+        expandedBase,
+        expandScriptList(scriptBySection.get(sectionId))
+      );
       if (combined.trim().length > 0) {
         sectionTexts.set(sectionId, combined);
       }
@@ -839,12 +1370,17 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
     }
 
     if (isSectionUnlocked(config, sectionId)) {
+      const rawOverride = getOwnSafe(config.basePrompts, sectionId) ?? '';
+      const original = ORIGINAL_MACRO_PATTERN.test(rawOverride)
+        ? getStockBaseline(sectionId)
+        : '';
+      const expandedOverride = expandPromptMacros(rawOverride, {
+        ...baseMacroCtx,
+        original,
+      });
       const overrideText = applySectionBudget(
         sectionId,
-        appendScriptTexts(
-          getOwnSafe(config.basePrompts, sectionId) ?? '',
-          scriptBySection.get(sectionId)
-        ),
+        appendScriptTexts(expandedOverride, expandScriptList(scriptBySection.get(sectionId))),
         budgets
       );
       if (overrideText.trim().length > 0) {
@@ -895,9 +1431,13 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
       }
 
       case 'persona': {
-        const basePersona = !hasCardSlot ? buildCardSection(input.cardPersona) : '';
+        const basePersona = hasUserPersona
+          ? buildUserPersonaSection(input.userPersona, baseMacroCtx)
+          : !hasCardSlot
+            ? buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates)
+            : '';
         const personaText = applySectionBudget(
-          !hasCardSlot ? 'card' : 'persona',
+          !hasCardSlot && !hasUserPersona ? 'card' : 'persona',
           appendScriptTexts(basePersona, scriptBySection.get('persona')),
           budgets
         );
@@ -910,7 +1450,10 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
       case 'card': {
         const cardText = applySectionBudget(
           'card',
-          appendScriptTexts(buildCardSection(input.cardPersona), scriptBySection.get('card')),
+          appendScriptTexts(
+            buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates),
+            scriptBySection.get('card')
+          ),
           budgets
         );
         if (cardText.trim().length > 0) {
@@ -973,10 +1516,60 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
     }
   }
 
+  // Collect enabled in_chat custom blocks in deterministic order (effectiveOrder first, then sorted keys)
+  const orderedInChatIds: string[] = [];
+  const seenInChatIds = new Set<string>();
+  for (const sectionId of effectiveOrder) {
+    if (inChatSectionIds.has(sectionId) && !seenInChatIds.has(sectionId)) {
+      seenInChatIds.add(sectionId);
+      orderedInChatIds.push(sectionId);
+    }
+  }
+  for (const blockId of customBlockKeysSorted) {
+    if (inChatSectionIds.has(blockId) && !seenInChatIds.has(blockId)) {
+      seenInChatIds.add(blockId);
+      orderedInChatIds.push(blockId);
+    }
+  }
+
+  const inChatBlocks: InChatBlockEntry[] = [];
+  const disabledInChatIds: string[] = [];
+  for (const blockId of orderedInChatIds) {
+    const spec = getCustomBlockSpec(config, blockId);
+    if (spec === undefined) {
+      continue;
+    }
+    if (getOwnSafe(config.unlockedPromptSections, blockId) === false) {
+      disabledInChatIds.push(blockId);
+      continue;
+    }
+    const rawBase = Object.hasOwn(config.basePrompts, blockId)
+      ? (getOwnSafe(config.basePrompts, blockId) ?? '')
+      : '';
+    const expandedBase = rawBase.length > 0 ? expandPromptMacros(rawBase, baseMacroCtx) : '';
+    const combined = appendScriptTexts(
+      expandedBase,
+      expandScriptList(scriptBySection.get(blockId))
+    );
+    if (combined.trim().length > 0) {
+      inChatBlocks.push({
+        id: blockId,
+        role: normalizeBlockRole(spec.role),
+        depth: normalizeInjectionDepth(spec.injectionDepth),
+        text: combined,
+      });
+    } else {
+      disabledInChatIds.push(blockId);
+    }
+  }
+
   const latestInputTokens = estimateTokens(input.latestInput);
   const shedResult = shedExcessSystemTokens(
     effectiveOrder,
     sectionTexts,
+    inChatBlocks,
+    config,
+    inChatSectionIds,
     budgets.totalMaxTokens,
     latestInputTokens
   );
@@ -984,7 +1577,7 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
 
   const remainingForTranscript = Math.max(
     0,
-    budgets.totalMaxTokens - shedResult.systemTokens - latestInputTokens
+    budgets.totalMaxTokens - shedResult.fixedTokens - latestInputTokens
   );
   const transcriptFit = fitRecentTranscriptWindow(input.recentTranscript, remainingForTranscript);
   droppedItemsCount += transcriptFit.droppedCount;
@@ -1007,12 +1600,58 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
   for (const builtinId of BUILTIN_SECTION_IDS) {
     setOwnSafe(tokenBreakdown, builtinId, 0);
   }
+  for (const disabledId of disabledInChatIds) {
+    setOwnSafe(tokenBreakdown, disabledId, 0);
+  }
+
+  // Pre-compute splice anchors into fitted transcript_window + latest_input
+  const baseChatLength = transcriptFit.included.length + 1;
+  const inChatByAnchor = new Map<number, InChatBlockEntry[]>();
+  for (const entry of inChatBlocks) {
+    if (entry.text.trim().length === 0) {
+      setOwnSafe(tokenBreakdown, entry.id, 0);
+      continue;
+    }
+    const anchor = Math.max(0, baseChatLength - entry.depth);
+    let list = inChatByAnchor.get(anchor);
+    if (list === undefined) {
+      list = [];
+      inChatByAnchor.set(anchor, list);
+    }
+    list.push(entry);
+    setOwnSafe(renderedSections, entry.id, entry.text);
+    setOwnSafe(tokenBreakdown, entry.id, estimateTokens(entry.text));
+  }
+
+  const emitInChatAtAnchor = (anchor: number): void => {
+    const entries = inChatByAnchor.get(anchor);
+    if (entries === undefined) {
+      return;
+    }
+    for (const entry of entries) {
+      messages.push({
+        role: entry.role,
+        content: entry.text,
+      });
+    }
+  };
+
+  let transcriptEmitted = false;
 
   for (const sectionId of effectiveOrder) {
+    if (inChatSectionIds.has(sectionId)) {
+      continue;
+    }
+
     if (sectionId === 'transcript_window') {
       flushSystemBuffer();
-      for (const msg of transcriptFit.included) {
-        messages.push(msg);
+      transcriptEmitted = true;
+      for (let i = 0; i < transcriptFit.included.length; i += 1) {
+        emitInChatAtAnchor(i);
+        const msg = transcriptFit.included[i];
+        if (msg !== undefined) {
+          messages.push(msg);
+        }
       }
       if (transcriptFit.included.length > 0) {
         setOwnSafe(
@@ -1027,10 +1666,21 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
 
     if (sectionId === 'latest_input') {
       flushSystemBuffer();
+      if (!transcriptEmitted && transcriptFit.included.length > 0) {
+        for (let i = 0; i < transcriptFit.included.length; i += 1) {
+          emitInChatAtAnchor(i);
+          const msg = transcriptFit.included[i];
+          if (msg !== undefined) {
+            messages.push(msg);
+          }
+        }
+      }
+      emitInChatAtAnchor(transcriptFit.included.length);
       messages.push({
         role: 'user',
         content: input.latestInput,
       });
+      emitInChatAtAnchor(baseChatLength);
       if (input.latestInput.length > 0) {
         setOwnSafe(renderedSections, 'latest_input', input.latestInput);
       }
@@ -1040,7 +1690,17 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
 
     const sectionText = sectionTexts.get(sectionId);
     if (sectionText !== undefined && sectionText.trim().length > 0) {
-      systemBuffer.push(sectionText);
+      const spec = getCustomBlockSpec(config, sectionId);
+      const role = spec !== undefined ? normalizeBlockRole(spec.role) : 'system';
+      if (role === 'user' || role === 'assistant') {
+        flushSystemBuffer();
+        messages.push({
+          role,
+          content: sectionText,
+        });
+      } else {
+        systemBuffer.push(sectionText);
+      }
       setOwnSafe(renderedSections, sectionId, sectionText);
       setOwnSafe(tokenBreakdown, sectionId, estimateTokens(sectionText));
     } else {

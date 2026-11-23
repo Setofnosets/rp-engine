@@ -4,22 +4,33 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { BeatLedgerState } from '../../src/beats/beat-ledger.js';
 import { importSillyTavernCard } from '../../src/cartridge/importers/st-card-importer.js';
-import { parseMainCliArgs, loadPlaySessionInputs, runMainCli } from '../../src/cli/main.js';
+import {
+  buildCliModelGateway,
+  loadCliPersonaFile,
+  loadCliPresetFile,
+  loadPlaySessionInputs,
+  parseMainCliArgs,
+  runMainCli,
+  saveCliModelGatewayConnections,
+} from '../../src/cli/main.js';
 import type { CombatState, CombatantState } from '../../src/combat/action-validator.js';
 import type { GridTile, TacticalGrid } from '../../src/combat/grid-types.js';
 import { resolveEffectiveControlRoomConfig } from '../../src/config/control-room-config.js';
 import { computeControlRoomDiffReport } from '../../src/config/prompt-diff.js';
 import { isOk } from '../../src/core/result.js';
+import { saveConnectionsFile } from '../../src/gateway/connection-store.js';
 import { createMockModelGateway } from '../../src/gateway/mock-provider.js';
 import { SessionRuntime } from '../../src/runtime/session-runtime.js';
 import {
+  STOCK_FREEFORM_PACK,
   STOCK_SLICE_OF_LIFE_PACK,
   STOCK_TACTICAL_RPG_PACK,
 } from '../../src/schema/stock-system-packs.js';
 import { RefereeDaemon } from '../../src/server/daemon.js';
 import type { AuditEntry } from '../../src/state/audit-log.js';
 import { createWorldState } from '../../src/state/world-state.js';
-import { TuiController } from '../../src/tui/app.js';
+import { RefereeDataStore } from '../../src/storage/data-store.js';
+import { GAMEPLAY_SLASH_COMMANDS, TuiController } from '../../src/tui/app.js';
 import { renderAuditAndChroniclePane } from '../../src/tui/panes/audit-and-chronicle-pane.js';
 import { renderChatPane } from '../../src/tui/panes/chat-pane.js';
 import { renderCombatGridPane } from '../../src/tui/panes/combat-grid-pane.js';
@@ -678,5 +689,602 @@ describe('PR-6.3: Native CLI/TUI Client & Panes', () => {
     expect(helpCode).toBe(0);
     expect(stdout.join('\n')).toContain('Referee Engine CLI');
     expect(stderr).toHaveLength(0);
+  });
+});
+
+describe('PR-7.13: Native CLI & TUI Completion', () => {
+  it('1. Unblocks all GAMEPLAY_SLASH_COMMANDS and executes turns instead of rejecting as unknown', async () => {
+    expect([...GAMEPLAY_SLASH_COMMANDS]).toEqual([
+      '/travel',
+      '/rest',
+      '/play-as',
+      '/move',
+      '/attack',
+      '/skill',
+      '/defend',
+      '/end-turn',
+    ]);
+
+    const gateway = createMockModelGateway({
+      narrator: Array.from({ length: 10 }, (_, idx) => ({
+        kind: 'text' as const,
+        text: `Gameplay turn ${idx + 1} resolved.`,
+      })),
+      state_tracker: Array.from({ length: 10 }, () => ({
+        kind: 'json' as const,
+        value: {},
+      })),
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'tui-gameplay-cmds',
+      systemPack: STOCK_TACTICAL_RPG_PACK,
+      gateway,
+      seed: 'gameplay-seed',
+    });
+
+    const heroRes = runtime.upsertCharacter('hero_1', {
+      name: 'Kael',
+      status: 'active',
+      presentInScene: true,
+      locationId: null,
+      mood: 'focused',
+      allegiance: 'allies',
+    });
+    expect(isOk(heroRes)).toBe(true);
+
+    const goblinRes = runtime.upsertCharacter('goblin_1', {
+      name: 'Goblin Raider',
+      status: 'active',
+      presentInScene: true,
+      locationId: null,
+      mood: 'hostile',
+      allegiance: 'raiders',
+    });
+    expect(isOk(goblinRes)).toBe(true);
+
+    const controller = new TuiController({ runtime, gateway });
+
+    // Non-combat gameplay slash commands
+    const travelOut = await controller.handleInput('/travel Old Watchtower');
+    expect(travelOut.outputLines.join(' ')).toContain('Gameplay turn');
+    expect(travelOut.outputLines.join(' ')).not.toContain('Unknown command');
+    expect(runtime.getState().scene.location).toBe('Old Watchtower');
+
+    const restOut = await controller.handleInput('/rest');
+    expect(restOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    const playAsOut = await controller.handleInput('/play-as hero_1');
+    expect(playAsOut.outputLines.join(' ')).toContain('Gameplay turn');
+    expect(runtime.getState().player.characterId).toBe('hero_1');
+
+    // Start combat with /start-combat and exercise all combat slash commands
+    const combatStartOut = await controller.handleInput('/start-combat goblin_1');
+    expect(combatStartOut.outputLines[0]).toContain('Started combat');
+    expect(runtime.getCombatState()?.active).toBe(true);
+
+    const moveOut = await controller.handleInput('/move 2,1');
+    expect(moveOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    const attackOut = await controller.handleInput('/attack goblin_1');
+    expect(attackOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    const skillOut = await controller.handleInput('/skill basic_strike goblin_1');
+    expect(skillOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    const defendOut = await controller.handleInput('/defend');
+    expect(defendOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    const endTurnOut = await controller.handleInput('/end-turn');
+    expect(endTurnOut.outputLines.join(' ')).toContain('Gameplay turn');
+
+    controller.dispose();
+  });
+
+  it('2. Supports /characters, /inspect, /pin, /unpin, /dismiss, and HUD Cast: line within 80x24', async () => {
+    const gateway = createMockModelGateway({
+      narrator: [{ kind: 'text', text: 'Elena steps into the lantern light.' }],
+      state_tracker: [{ kind: 'json', value: {} }],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'tui-cast-inspect',
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway,
+      seed: 'cast-seed',
+    });
+
+    runtime.upsertCharacter('elena', {
+      name: 'Elena',
+      status: 'active',
+      presentInScene: true,
+      locationId: null,
+      mood: 'warm',
+      allegiance: 'cafe_staff',
+      agenda: 'Keep the morning rush smooth',
+      traits: ['observant'],
+      sections: { sec_personality: 'Warm and quick-witted.' },
+    });
+    runtime.upsertCharacter('marcus', {
+      name: 'Marcus',
+      status: 'active',
+      presentInScene: false,
+      locationId: 'north_gate',
+      mood: 'guarded',
+      allegiance: 'city_watch',
+    });
+
+    const controller = new TuiController({ runtime, gateway });
+
+    // /characters (and aliases /roster, /cast)
+    const charsOut = await controller.handleInput('/characters');
+    const charsText = charsOut.outputLines.join('\n');
+    expect(charsText).toContain('[HERE]');
+    expect(charsText).toContain('Elena (elena)');
+    expect(charsText).toContain('[OFFSCREEN @ north_gate]');
+    expect(charsText).toContain('Marcus (marcus)');
+
+    const rosterOut = await controller.handleInput('/roster');
+    expect(rosterOut.outputLines.join('\n')).toContain('Elena');
+    const castOut = await controller.handleInput('/cast marcus');
+    expect(castOut.outputLines.join('\n')).toContain('Marcus');
+    expect(castOut.outputLines.join('\n')).not.toContain('Elena');
+
+    // /inspect
+    const inspectNpc = await controller.handleInput('/inspect elena');
+    const inspectText = inspectNpc.outputLines.join('\n');
+    expect(inspectText).toContain('Dossier: Elena (elena)');
+    expect(inspectText).toContain('Warm and quick-witted.');
+    expect(inspectText).toContain('observant');
+
+    const inspectPlayer = await controller.handleInput('/inspect player');
+    expect(inspectPlayer.outputLines.join('\n')).toContain('[PC]');
+
+    // /pin, /unpin (pre-turn), /pin + turn + /unpin + /dismiss
+    await controller.handleInput('/pin marcus');
+    expect(controller.getDirectorSteering().pinCharacterIds).toEqual(['marcus']);
+
+    await controller.handleInput('/unpin marcus');
+    expect(controller.getDirectorSteering().pinCharacterIds).toBeUndefined();
+
+    await controller.handleInput('/pin marcus');
+    const turnOut = await controller.handleInput('I look toward the doorway.');
+    expect(turnOut.outputLines.join(' ')).toContain('Elena steps');
+    expect(runtime.getState().scene.pinnedCharacterIds).toContain('marcus');
+    expect(controller.getDirectorSteering().pinCharacterIds).toBeUndefined();
+
+    const pinnedList = await controller.handleInput('/characters');
+    expect(pinnedList.outputLines.join('\n')).toContain('[PINNED]');
+
+    await controller.handleInput('/unpin marcus');
+    expect(controller.getDirectorSteering().dismissCharacterIds).toContain('marcus');
+
+    await controller.handleInput('/dismiss elena');
+    expect(controller.getDirectorSteering().dismissCharacterIds).toContain('elena');
+
+    // Narrow 80x24 HUD Cast: line and strict viewport bounds
+    const screen80 = controller.renderScreen({ width: 80, height: 24 });
+    expect(screen80).toContain('Cast:');
+    expect(screen80).toContain('Elena');
+    const lines = screen80.split('\n');
+    expect(lines.length).toBeLessThanOrEqual(24);
+    for (const line of lines) {
+      expect(line.length).toBeLessThanOrEqual(80);
+    }
+
+    controller.dispose();
+  });
+
+  it('3. Supports /save-connections, /load-connections, /disconnect-role, /preset-import/export/save/load/list, /sheet-preset, /sampling, and /persona', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'referee-tui-713-'));
+    tempDirs.push(tmpDir);
+    const dataStore = new RefereeDataStore(path.join(tmpDir, 'data'));
+    await dataStore.init();
+    const connectionsPath = path.join(tmpDir, 'connections.json');
+
+    const gateway = createMockModelGateway({
+      narrator: [{ kind: 'text', text: 'OK' }],
+    });
+    gateway.setDefaultConnection({
+      provider: 'openai_compatible',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'llama3.1:8b',
+      temperature: 0.7,
+    });
+    gateway.setRoleConnection('state_tracker', {
+      provider: 'openai_compatible',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'qwen2.5:7b',
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'tui-presets-persona',
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway,
+      seed: 'preset-seed',
+    });
+
+    const controller = new TuiController({
+      runtime,
+      gateway,
+      dataStore,
+      connectionsPath,
+    });
+
+    // Connections: save named profile, disconnect role, modify default, then load profile back
+    const saveConnOut = await controller.handleInput('/save-connections local-dev');
+    expect(saveConnOut.outputLines[0]).toContain('local-dev');
+
+    const discOut = await controller.handleInput('/disconnect-role state_tracker');
+    expect(discOut.outputLines[0]).toContain('Removed connection override for role "state_tracker"');
+    expect(gateway.getConnectionsSnapshot().connections.state_tracker).toBeUndefined();
+
+    await controller.handleInput('/connect http://127.0.0.1:9999/v1 other-model');
+    expect(gateway.getConnectionsSnapshot().defaultConnection?.model).toBe('other-model');
+
+    const loadConnOut = await controller.handleInput('/load-connections local-dev');
+    expect(loadConnOut.outputLines[0]).toContain('Loaded connection profile "local-dev"');
+    expect(gateway.getConnectionsSnapshot().defaultConnection?.model).toBe('llama3.1:8b');
+    expect(gateway.getConnectionsSnapshot().connections.state_tracker?.model).toBe('qwen2.5:7b');
+
+    // Preset import (ST Chat Completion preset) & Control Room pane rendering
+    const stPresetPath = path.join(tmpDir, 'st-chat-preset.json');
+    await fs.writeFile(
+      stPresetPath,
+      JSON.stringify({
+        name: 'Cozy Tavern Chat',
+        temperature: 0.85,
+        openai_max_tokens: 420,
+        openai_max_context: 8192,
+        top_p: 0.92,
+        repetition_penalty: 1.12,
+        prompts: [
+          {
+            identifier: 'main',
+            name: 'Main Prompt',
+            role: 'system',
+            content: 'Narrate vividly.',
+            enabled: true,
+          },
+          {
+            identifier: 'custom_style',
+            name: 'Style Block',
+            role: 'system',
+            content: 'Keep prose grounded.',
+            injection_position: 0,
+            enabled: true,
+          },
+        ],
+        prompt_order: [
+          {
+            character_id: 100001,
+            order: [
+              { identifier: 'main', enabled: true },
+              { identifier: 'custom_style', enabled: true },
+              { identifier: 'chatHistory', enabled: true },
+            ],
+          },
+        ],
+      }),
+      'utf8'
+    );
+
+    const importOut = await controller.handleInput(`/preset-import ${stPresetPath}`);
+    expect(importOut.outputLines[0]).toContain('st_chat_completion');
+    expect(runtime.getConfig().generation?.temperature).toBe(0.85);
+    expect(runtime.getConfig().generation?.maxTokens).toBe(420);
+    expect(Object.keys(runtime.getConfig().customPromptBlocks ?? {}).length).toBeGreaterThanOrEqual(1);
+
+    // Control Room pane shows Generation: and ST Blocks: within 80x24
+    await controller.handleInput('/control-room');
+    const crScreen = controller.renderScreen({ width: 80, height: 24 });
+    expect(crScreen).toContain('Generation:');
+    expect(crScreen).toContain('temp=0.85');
+    expect(crScreen).toContain('ST Blocks:');
+    for (const line of crScreen.split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(80);
+    }
+
+    // /sampling view and live update
+    const samplingView = await controller.handleInput('/sampling');
+    expect(samplingView.outputLines[0]).toContain('temperature=0.85');
+
+    const samplingSet = await controller.handleInput(
+      '/sampling temp=0.65 max_tokens=500 top_p=0.9 rep_pen=1.08 max_context=12000'
+    );
+    expect(samplingSet.outputLines[0]).toContain('temperature=0.65');
+    expect(runtime.getConfig().generation?.temperature).toBe(0.65);
+    expect(runtime.getConfig().generation?.maxTokens).toBe(500);
+    expect(runtime.getConfig().generation?.topP).toBe(0.9);
+    expect(runtime.getConfig().generation?.repetitionPenalty).toBe(1.08);
+    expect(runtime.getConfig().generation?.maxContextTokens).toBe(12000);
+
+    // /preset save, /preset list, /preset load
+    const presetSaveOut = await controller.handleInput('/preset save tavern-v1');
+    expect(presetSaveOut.outputLines[0]).toContain('Saved Control Room preset "tavern-v1"');
+
+    const presetListOut = await controller.handleInput('/preset list');
+    expect(presetListOut.outputLines.join('\n')).toContain('tavern-v1');
+
+    await controller.handleInput('/sampling temp=0.2');
+    expect(runtime.getConfig().generation?.temperature).toBe(0.2);
+
+    const presetLoadOut = await controller.handleInput('/preset load tavern-v1');
+    expect(presetLoadOut.outputLines[0]).toContain('Loaded Control Room preset "tavern-v1"');
+    expect(runtime.getConfig().generation?.temperature).toBe(0.65);
+
+    // /preset-export (st_chat, st_text, referee)
+    const exportChatPath = path.join(tmpDir, 'out-chat.json');
+    const exportTextPath = path.join(tmpDir, 'out-text.json');
+    const exportRefPath = path.join(tmpDir, 'out-ref.json');
+    await controller.handleInput(`/preset-export ${exportChatPath} st_chat`);
+    await controller.handleInput(`/preset-export ${exportTextPath} st_text`);
+    await controller.handleInput(`/preset-export ${exportRefPath} referee`);
+
+    const exportedChat = JSON.parse(await fs.readFile(exportChatPath, 'utf8')) as Record<string, unknown>;
+    expect(exportedChat['temperature']).toBe(0.65);
+    expect(Array.isArray(exportedChat['prompts'])).toBe(true);
+
+    const exportedText = JSON.parse(await fs.readFile(exportTextPath, 'utf8')) as Record<string, unknown>;
+    expect(exportedText['temp']).toBe(0.65);
+    expect(exportedText['amount_gen']).toBe(500);
+
+    const exportedRef = JSON.parse(await fs.readFile(exportRefPath, 'utf8')) as Record<string, unknown>;
+    expect((exportedRef['generation'] as Record<string, unknown>)['temperature']).toBe(0.65);
+
+    // /sheet-preset
+    const sheetOut = await controller.handleInput('/sheet-preset dnd-adventurer');
+    expect(sheetOut.outputLines[0]).toContain('dnd-adventurer');
+    expect(runtime.getConfig().pcCoreSections.some((s) => s.id === 'sec_combat_profile')).toBe(true);
+
+    // /persona set, /persona section, /persona save, /persona list, /persona load
+    const pSetOut = await controller.handleInput('/persona set Aria | Wandering clockmaker');
+    expect(pSetOut.outputLines[0]).toContain('Aria');
+    expect(runtime.getState().player.name).toBe('Aria');
+    expect(runtime.getActivePersona()?.description).toBe('Wandering clockmaker');
+
+    const pSecOut = await controller.handleInput('/persona section sec_body Tall with brass goggles.');
+    expect(pSecOut.outputLines[0]).toContain('sec_body');
+    expect(runtime.getState().player.sections['sec_body']).toBe('Tall with brass goggles.');
+
+    const pSaveOut = await controller.handleInput('/persona save aria-main');
+    expect(pSaveOut.outputLines[0]).toContain('Saved persona "aria-main"');
+
+    const pListOut = await controller.handleInput('/persona list');
+    expect(pListOut.outputLines.join('\n')).toContain('aria-main: Aria');
+
+    await controller.handleInput('/persona set TempUser | Temporary');
+    expect(runtime.getState().player.name).toBe('TempUser');
+
+    const pLoadOut = await controller.handleInput('/persona load aria-main');
+    expect(pLoadOut.outputLines[0]).toContain('Loaded persona "aria-main"');
+    expect(runtime.getState().player.name).toBe('Aria');
+    expect(runtime.getState().player.sections['sec_body']).toBe('Tall with brass goggles.');
+
+    controller.dispose();
+  });
+
+  it('4. Works over live RefereeDaemon HTTP mode for new commands', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'referee-tui-daemon-713-'));
+    tempDirs.push(tmpDir);
+
+    const gateway = createMockModelGateway({
+      narrator: [{ kind: 'text', text: 'Daemon turn complete.' }],
+      state_tracker: [{ kind: 'json', value: {} }],
+    });
+    gateway.setDefaultConnection({
+      provider: 'mock',
+      baseUrl: 'mock://127.0.0.1/v1',
+      model: 'daemon-default',
+    });
+    gateway.setRoleConnection('narrator', {
+      provider: 'mock',
+      baseUrl: 'mock://127.0.0.1/v1',
+      model: 'daemon-narrator',
+    });
+
+    const daemon = new RefereeDaemon({
+      host: '127.0.0.1',
+      port: 0,
+      gateway,
+      dataDir: tmpDir,
+    });
+    const info = await daemon.start();
+
+    try {
+      const controller = new TuiController({ daemonUrl: info.url });
+      await controller.connectDaemonSession({ systemPackId: 'stock-tactical-rpg' });
+
+      // /save-connections, /disconnect-role, /load-connections
+      await controller.handleInput('/save-connections daemon-prof');
+      await controller.handleInput('/disconnect-role narrator');
+      expect(gateway.getConnectionsSnapshot().connections.narrator).toBeUndefined();
+      await controller.handleInput('/load-connections daemon-prof');
+      expect(gateway.getConnectionsSnapshot().connections.narrator?.model).toBe('daemon-narrator');
+
+      // /sheet-preset & /sampling
+      const sheetRes = await controller.handleInput('/sheet-preset superhero-dossier');
+      expect(sheetRes.outputLines[0]).toContain('superhero-dossier');
+      const sampRes = await controller.handleInput('/sampling temp=0.72 max_tokens=333');
+      expect(sampRes.outputLines[0]).toContain('temperature=0.72');
+
+      // /persona set & /persona section
+      await controller.handleInput('/persona set Nova | Starlight courier');
+      await controller.handleInput('/persona section sec_species Human');
+      await controller.handleInput('/persona save nova-1');
+
+      // /characters & /inspect player
+      const charsRes = await controller.handleInput('/characters');
+      expect(charsRes.outputLines.join('\n')).toContain('Nova');
+      const inspectRes = await controller.handleInput('/inspect player');
+      expect(inspectRes.outputLines.join('\n')).toContain('Human');
+
+      // /start-combat & /end-turn gameplay command over daemon
+      const combatRes = await controller.handleInput('/start-combat bandit_1');
+      expect(combatRes.outputLines[0]).toContain('Started combat');
+      const endTurnRes = await controller.handleInput('/end-turn');
+      expect(endTurnRes.outputLines.join(' ')).toContain('Daemon turn complete');
+
+      controller.dispose();
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  it('5. CLI parses new flags, preserves ConnectionStore fields, and loads preset/persona/save-dir', async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'referee-cli-713-'));
+    tempDirs.push(tmpDir);
+
+    const playArgs = parseMainCliArgs([
+      'play',
+      '--save-dir',
+      './saves/s1',
+      '--resume',
+      './saves/s0',
+      '--preset',
+      './preset.json',
+      '--persona',
+      './persona.json',
+      '--data-dir',
+      './data',
+    ]);
+    expect(playArgs.ok).toBe(true);
+    if (playArgs.ok && playArgs.value.command === 'play') {
+      expect(playArgs.value.saveDirPath).toBe('./saves/s1');
+      expect(playArgs.value.resumePath).toBe('./saves/s0');
+      expect(playArgs.value.presetPath).toBe('./preset.json');
+      expect(playArgs.value.personaPath).toBe('./persona.json');
+      expect(playArgs.value.dataDir).toBe('./data');
+    }
+
+    const daemonArgs = parseMainCliArgs([
+      'daemon',
+      '--data-dir',
+      './data',
+      '--save-dir',
+      './saves/s1',
+      '--resume',
+      './saves/s0',
+      '--preset',
+      './preset.json',
+      '--persona',
+      './persona.json',
+    ]);
+    expect(daemonArgs.ok).toBe(true);
+    if (daemonArgs.ok && daemonArgs.value.command === 'daemon') {
+      expect(daemonArgs.value.dataDir).toBe('./data');
+      expect(daemonArgs.value.saveDirPath).toBe('./saves/s1');
+      expect(daemonArgs.value.resumePath).toBe('./saves/s0');
+      expect(daemonArgs.value.presetPath).toBe('./preset.json');
+      expect(daemonArgs.value.personaPath).toBe('./persona.json');
+    }
+
+    // buildCliModelGateway preserves provider, SamplingParameters, timeoutMs, supportsJsonSchema, activeProfile
+    const connFile = path.join(tmpDir, 'referee.connections.json');
+    const saveRes = await saveConnectionsFile(connFile, {
+      version: 1,
+      activeProfile: 'anthropic-main',
+      defaultConnection: {
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-sonnet-4-5',
+        apiKey: 'sk-ant-test',
+        temperature: 0.75,
+        maxTokens: 1024,
+        topP: 0.9,
+        topK: 40,
+        repetitionPenalty: 1.05,
+        timeoutMs: 45000,
+        supportsJsonSchema: false,
+      },
+      profiles: {
+        'anthropic-main': {
+          defaultConnection: {
+            provider: 'anthropic',
+            baseUrl: 'https://api.anthropic.com',
+            model: 'claude-sonnet-4-5',
+            temperature: 0.75,
+            timeoutMs: 45000,
+            supportsJsonSchema: false,
+          },
+        },
+      },
+    });
+    expect(saveRes.ok).toBe(true);
+
+    const gwRes = await buildCliModelGateway({ connectionsPath: connFile }, {});
+    expect(gwRes.ok).toBe(true);
+    if (gwRes.ok) {
+      const snap = gwRes.value.getConnectionsSnapshot();
+      expect(snap.defaultConnection?.provider).toBe('anthropic');
+      expect(snap.defaultConnection?.temperature).toBe(0.75);
+      expect(snap.defaultConnection?.maxTokens).toBe(1024);
+      expect(snap.defaultConnection?.topP).toBe(0.9);
+      expect(snap.defaultConnection?.topK).toBe(40);
+      expect(snap.defaultConnection?.repetitionPenalty).toBe(1.05);
+      expect(snap.defaultConnection?.timeoutMs).toBe(45000);
+      expect(snap.defaultConnection?.supportsJsonSchema).toBe(false);
+
+      const savedBack = await saveCliModelGatewayConnections(connFile, gwRes.value);
+      expect(savedBack.ok).toBe(true);
+      if (savedBack.ok) {
+        expect(savedBack.value.activeProfile).toBe('anthropic-main');
+        expect(savedBack.value.defaultConnection?.provider).toBe('anthropic');
+      }
+    }
+
+    // loadCliPresetFile and loadCliPersonaFile + SessionRuntime.fromSaveDirectory hydration
+    const cliPresetPath = path.join(tmpDir, 'cli-preset.json');
+    await fs.writeFile(
+      cliPresetPath,
+      JSON.stringify({ name: 'CLI Preset', temperature: 0.55, amount_gen: 300 }),
+      'utf8'
+    );
+    const cliPresetRes = await loadCliPresetFile(cliPresetPath);
+    expect(cliPresetRes.ok).toBe(true);
+    if (cliPresetRes.ok) {
+      expect(cliPresetRes.value.generation.temperature).toBe(0.55);
+    }
+
+    const cliPersonaPath = path.join(tmpDir, 'cli-persona.json');
+    await fs.writeFile(
+      cliPersonaPath,
+      JSON.stringify({ id: 'cli-hero', name: 'Rowan', description: 'Scout' }),
+      'utf8'
+    );
+    const cliPersonaRes = await loadCliPersonaFile(cliPersonaPath);
+    expect(cliPersonaRes.ok).toBe(true);
+    if (cliPersonaRes.ok) {
+      expect(cliPersonaRes.value.name).toBe('Rowan');
+    }
+
+    // Verify SessionRuntime save + resume roundtrip compatible with CLI --save-dir / --resume
+    const saveDir = path.join(tmpDir, 'cli-save');
+    const mockGw = createMockModelGateway({
+      narrator: [{ kind: 'text', text: 'Saved turn 1.' }],
+      state_tracker: [{ kind: 'json', value: {} }],
+    });
+    const session1 = new SessionRuntime({
+      sessionId: 'cli-session-1',
+      systemPack: STOCK_FREEFORM_PACK,
+      gateway: mockGw,
+      saveDir,
+      ...(cliPresetRes.ok ? { userControlRoomLayer: cliPresetRes.value.layer } : {}),
+      ...(cliPersonaRes.ok ? { userPersona: cliPersonaRes.value } : {}),
+    });
+    const turn1 = await session1.executeTurn({ text: 'Hello world' });
+    expect(turn1.ok).toBe(true);
+    await session1.flushPendingSaves();
+
+    const resumed = await SessionRuntime.fromSaveDirectory(saveDir, {
+      sessionId: 'cli-session-1',
+      systemPack: STOCK_FREEFORM_PACK,
+      gateway: mockGw,
+    });
+    expect(resumed.ok).toBe(true);
+    if (resumed.ok) {
+      expect(resumed.value.getState().player.name).toBe('Rowan');
+      expect(resumed.value.getConfig().generation?.temperature).toBe(0.55);
+    }
   });
 });

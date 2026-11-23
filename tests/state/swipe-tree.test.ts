@@ -96,6 +96,26 @@ describe('computeStateHash', () => {
 
     expect(() => computeStateHash(ws, circular)).toThrow(RefereeError);
   });
+
+  it('preserves legacy hashes when combatState is undefined or null and hashes non-null combatState deterministically', () => {
+    const ws = makeBaseWorldState();
+    const ledger = { beat_intro: 'open' };
+    const legacyHash = computeStateHash(ws, ledger);
+
+    expect(computeStateHash(ws, ledger, undefined)).toBe(legacyHash);
+    expect(computeStateHash(ws, ledger, null)).toBe(legacyHash);
+
+    const combatA = { active: true, round: 2, turnOrder: ['alice', 'goblin'], offset: 0 };
+    const combatB = { offset: -0, turnOrder: ['alice', 'goblin'], round: 2, active: true };
+    const combatHashA = computeStateHash(ws, ledger, combatA);
+    const combatHashB = computeStateHash(ws, ledger, combatB);
+
+    expect(combatHashA).toBe(combatHashB);
+    expect(combatHashA).not.toBe(legacyHash);
+
+    const combatDifferent = { active: true, round: 3, turnOrder: ['alice', 'goblin'], offset: 0 };
+    expect(computeStateHash(ws, ledger, combatDifferent)).not.toBe(combatHashA);
+  });
 });
 
 describe('Swipe-Coupled Message Tree', () => {
@@ -360,6 +380,138 @@ describe('Swipe-Coupled Message Tree', () => {
           content: 'conflict',
           checkpoint: conflictingCp,
           createdAtSeq: 2,
+        })
+      )
+    ).toBe(true);
+  });
+
+  it('preserves, isolates, and validates combatState across checkpoints, rollbacks, and swipe switches', () => {
+    const ws0 = makeBaseWorldState();
+    const combatInitial = { active: false, round: 0, participants: [] as string[] };
+    const cp0: StateCheckpoint = {
+      checkpointId: 'cp-combat-0',
+      turn: 0,
+      worldState: ws0,
+      beatLedger: {},
+      rngState: ws0.meta.rngState,
+      combatState: combatInitial,
+      stateHash: computeStateHash(ws0, {}, combatInitial),
+    };
+
+    let tree = createSwipeTree(cp0);
+    const u1 = appendMessageTurn(tree, {
+      messageId: 'msg-u1',
+      parentMessageId: null,
+      role: 'user',
+      content: 'Draw sword.',
+      checkpoint: cp0,
+    });
+    expect(isOk(u1)).toBe(true);
+    if (!u1.ok) return;
+    tree = u1.value;
+
+    // External mutation of input combatState must not affect stored checkpoint
+    combatInitial.round = 99;
+    expect(tree.checkpoints['cp-combat-0']?.combatState).toEqual({
+      active: false,
+      round: 0,
+      participants: [],
+    });
+
+    const combatSwipeA = { active: true, round: 1, participants: ['alice', 'bandit'] };
+    const cpA: StateCheckpoint = {
+      checkpointId: 'cp-combat-a',
+      turn: 1,
+      worldState: ws0,
+      beatLedger: {},
+      rngState: ws0.meta.rngState,
+      combatState: combatSwipeA,
+      stateHash: computeStateHash(ws0, {}, combatSwipeA),
+    };
+    const a1 = appendMessageTurn(tree, {
+      messageId: 'msg-a1',
+      parentMessageId: 'msg-u1',
+      role: 'assistant',
+      content: 'Combat begins!',
+      checkpoint: cpA,
+    });
+    expect(isOk(a1)).toBe(true);
+    if (!a1.ok) return;
+    tree = a1.value;
+
+    const rb = rollbackForSwipe(tree, 'msg-a1');
+    expect(isOk(rb)).toBe(true);
+    if (rb.ok) {
+      expect(rb.value.restoredCheckpoint.combatState).toEqual({
+        active: false,
+        round: 0,
+        participants: [],
+      });
+    }
+
+    const cpB: StateCheckpoint = {
+      checkpointId: 'cp-combat-b',
+      turn: 1,
+      worldState: ws0,
+      beatLedger: {},
+      rngState: ws0.meta.rngState,
+      combatState: null,
+      stateHash: computeStateHash(ws0, {}, null),
+    };
+    const swB = recordSwipeVariant(tree, 'msg-a1', {
+      content: 'You negotiate instead.',
+      checkpoint: cpB,
+      createdAtSeq: 2,
+    });
+    expect(isOk(swB)).toBe(true);
+    if (!swB.ok) return;
+    tree = swB.value.nextTree;
+
+    const backToA = activateSwipeVariant(tree, 'msg-a1', 0);
+    expect(isOk(backToA)).toBe(true);
+    if (backToA.ok) {
+      expect(backToA.value.restoredCheckpoint.combatState).toEqual(combatSwipeA);
+    }
+
+    const validated = validateSwipeTreeState(JSON.parse(JSON.stringify(tree)));
+    expect(isOk(validated)).toBe(true);
+    if (validated.ok) {
+      expect(validated.value.checkpoints['cp-combat-a']?.combatState).toEqual(combatSwipeA);
+      expect(validated.value.checkpoints['cp-combat-b']?.combatState).toBeNull();
+    }
+
+    // Rejects prototype pollution or non-JSON-safe values inside combatState
+    const pollutedCombat = JSON.parse('{"__proto__":{"polluted":true}}') as Record<string, unknown>;
+    const badProtoCp: StateCheckpoint = {
+      ...cp0,
+      checkpointId: 'cp-bad-proto',
+      combatState: pollutedCombat,
+    };
+    expect(
+      isErr(
+        appendMessageTurn(tree, {
+          messageId: 'msg-bad-proto',
+          parentMessageId: 'msg-u1',
+          role: 'user',
+          content: 'bad',
+          checkpoint: badProtoCp,
+        })
+      )
+    ).toBe(true);
+
+    const badNanCp: StateCheckpoint = {
+      ...cp0,
+      checkpointId: 'cp-bad-nan',
+      combatState: { round: Number.NaN },
+    };
+    expect(
+      isErr(
+        appendMessageTurn(tree, {
+          messageId: 'msg-bad-nan',
+          parentMessageId: 'msg-u1',
+          role: 'user',
+          content: 'bad',
+          checkpoint: badNanCp,
         })
       )
     ).toBe(true);

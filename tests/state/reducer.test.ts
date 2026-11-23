@@ -869,4 +869,297 @@ describe('applyPatchBatch', () => {
       expect(validated.value.warnings).toEqual([]);
     }
   });
+
+  it('handles character_upsert creation with defaults, scene presence sync, and validateWorldState compliance', () => {
+    // Tier 0 (scene_only): defaults presentInScene to true and syncs scene.presentCharacterIds
+    const t0Initial = createWorldState({
+      sessionId: 'upsert-t0',
+      player: { id: 'player', name: 'Hero', characterId: 'hero' },
+      characters: [
+        {
+          id: 'hero',
+          name: 'Hero',
+          status: 'active',
+          presentInScene: true,
+          locationId: null,
+          formId: null,
+          formGroup: null,
+          sections: {},
+          customFields: {},
+          abilities: [],
+          goals: [],
+          agenda: '',
+          allegiance: '',
+          mood: 'neutral',
+          traits: [],
+        },
+      ],
+    });
+
+    const t0Res = applyPatchBatch(t0Initial, {
+      eventId: 'evt-upsert-t0',
+      source: 'engine',
+      operations: [
+        {
+          op: 'character_upsert',
+          characterId: 'mira',
+          character: {
+            name: 'Mira',
+            mood: 'warm',
+            abilities: ['Brewing'],
+            sections: { sec_personality: 'Kind herbalist.' },
+          },
+        },
+        {
+          op: 'character_upsert',
+          characterId: 'shadow_watcher',
+          character: {
+            name: 'Shadow Watcher',
+            presentInScene: false,
+          },
+        },
+      ],
+    });
+    expect(isOk(t0Res)).toBe(true);
+    if (!t0Res.ok) return;
+
+    const mira = t0Res.value.nextState.entities.characters['mira'];
+    expect(mira).toEqual({
+      id: 'mira',
+      name: 'Mira',
+      status: 'active',
+      presentInScene: true,
+      locationId: null,
+      formId: null,
+      formGroup: null,
+      sections: { sec_personality: 'Kind herbalist.' },
+      customFields: {},
+      abilities: ['Brewing'],
+      goals: [],
+      agenda: '',
+      allegiance: '',
+      mood: 'warm',
+      traits: [],
+    });
+    expect(t0Res.value.nextState.scene.presentCharacterIds).toEqual(['hero', 'mira']);
+    expect(t0Res.value.changedPaths.has('entities.characters.mira')).toBe(true);
+    expect(t0Res.value.changedPaths.has('scene.presentCharacterIds')).toBe(true);
+    expect(isOk(validateWorldState(t0Res.value.nextState))).toBe(true);
+
+    // Upserting player character when not in presentCharacterIds does not add player characterId
+    const t0PlayerNotPresent = cloneWorldState(t0Initial);
+    t0PlayerNotPresent.scene.presentCharacterIds = [];
+    const heroUpsertRes = applyPatchBatch(t0PlayerNotPresent, {
+      eventId: 'evt-upsert-hero',
+      source: 'engine',
+      operations: [
+        {
+          op: 'character_upsert',
+          characterId: 'hero',
+          character: { name: 'Hero Updated', mood: 'brave' },
+        },
+      ],
+    });
+    expect(isOk(heroUpsertRes)).toBe(true);
+    if (heroUpsertRes.ok) {
+      expect(heroUpsertRes.value.nextState.scene.presentCharacterIds).toEqual([]);
+    }
+
+    // Tier 1 (emergent): defaults locationId to state.scene.locationId and syncs presence when active & here
+    const t1Initial = makeTestState();
+    const t1Res = applyPatchBatch(t1Initial, {
+      eventId: 'evt-upsert-t1',
+      source: 'engine',
+      operations: [
+        {
+          op: 'character_upsert',
+          characterId: 'lyra',
+          character: {
+            name: 'Lyra',
+            progression: { level: 3, xp: 250, className: 'Scout' },
+            resources: { hp: { current: 22, max: 22 } },
+          },
+        },
+        {
+          op: 'character_upsert',
+          characterId: 'distant_courier',
+          character: {
+            name: 'Distant Courier',
+            locationId: 'watchtower',
+          },
+        },
+      ],
+    });
+    expect(isOk(t1Res)).toBe(true);
+    if (!t1Res.ok) return;
+
+    expect(t1Res.value.nextState.entities.characters['lyra']?.locationId).toBe('courtyard');
+    expect(t1Res.value.nextState.entities.characters['lyra']?.presentInScene).toBe(false);
+    expect(t1Res.value.nextState.scene.presentCharacterIds).toContain('lyra');
+    expect(t1Res.value.nextState.scene.presentCharacterIds).not.toContain('distant_courier');
+    expect(t1Res.value.auditEntries.map((e) => e.op)).toEqual([
+      'character_upsert',
+      'character_upsert',
+    ]);
+  });
+
+  it('merges existing characters without clobbering fields and rejects atomically when mergeIfExists is false', () => {
+    const initial = makeTestState();
+    const snapshot = cloneWorldState(initial);
+
+    // Merge updates mood and adds a section while preserving existing sections, customFields, abilities, goals, traits
+    const mergeRes = applyPatchBatch(initial, {
+      eventId: 'evt-upsert-merge',
+      source: 'engine',
+      operations: [
+        {
+          op: 'character_upsert',
+          characterId: 'castellan',
+          character: {
+            name: 'Castellan Vance',
+            mood: 'relieved',
+            sections: { sec_appearance: 'Polished breastplate.' },
+            customFields: { trust: 10 },
+          },
+        },
+      ],
+    });
+    expect(isOk(mergeRes)).toBe(true);
+    if (!mergeRes.ok) return;
+
+    const updated = mergeRes.value.nextState.entities.characters['castellan'];
+    expect(updated?.mood).toBe('relieved');
+    expect(updated?.agenda).toBe('Question visitors');
+    expect(updated?.abilities).toEqual(['Command']);
+    expect(updated?.sections).toEqual({
+      sec_personality: 'Stern and calculating.',
+      sec_appearance: 'Polished breastplate.',
+    });
+    expect(updated?.customFields).toEqual({
+      suspicion: 25,
+      trust: 10,
+    });
+    expect(mergeRes.value.changedPaths.has('entities.characters.castellan')).toBe(true);
+
+    // Player character upsert never adds player.characterId to scene.presentCharacterIds
+    const withoutPlayerPresent = cloneWorldState(initial);
+    withoutPlayerPresent.scene.presentCharacterIds = ['castellan'];
+    const playerMergeRes = applyPatchBatch(withoutPlayerPresent, {
+      eventId: 'evt-upsert-player',
+      source: 'engine',
+      operations: [
+        {
+          op: 'character_upsert',
+          characterId: 'elena',
+          character: { name: 'Elena', mood: 'determined' },
+        },
+      ],
+    });
+    expect(isOk(playerMergeRes)).toBe(true);
+    if (playerMergeRes.ok) {
+      expect(playerMergeRes.value.nextState.scene.presentCharacterIds).toEqual(['castellan']);
+    }
+
+    // mergeIfExists: false rejects existing character and rolls back earlier ops atomically
+    const conflictRes = applyPatchBatch(initial, {
+      eventId: 'evt-upsert-conflict',
+      source: 'engine',
+      operations: [
+        { op: 'set', path: 'flags.met_castellan', value: true },
+        {
+          op: 'character_upsert',
+          characterId: 'castellan',
+          character: { name: 'Duplicate Vance' },
+          mergeIfExists: false,
+        },
+      ],
+    });
+    expect(isErr(conflictRes)).toBe(true);
+    if (!conflictRes.ok) {
+      expect(conflictRes.error[0]?.code).toBe('ENTITY_ALREADY_EXISTS');
+    }
+    expect(initial).toEqual(snapshot);
+  });
+
+  it('rejects unsafe keys/IDs in character_upsert atomically and enforces tracker field policies', () => {
+    const initial = makeTestState();
+    const snapshot = cloneWorldState(initial);
+    const compiledSchema = makeCompiledSchema();
+
+    for (const badId of ['__proto__', 'constructor', 'prototype', 'a.b', 'a/b', '  ']) {
+      const badRes = applyPatchBatch(initial, {
+        eventId: `evt-bad-id-${badId}`,
+        source: 'engine',
+        operations: [
+          { op: 'set', path: 'flags.met_castellan', value: true },
+          {
+            op: 'character_upsert',
+            characterId: badId,
+            character: { name: 'Bad' },
+          },
+        ],
+      });
+      expect(isErr(badRes)).toBe(true);
+      expect(initial).toEqual(snapshot);
+    }
+
+    const pollutedSections = JSON.parse('{"__proto__": "evil"}') as Record<string, string>;
+    const protoSectionRes = applyPatchBatch(initial, {
+      eventId: 'evt-proto-sec',
+      source: 'engine',
+      operations: [
+        { op: 'set', path: 'flags.met_castellan', value: true },
+        {
+          op: 'character_upsert',
+          characterId: 'new_npc',
+          character: {
+            name: 'New NPC',
+            sections: pollutedSections,
+          },
+        },
+      ],
+    });
+    expect(isErr(protoSectionRes)).toBe(true);
+    expect(initial).toEqual(snapshot);
+
+    // Tracker source strips/rejects locked NPC sections & locked combat resources while committing valid character
+    const trackerRes = applyPatchBatch(
+      initial,
+      {
+        eventId: 'evt-tracker-upsert',
+        source: 'tracker',
+        operations: [
+          {
+            op: 'character_upsert',
+            characterId: 'rook',
+            character: {
+              name: 'Rook',
+              mood: 'guarded',
+              sections: {
+                sec_personality: 'Attempted overwrite of locked NPC section',
+              },
+              resources: {
+                hp: { current: 50, max: 50 },
+              },
+              progression: {
+                level: 10,
+                xp: 9999,
+              },
+            },
+          },
+        ],
+      },
+      { compiledSchema }
+    );
+    expect(isOk(trackerRes)).toBe(true);
+    if (!trackerRes.ok) return;
+
+    const rook = trackerRes.value.nextState.entities.characters['rook'];
+    expect(rook?.name).toBe('Rook');
+    expect(rook?.mood).toBe('guarded');
+    expect(rook?.sections['sec_personality']).toBeUndefined();
+    expect(rook?.resources?.['hp']).toBeUndefined();
+    expect(rook?.progression).toBeUndefined();
+    expect(trackerRes.value.rejectedOperations.length).toBeGreaterThanOrEqual(4);
+  });
 });

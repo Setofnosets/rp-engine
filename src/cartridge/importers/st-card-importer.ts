@@ -3,6 +3,7 @@ import type { BeatDefinition } from '../../beats/beat-ledger.js';
 import type { PredicateAst } from '../../beats/predicate-ast.js';
 import { type ValidationError, validationError } from '../../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../../core/result.js';
+import type { CharacterEntity } from '../../state/world-state.js';
 import {
   type CartridgeBundle,
   isPlainObject,
@@ -14,6 +15,7 @@ import {
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const DEFAULT_RECOMMENDED_SYSTEM_PACK = 'stock-slice-of-life';
+const MAX_SEEDED_BACKGROUND_CHARS = 1200;
 
 function sanitizeJsonValue(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -60,6 +62,30 @@ function slugifyId(raw: string, fallback: string): string {
     return fallback;
   }
   return slug;
+}
+
+function slugifyCharacterId(raw: string, fallback: string): string {
+  const trimmedLower = raw.trim().toLowerCase();
+  const safeFallback =
+    fallback.trim().length > 0 && !isUnsafeRecordKey(fallback.trim())
+      ? fallback.trim()
+      : 'character';
+  if (isUnsafeRecordKey(trimmedLower)) {
+    return safeFallback;
+  }
+  const slug = trimmedLower.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  if (slug.length === 0 || isUnsafeRecordKey(slug)) {
+    return safeFallback;
+  }
+  return slug;
+}
+
+function buildBackgroundSummary(rawDescription: string): string {
+  const trimmed = rawDescription.trim();
+  if (trimmed.length <= MAX_SEEDED_BACKGROUND_CHARS) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, MAX_SEEDED_BACKGROUND_CHARS - 3).trimEnd()}...`;
 }
 
 function decodeBase64OrJsonString(rawText: string): Result<unknown, ValidationError[]> {
@@ -508,6 +534,36 @@ export function importSillyTavernCard(
 
   const recommendedSystemPack = options.recommendedSystemPack ?? DEFAULT_RECOMMENDED_SYSTEM_PACK;
   const cardId = slugifyId(name, 'imported-st-card');
+  const charId = slugifyCharacterId(name, cardId);
+
+  const seededSections: Record<string, string | string[]> = {};
+  if (personality.length > 0) {
+    setSafeProperty(seededSections, 'sec_personality', personality);
+  }
+  const trimmedDescription = rawDescription.trim();
+  if (trimmedDescription.length > 0) {
+    setSafeProperty(seededSections, 'sec_background', buildBackgroundSummary(trimmedDescription));
+  }
+
+  const seededCharacter: CharacterEntity = {
+    id: charId,
+    name,
+    status: 'active',
+    presentInScene: true,
+    locationId: null,
+    formId: null,
+    formGroup: null,
+    sections: seededSections,
+    customFields: {},
+    abilities: [],
+    goals: [],
+    agenda: '',
+    allegiance: '',
+    mood: 'neutral',
+    traits: [],
+  };
+  const initialCharacters: Record<string, CharacterEntity> = {};
+  setSafeProperty(initialCharacters, charId, seededCharacter);
 
   const bundle: CartridgeBundle = {
     rootDir: null,
@@ -517,7 +573,7 @@ export function importSillyTavernCard(
       version: characterVersion,
       title: name,
       ...(creator !== undefined && creator.length > 0 ? { author: creator } : {}),
-      description: rawDescription.trim() || `${name} (imported SillyTavern card)`,
+      description: trimmedDescription || `${name} (imported SillyTavern card)`,
       recommendedSystemPack,
       persona: {
         name,
@@ -526,6 +582,9 @@ export function importSillyTavernCard(
         ...(firstMessage.trim().length > 0 ? { firstMessage } : {}),
         ...(combinedSystemPrompt.length > 0 ? { systemPrompt: combinedSystemPrompt } : {}),
       },
+    },
+    initialEntities: {
+      characters: initialCharacters,
     },
     beats,
     routes: [],

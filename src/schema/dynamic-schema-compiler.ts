@@ -43,6 +43,10 @@ export interface CadenceContext {
   manualTrigger?: boolean;
 }
 
+export interface TrackerCompileContext extends CadenceContext {
+  autoRegisterEmergentNpcs?: boolean;
+}
+
 export interface CompiledTrackerSchema {
   trackerJsonSchema: Record<string, unknown> | null;
   activeTrackerInstructions: string[];
@@ -292,7 +296,7 @@ export function isCadenceDue(cadence: CadencePolicy, context: CadenceContext): b
  */
 export function compileActiveTrackerSchema(
   config: EffectiveSystemConfig,
-  context: CadenceContext
+  context: TrackerCompileContext
 ): CompiledTrackerSchema {
   const fieldPolicyMap = new Map<string, CompiledFieldPolicy>();
   const activeTrackerInstructions: string[] = [];
@@ -750,6 +754,45 @@ export function compileActiveTrackerSchema(
       fieldPolicyMap,
       dueModuleIds,
     };
+  }
+
+  if (context.autoRegisterEmergentNpcs === true) {
+    rootProperties['new_characters'] = {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['id', 'name'],
+        properties: {
+          id: {
+            type: 'string',
+            maxLength: 64,
+            description: 'Unique lowercase snake_case identifier for the newly introduced NPC',
+          },
+          name: {
+            type: 'string',
+            maxLength: 120,
+            description: 'Display name of the newly introduced NPC',
+          },
+          mood: { type: 'string', maxLength: 64 },
+          allegiance: { type: 'string', maxLength: 64 },
+          traits: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 10,
+          },
+          presentInScene: { type: 'boolean' },
+          sections: {
+            type: 'object',
+            additionalProperties: false,
+            properties: { ...npcSectionProperties },
+          },
+        },
+      },
+    };
+    activeTrackerInstructions.push(
+      'Populate new_characters ONLY for newly introduced named NPCs not already in Known character IDs, using a unique lowercase snake_case id (maximum 5 per turn).'
+    );
   }
 
   return {

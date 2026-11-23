@@ -7,6 +7,7 @@ import {
 import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import type { AuditEntry } from '../state/audit-log.js';
+import type { FormDefinition } from '../state/forms.js';
 import type { PatchOperation } from '../state/patch.js';
 import { type ReducerOptions, applyPatchBatch } from '../state/reducer.js';
 import { type WorldState, cloneWorldState } from '../state/world-state.js';
@@ -38,6 +39,7 @@ export interface ApplyDirectorSteeringParams {
   readonly steering: DirectorSteeringInput;
   readonly beats?: readonly BeatDefinition[];
   readonly reducerOptions?: ReducerOptions;
+  readonly formDefinitions?: readonly FormDefinition[];
 }
 
 export interface ApplyDirectorSteeringResult {
@@ -292,7 +294,7 @@ export function applyDirectorSteering(
     slotsElapsed += batchRes.value.slotsElapsed;
 
     if (hasCastAdjustment) {
-      const cast = computeLocationCast(currentState);
+      const cast = computeLocationCast(currentState, params.formDefinitions);
       if (!arraysEqual(cast.presentCharacterIds, currentState.scene.presentCharacterIds)) {
         const castSyncRes = applyPatchBatch(
           currentState,

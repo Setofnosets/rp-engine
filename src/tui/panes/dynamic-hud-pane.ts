@@ -132,6 +132,29 @@ export function renderDynamicHudPane(params: RenderDynamicHudPaneParams): string
     lines.push(truncateLine(`Clock: ${clockStr} | StoryTurn: ${state.clocks.storyTurn}`, width));
   }
 
+  const allCharIds = Object.keys(state.entities.characters).filter(isSafeRecordKey);
+  const presentNames: string[] = [];
+  const seenPresent = new Set<string>();
+  for (const cid of state.scene.presentCharacterIds) {
+    if (!isSafeRecordKey(cid) || seenPresent.has(cid)) {
+      continue;
+    }
+    seenPresent.add(cid);
+    const char = getSafeOwn(state.entities.characters, cid);
+    presentNames.push(char !== undefined && char.name.trim().length > 0 ? char.name : cid);
+  }
+  const countSuffix = ` (${presentNames.length}/${allCharIds.length})`;
+  const castPrefix = 'Cast: ';
+  const maxNamesLen = Math.max(0, width - castPrefix.length - countSuffix.length);
+  const rawNames = presentNames.length > 0 ? presentNames.join(', ') : 'none';
+  const fittedNames =
+    rawNames.length <= maxNamesLen
+      ? rawNames
+      : maxNamesLen <= 3
+        ? rawNames.slice(0, maxNamesLen)
+        : `${rawNames.slice(0, maxNamesLen - 3)}...`;
+  lines.push(truncateLine(`${castPrefix}${fittedNames}${countSuffix}`, width));
+
   if (caps.progression !== 'disabled' && state.player.progression !== undefined) {
     const prog = state.player.progression;
     const classPart = prog.className ? ` ${prog.className}` : '';
