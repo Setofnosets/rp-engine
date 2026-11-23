@@ -1,0 +1,219 @@
+/* Referee Engine SillyTavern Bridge Styles (scoped under .referee-bridge-*) */
+
+.referee-bridge-root {
+  font-family: inherit;
+  color: var(--SmartThemeBodyColor, #e5e7eb);
+  background: var(--SmartThemeBlurTintColor, rgba(20, 24, 34, 0.92));
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.14));
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 6px 0;
+  font-size: 0.88rem;
+  line-height: 1.4;
+}
+
+.referee-bridge-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.referee-bridge-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  letter-spacing: 0.01em;
+}
+
+.referee-bridge-pill,
+.referee-bridge-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+  background: rgba(148, 163, 184, 0.18);
+  border: 1px solid rgba(148, 163, 184, 0.28);
+}
+
+.referee-bridge-badge--matches_stock {
+  background: rgba(34, 197, 94, 0.16);
+  border-color: rgba(34, 197, 94, 0.4);
+  color: #86efac;
+}
+
+.referee-bridge-badge--from_cartridge {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(59, 130, 246, 0.45);
+  color: #93c5fd;
+}
+
+.referee-bridge-badge--user_customized {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fcd34d;
+}
+
+.referee-bridge-hud-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+}
+
+.referee-bridge-widget {
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+.referee-bridge-widget-title {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.78;
+  margin-bottom: 6px;
+}
+
+.referee-bridge-meter-row {
+  margin: 4px 0;
+}
+
+.referee-bridge-meter-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.8rem;
+  margin-bottom: 2px;
+}
+
+.referee-bridge-meter-track {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.referee-bridge-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  transition: width 150ms ease;
+}
+
+.referee-bridge-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.referee-bridge-tag {
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.76rem;
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.referee-bridge-tag--pinned {
+  border: 1px solid rgba(245, 158, 11, 0.5);
+  color: #fde68a;
+}
+
+.referee-bridge-toast {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.12);
+}
+
+.referee-bridge-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.referee-bridge-btn {
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font-size: 0.8rem;
+}
+
+.referee-bridge-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.referee-bridge-btn--primary {
+  background: rgba(59, 130, 246, 0.3);
+  border-color: rgba(59, 130, 246, 0.6);
+}
+
+.referee-bridge-btn--active {
+  background: rgba(245, 158, 11, 0.3);
+  border-color: rgba(245, 158, 11, 0.65);
+}
+
+/* Director Bar */
+.referee-bridge-director-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.referee-bridge-input,
+.referee-bridge-textarea,
+.referee-bridge-select {
+  background: rgba(0, 0, 0, 0.35);
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 0.82rem;
+}
+
+/* Control Room Modal & Wizard Drawer */
+.referee-bridge-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border-radius: 10px;
+  background: var(--SmartThemeBlurTintColor, #111827);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+}
+
+.referee-bridge-section-card {
+  padding: 10px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.referee-bridge-pack-list,
+.referee-bridge-group-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 6px;
+}
+
+.referee-bridge-wizard-drawer {
+  padding: 10px;
+  border-radius: 6px;
+  border: 1px dashed rgba(96, 165, 250, 0.45);
+  background: rgba(30, 58, 138, 0.16);
+}

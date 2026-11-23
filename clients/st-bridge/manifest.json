@@ -1,0 +1,11 @@
+{
+  "display_name": "Referee Engine Bridge",
+  "loading_order": 5,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Referee Engine",
+  "version": "0.1.0",
+  "generate_interceptor": "refereeGenerateInterceptor"
+}
