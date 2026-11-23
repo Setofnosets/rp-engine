@@ -1,0 +1,93 @@
+{
+  "skills": [
+    {
+      "id": "halberd_sweep",
+      "name": "Halberd Sweep",
+      "description": "A wide sweeping polearm arc striking nearby foes.",
+      "category": "attack",
+      "actionCost": "action",
+      "resourceCosts": { "stamina": 2 },
+      "cooldownTurns": 1,
+      "targeting": {
+        "shape": "aoe_radius",
+        "minRange": 1,
+        "maxRange": 2,
+        "radius": 1,
+        "requiresLos": true
+      },
+      "hitResolution": {
+        "kind": "attack_roll",
+        "stat": "str"
+      },
+      "effects": [
+        {
+          "type": "damage",
+          "dice": "2d6",
+          "flat": 3,
+          "scalingStat": "str"
+        }
+      ],
+      "tags": ["melee", "polearm", "aoe"]
+    },
+    {
+      "id": "basic_strike",
+      "name": "Basic Strike",
+      "description": "A standard melee weapon strike against an adjacent foe.",
+      "category": "attack",
+      "actionCost": "action",
+      "resourceCosts": {},
+      "targeting": {
+        "shape": "single_enemy",
+        "minRange": 1,
+        "maxRange": 1,
+        "requiresLos": true
+      },
+      "hitResolution": {
+        "kind": "attack_roll",
+        "stat": "str"
+      },
+      "effects": [
+        {
+          "type": "damage",
+          "dice": "1d8",
+          "scalingStat": "str"
+        }
+      ],
+      "tags": ["melee", "weapon"]
+    },
+    {
+      "id": "shield_bash",
+      "name": "Shield Bash",
+      "description": "Slams a heavy shield into an adjacent enemy, staggering them.",
+      "category": "skill",
+      "actionCost": "action",
+      "resourceCosts": { "stamina": 1 },
+      "cooldownTurns": 1,
+      "targeting": {
+        "shape": "single_enemy",
+        "minRange": 1,
+        "maxRange": 1,
+        "requiresLos": true
+      },
+      "hitResolution": {
+        "kind": "attack_roll",
+        "stat": "str"
+      },
+      "effects": [
+        {
+          "type": "damage",
+          "dice": "1d6",
+          "flat": 2,
+          "scalingStat": "str"
+        },
+        {
+          "type": "apply_status",
+          "statusId": "stunned",
+          "statusDuration": 1,
+          "statusIntensity": 1
+        }
+      ],
+      "tags": ["melee", "shield", "control"]
+    }
+  ]
+}

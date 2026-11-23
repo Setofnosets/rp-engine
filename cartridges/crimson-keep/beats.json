@@ -1,0 +1,75 @@
+[
+  {
+    "id": "castellan-intro",
+    "act": "Act I",
+    "class": "gate",
+    "priority": 30,
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 1
+    },
+    "until": {
+      "any": [
+        { "mentions": ["castellan", "oath", "greet"], "window": 4 },
+        { "flag": "met_castellan" }
+      ]
+    },
+    "lore": "lore/castellan.md",
+    "nudge": "Speak with Castellan Aldric in the courtyard and declare your intent.",
+    "on_resolve": [
+      { "set": { "flags.met_castellan": true } }
+    ]
+  },
+  {
+    "id": "defeat-guards",
+    "act": "Act I",
+    "class": "gate",
+    "priority": 20,
+    "requires": ["castellan-intro"],
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 1
+    },
+    "until": {
+      "any": [
+        { "entity": ["characters", "captain_varek", "status"], "op": "==", "value": "dead" },
+        { "flag": "guards_defeated" }
+      ]
+    },
+    "nudge": "Overcome Captain Varek's guard blocking the Great Hall.",
+    "on_resolve": [
+      { "set": { "flags.guards_defeated": true } }
+    ]
+  },
+  {
+    "id": "archive-discovery",
+    "act": "Act II",
+    "class": "gate",
+    "priority": 10,
+    "requires": ["defeat-guards"],
+    "when": {
+      "at": "keep.archive"
+    },
+    "until": {
+      "any": [
+        { "mentions": ["ledger", "tome", "archive"], "window": 4 },
+        { "flag": "archive_read" }
+      ]
+    },
+    "nudge": "Examine the ancient Crimson Archive ledgers to uncover the truth of the Eclipse.",
+    "on_resolve": [
+      { "set": { "flags.archive_discovered": true } }
+    ]
+  },
+  {
+    "id": "torchlight-lore",
+    "class": "ambient",
+    "priority": 5,
+    "when": {
+      "mentions": ["torch", "sigil", "crimson"]
+    },
+    "nudge": "Iron braziers throw flickering light across the weathered sigils of the Crimson Order."
+  }
+]

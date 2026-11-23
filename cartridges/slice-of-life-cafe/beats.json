@@ -1,0 +1,11 @@
+[
+  {
+    "id": "cafe-menu-lore",
+    "class": "ambient",
+    "priority": 5,
+    "when": {
+      "mentions": ["coffee", "espresso", "pastry"]
+    },
+    "lore": "lore/menu.md"
+  }
+]

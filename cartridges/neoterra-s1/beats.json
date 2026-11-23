@@ -1,0 +1,89 @@
+[
+  {
+    "id": "opening-arms-deal",
+    "act": "Act I",
+    "class": "gate",
+    "priority": 30,
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 1
+    },
+    "until": {
+      "any": [
+        {
+          "all": [
+            { "at": "neon-docks" },
+            { "mentions": ["intercept", "arms", "shipment"] }
+          ]
+        },
+        { "flag": "arms_deal_resolved" }
+      ]
+    },
+    "lore": "lore/clarity.md",
+    "nudge": "Intercept the Clarity arms shipment unloading at the Neon Docks.",
+    "on_resolve": [
+      { "set": { "flags.arms_deal_resolved": true } }
+    ]
+  },
+  {
+    "id": "beast-rumors",
+    "act": "Act I",
+    "class": "nudge",
+    "flexibility": "adaptable",
+    "priority": 20,
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 1
+    },
+    "until": {
+      "any": [
+        { "mentions": ["beast", "subway", "investigate"] },
+        { "flag": "beast_rumors_checked" }
+      ]
+    },
+    "deadline": {
+      "clock": "day",
+      "op": ">=",
+      "value": 3
+    },
+    "deadlinePolicy": "escalate",
+    "nudge": "Investigate reports of biomechanical beasts in the Old Subway before Day 3.",
+    "on_resolve": [
+      { "set": { "flags.beast_rumors_checked": true } }
+    ],
+    "on_deadline": [
+      { "set": { "flags.beast_deadline_missed": true } }
+    ]
+  },
+  {
+    "id": "climax-confrontation",
+    "act": "Act II",
+    "class": "gate",
+    "priority": 15,
+    "requires": ["opening-arms-deal"],
+    "when": {
+      "at": "clarity-hq"
+    },
+    "until": {
+      "any": [
+        { "mentions": ["confront", "claire", "disarm"] },
+        { "flag": "climax_resolved" }
+      ]
+    },
+    "deadline": {
+      "clock": "day",
+      "op": ">=",
+      "value": 5
+    },
+    "deadlinePolicy": "close",
+    "nudge": "Infiltrate Clarity HQ and confront Claire Atropos before Day 5.",
+    "on_resolve": [
+      { "set": { "flags.hero_triumph": true, "flags.climax_resolved": true } }
+    ],
+    "on_deadline": [
+      { "set": { "flags.villain_ascendant": true } }
+    ]
+  }
+]

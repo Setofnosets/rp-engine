@@ -1,0 +1,191 @@
+{
+  "locations": {
+    "central-plaza": {
+      "id": "central-plaza",
+      "name": "Central Plaza",
+      "kind": "district",
+      "status": "normal",
+      "controllingFactionId": "petrabyte",
+      "connectedLocations": ["petrabyte-tower", "neon-docks", "old-subway"],
+      "discovered": true,
+      "tags": ["plaza", "hub"],
+      "notes": "Holographic civic plaza linking midtown towers to the harbor transit line."
+    },
+    "petrabyte-tower": {
+      "id": "petrabyte-tower",
+      "name": "Petrabyte Tower",
+      "kind": "tower",
+      "status": "normal",
+      "controllingFactionId": "petrabyte",
+      "connectedLocations": ["central-plaza", "clarity-hq"],
+      "discovered": true,
+      "tags": ["tower", "corporate", "hq"],
+      "notes": "Glass corporate spire housing Petrabyte Security's command deck."
+    },
+    "neon-docks": {
+      "id": "neon-docks",
+      "name": "Neon Docks",
+      "kind": "harbor",
+      "status": "contested",
+      "controllingFactionId": "clarity",
+      "connectedLocations": ["central-plaza", "old-subway"],
+      "discovered": true,
+      "tags": ["docks", "smuggling"],
+      "notes": "Rain-slicked cargo piers where Clarity cells offload black-market ordnance."
+    },
+    "clarity-hq": {
+      "id": "clarity-hq",
+      "name": "Clarity HQ",
+      "kind": "fortress",
+      "status": "contested",
+      "controllingFactionId": "clarity",
+      "connectedLocations": ["petrabyte-tower", "old-subway"],
+      "discovered": false,
+      "tags": ["hq", "clarity"],
+      "notes": "Fortified relay substation commandeered by Claire Atropos."
+    },
+    "old-subway": {
+      "id": "old-subway",
+      "name": "Old Subway",
+      "kind": "tunnel",
+      "status": "normal",
+      "controllingFactionId": null,
+      "connectedLocations": ["central-plaza", "neon-docks", "clarity-hq"],
+      "discovered": false,
+      "tags": ["subway", "underground"],
+      "notes": "Abandoned maglev tunnels threading beneath NeoTerra's foundation."
+    }
+  },
+  "characters": {
+    "vaiva_civilian": {
+      "id": "vaiva_civilian",
+      "name": "Vaiva",
+      "status": "active",
+      "presentInScene": true,
+      "locationId": "central-plaza",
+      "formId": "form_vaiva_civilian",
+      "formGroup": "vaiva_identity",
+      "sections": {
+        "sec_equipment": "Rain-hooded courier jacket and visor glasses"
+      },
+      "customFields": {},
+      "abilities": ["prism_flash"],
+      "goals": ["Protect civilian cover", "Track Clarity smuggling"],
+      "agenda": "Coordinate quiet reconnaissance for Petrabyte",
+      "allegiance": "petrabyte",
+      "mood": "alert",
+      "traits": ["sharp", "guarded"]
+    },
+    "vaiva_colorgarde": {
+      "id": "vaiva_colorgarde",
+      "name": "Colorgarde",
+      "status": "offscreen",
+      "presentInScene": false,
+      "locationId": null,
+      "formId": "form_vaiva_colorgarde",
+      "formGroup": "vaiva_identity",
+      "sections": {
+        "sec_equipment": "Chromatic exo-rig and hard-light gauntlets",
+        "sec_superpowers": "Refractive hard-light barriers and prism bursts"
+      },
+      "customFields": {},
+      "abilities": ["prism_burst", "hardlight_aegis"],
+      "goals": ["Stop Clarity Uprising", "Defend Central Plaza"],
+      "agenda": "Respond to high-threat metahuman alerts",
+      "allegiance": "petrabyte",
+      "mood": "resolute",
+      "traits": ["heroic", "decisive"]
+    },
+    "aurelia_longshot": {
+      "id": "aurelia_longshot",
+      "name": "Aurelia Longshot",
+      "status": "active",
+      "presentInScene": false,
+      "locationId": "petrabyte-tower",
+      "formId": null,
+      "formGroup": null,
+      "sections": {
+        "sec_equipment": "Long-barrel rail carbine and telemetry monocle",
+        "sec_superpowers": "Ballistic trajectory intuition"
+      },
+      "customFields": {},
+      "abilities": ["rail_snipe"],
+      "goals": ["Secure Petrabyte Tower perimeter"],
+      "agenda": "Provide overwatch across midtown rooftops",
+      "allegiance": "petrabyte",
+      "mood": "focused",
+      "traits": ["precise", "dry"]
+    },
+    "claire_atropos": {
+      "id": "claire_atropos",
+      "name": "Claire Atropos",
+      "status": "active",
+      "presentInScene": false,
+      "locationId": "clarity-hq",
+      "formId": null,
+      "formGroup": null,
+      "sections": {
+        "sec_equipment": "Chronos-weave coat and resonance staff",
+        "sec_superpowers": "Causal thread severing and grid resonance"
+      },
+      "customFields": {},
+      "abilities": ["thread_sever"],
+      "goals": ["Seize NeoTerra transit and power grids"],
+      "agenda": "Direct Clarity Uprising from Clarity HQ",
+      "allegiance": "clarity",
+      "mood": "calculating",
+      "traits": ["ruthless", "visionary"]
+    }
+  },
+  "forms": [
+    {
+      "id": "form_vaiva_civilian",
+      "formGroup": "vaiva_identity",
+      "characterId": "vaiva_civilian",
+      "displayName": "Vaiva (Civilian)",
+      "description": "Civilian courier persona maintaining cover in Central Plaza.",
+      "legalTargets": ["form_vaiva_colorgarde"]
+    },
+    {
+      "id": "form_vaiva_colorgarde",
+      "formGroup": "vaiva_identity",
+      "characterId": "vaiva_colorgarde",
+      "displayName": "Colorgarde",
+      "description": "Chromatic superhero form deployed during open Clarity engagements.",
+      "legalTargets": ["form_vaiva_civilian"]
+    }
+  ],
+  "factions": {
+    "clarity": {
+      "id": "clarity",
+      "name": "Clarity Syndicate",
+      "side": "villain",
+      "status": "active",
+      "influence": 55,
+      "headquartersLocationId": "clarity-hq",
+      "goals": ["Smuggle ordnance via Neon Docks", "Seize NeoTerra grid"]
+    },
+    "petrabyte": {
+      "id": "petrabyte",
+      "name": "Petrabyte Security",
+      "side": "hero",
+      "status": "active",
+      "influence": 60,
+      "headquartersLocationId": "petrabyte-tower",
+      "goals": ["Protect Central Plaza", "Dismantle Clarity arms pipeline"]
+    }
+  },
+  "threats": {
+    "s1_threat_clarity": {
+      "id": "s1_threat_clarity",
+      "name": "Clarity Uprising",
+      "rank": "main",
+      "status": "active",
+      "stage": 1,
+      "progress": 20,
+      "locationId": "clarity-hq",
+      "sourceFactionId": "clarity",
+      "agenda": "Seize NeoTerra's power and subway grid before Day 5"
+    }
+  }
+}

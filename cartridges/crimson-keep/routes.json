@@ -1,0 +1,60 @@
+{
+  "routes": [
+    {
+      "id": "loyal",
+      "lock": "route_loyal",
+      "priority": 2,
+      "when": {
+        "all": [
+          { "beat": "archive-discovery", "status": "resolved" },
+          { "mentions": ["loyalty", "pledge", "castellan"] }
+        ]
+      },
+      "announce": "You swear your oathblade to Castellan Aldric — Loyal Route locked."
+    },
+    {
+      "id": "betrayal",
+      "lock": "route_betrayal",
+      "priority": 1,
+      "when": {
+        "all": [
+          { "beat": "archive-discovery", "status": "resolved" },
+          { "mentions": ["betray", "usurp", "shatter"] }
+        ]
+      },
+      "announce": "You shatter the Crimson Seal and claim the Keep's power — Betrayal Route locked."
+    }
+  ],
+  "endings": [
+    {
+      "id": "true-ending",
+      "route": "loyal",
+      "priority": 2,
+      "when": {
+        "all": [
+          { "at": "keep.sanctum" },
+          { "mentions": ["seal", "eclipse", "restore"] }
+        ]
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/true.md"
+      },
+      "mark": "ending_true"
+    },
+    {
+      "id": "exile-ending",
+      "route": "betrayal",
+      "priority": 1,
+      "when": {
+        "all": [
+          { "at": "keep.sanctum" },
+          { "mentions": ["seize", "exile", "throne"] }
+        ]
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/exile.md"
+      },
+      "mark": "ending_exile"
+    }
+  ]
+}

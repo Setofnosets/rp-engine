@@ -1,0 +1,90 @@
+{
+  "routes": [
+    {
+      "id": "hero-route",
+      "lock": "route_hero",
+      "priority": 2,
+      "when": {
+        "flag": "hero_triumph"
+      },
+      "announce": "Clarity's grid override collapses — Hero Victory route locked."
+    },
+    {
+      "id": "villain-route",
+      "lock": "route_villain",
+      "priority": 1,
+      "when": {
+        "flag": "villain_ascendant"
+      },
+      "announce": "Day 5 arrives unchecked: Clarity Syndicate seizes NeoTerra — Villain Victory route locked."
+    },
+    {
+      "id": "post-resistance",
+      "group": "post_victory",
+      "lock": "route_post_resistance",
+      "priority": 2,
+      "when": {
+        "flag": "joined_resistance"
+      },
+      "announce": "You vanish into the Old Subway to lead the Resistance."
+    },
+    {
+      "id": "post-join-villain",
+      "group": "post_victory",
+      "lock": "route_post_join_villain",
+      "priority": 1,
+      "when": {
+        "flag": "joined_clarity"
+      },
+      "announce": "You accept Claire Atropos's pact under the new Clarity regime."
+    }
+  ],
+  "endings": [
+    {
+      "id": "hero-victory",
+      "route": "hero-route",
+      "priority": 2,
+      "when": {
+        "flag": "hero_triumph"
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/hero-victory.md"
+      },
+      "mark": "ending_hero_victory"
+    },
+    {
+      "id": "villain-victory",
+      "route": "villain-route",
+      "priority": 1,
+      "when": {
+        "flag": "villain_ascendant"
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/villain-victory.md"
+      },
+      "mark": "ending_villain_victory",
+      "branches": [
+        {
+          "id": "resistance",
+          "label": "Lead the Underground Resistance",
+          "activateRoute": "post-resistance",
+          "routeGroup": "post_victory",
+          "targetArc": "post-victory",
+          "patch": {
+            "flags.joined_resistance": true
+          }
+        },
+        {
+          "id": "join-villain",
+          "label": "Join Claire Atropos's Clarity Order",
+          "activateRoute": "post-join-villain",
+          "routeGroup": "post_victory",
+          "targetArc": "post-victory",
+          "patch": {
+            "flags.joined_clarity": true
+          }
+        }
+      ]
+    }
+  ]
+}

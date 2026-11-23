@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 2,
+  "scene": {
+    "location": "Sunlit Corner Cafe",
+    "locationId": null,
+    "presentCharacterIds": [],
+    "pinnedCharacterIds": [],
+    "mood": "warm",
+    "pacing": "slow_burn",
+    "directorNudge": null
+  },
+  "player": {
+    "id": "player",
+    "name": "Guest",
+    "characterId": null,
+    "locationId": null,
+    "inventory": {
+      "items": {},
+      "currency": {}
+    },
+    "customFields": {},
+    "sections": {
+      "sec_equipment": "Light knit sweater and canvas tote"
+    }
+  }
+}

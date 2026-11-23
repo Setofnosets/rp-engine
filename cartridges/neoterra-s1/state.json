@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 2,
+  "clocks": {
+    "turn": 0,
+    "storyTurn": 0,
+    "day": 1,
+    "inGameDate": "2037-03-01",
+    "slot": "evening",
+    "slotsPerDay": ["morning", "afternoon", "evening", "night"],
+    "held": false,
+    "holdReason": null,
+    "timers": {}
+  },
+  "scene": {
+    "location": "Central Plaza",
+    "locationId": "central-plaza",
+    "presentCharacterIds": ["vaiva_civilian"],
+    "pinnedCharacterIds": [],
+    "mood": "charged",
+    "pacing": "balanced",
+    "directorNudge": null
+  },
+  "player": {
+    "id": "player",
+    "name": "Vanguard",
+    "characterId": null,
+    "locationId": "central-plaza",
+    "inventory": {
+      "items": {
+        "encrypted_beacon": 1
+      },
+      "currency": {
+        "credits": 250
+      }
+    },
+    "customFields": {},
+    "sections": {
+      "sec_equipment": "Arc-fiber trench coat and encrypted comm-link"
+    }
+  }
+}

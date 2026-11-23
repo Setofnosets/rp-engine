@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 2,
+  "clocks": {
+    "turn": 0,
+    "storyTurn": 0,
+    "day": 1,
+    "inGameDate": null,
+    "slot": "evening",
+    "slotsPerDay": ["morning", "afternoon", "evening", "night"],
+    "held": false,
+    "holdReason": null,
+    "timers": {}
+  },
+  "scene": {
+    "location": "Outer Courtyard",
+    "locationId": "keep.courtyard",
+    "presentCharacterIds": ["castellan"],
+    "pinnedCharacterIds": [],
+    "mood": "ominous",
+    "pacing": "balanced",
+    "directorNudge": null
+  },
+  "player": {
+    "id": "player",
+    "name": "Kaelen",
+    "characterId": null,
+    "locationId": "keep.courtyard",
+    "progression": {
+      "level": 1,
+      "xp": 0,
+      "className": "Vanguard",
+      "attributes": {
+        "str": 5,
+        "dex": 3,
+        "con": 4,
+        "int": 2,
+        "wis": 2,
+        "cha": 3
+      }
+    },
+    "resources": {
+      "hp": { "current": 40, "max": 40 },
+      "stamina": { "current": 20, "max": 20 },
+      "willpower": { "current": 10, "max": 10 }
+    },
+    "inventory": {
+      "items": {
+        "crimson_seal": 1
+      },
+      "currency": {
+        "gold": 25
+      }
+    },
+    "customFields": {},
+    "sections": {
+      "sec_equipment": "Steel brigandine, heater shield, and oathblade"
+    }
+  }
+}

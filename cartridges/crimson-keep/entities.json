@@ -1,0 +1,113 @@
+{
+  "locations": {
+    "keep.courtyard": {
+      "id": "keep.courtyard",
+      "name": "Outer Courtyard",
+      "kind": "courtyard",
+      "status": "normal",
+      "controllingFactionId": "crimson_order",
+      "connectedLocations": ["keep.great_hall"],
+      "discovered": true,
+      "tags": ["courtyard", "hub"],
+      "notes": "Rain-slicked courtyard beneath the keep gatehouse."
+    },
+    "keep.great_hall": {
+      "id": "keep.great_hall",
+      "name": "Great Hall",
+      "kind": "hall",
+      "status": "contested",
+      "controllingFactionId": "crimson_order",
+      "connectedLocations": ["keep.courtyard", "keep.archive", "keep.sanctum"],
+      "discovered": true,
+      "tags": ["hall", "headquarters"],
+      "notes": "Vaulted hall patrolled by Captain Varek's vanguard."
+    },
+    "keep.archive": {
+      "id": "keep.archive",
+      "name": "Crimson Archive",
+      "kind": "vault",
+      "status": "normal",
+      "controllingFactionId": "crimson_order",
+      "connectedLocations": ["keep.great_hall"],
+      "discovered": false,
+      "tags": ["archive", "secret"],
+      "notes": "Dusty stone vault housing the founding ledgers of the Order."
+    },
+    "keep.sanctum": {
+      "id": "keep.sanctum",
+      "name": "Blood Sanctum",
+      "kind": "sanctum",
+      "status": "contested",
+      "controllingFactionId": "crimson_order",
+      "connectedLocations": ["keep.great_hall"],
+      "discovered": false,
+      "tags": ["sanctum", "ritual"],
+      "notes": "Innermost chamber where the Blood Eclipse ward pulses."
+    }
+  },
+  "characters": {
+    "castellan": {
+      "id": "castellan",
+      "name": "Castellan Aldric",
+      "status": "active",
+      "presentInScene": true,
+      "locationId": "keep.courtyard",
+      "formId": null,
+      "formGroup": null,
+      "sections": {
+        "sec_equipment": "Crimson surcoat over blackened plate"
+      },
+      "customFields": {},
+      "abilities": ["basic_strike", "shield_bash"],
+      "progression": { "level": 1, "xp": 0 },
+      "goals": ["Contain the Blood Eclipse", "Test Kaelen's loyalty"],
+      "agenda": "Preserve the Keep's ancient ward",
+      "allegiance": "crimson_order",
+      "mood": "stern",
+      "traits": ["vigilant", "sworn"]
+    },
+    "captain_varek": {
+      "id": "captain_varek",
+      "name": "Captain Varek",
+      "status": "active",
+      "presentInScene": false,
+      "locationId": "keep.great_hall",
+      "formId": null,
+      "formGroup": null,
+      "sections": {
+        "sec_equipment": "Heavy crimson half-plate and poleaxe"
+      },
+      "customFields": {},
+      "abilities": ["basic_strike", "halberd_sweep"],
+      "goals": ["Bar intruders from the Great Hall"],
+      "agenda": "Enforce martial lockdown across the keep",
+      "allegiance": "crimson_order",
+      "mood": "hostile",
+      "traits": ["ruthless", "disciplined"]
+    }
+  },
+  "factions": {
+    "crimson_order": {
+      "id": "crimson_order",
+      "name": "The Crimson Order",
+      "side": "neutral",
+      "status": "active",
+      "influence": 65,
+      "headquartersLocationId": "keep.great_hall",
+      "goals": ["Guard the Blood Sanctum", "Contain the Blood Eclipse"]
+    }
+  },
+  "threats": {
+    "blood_eclipse": {
+      "id": "blood_eclipse",
+      "name": "The Blood Eclipse",
+      "rank": "main",
+      "status": "active",
+      "stage": 1,
+      "progress": 25,
+      "locationId": "keep.sanctum",
+      "sourceFactionId": "crimson_order",
+      "agenda": "Unseal the Blood Sanctum beneath the eclipse"
+    }
+  }
+}
