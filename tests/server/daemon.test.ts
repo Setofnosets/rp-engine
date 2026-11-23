@@ -1,3 +1,6 @@
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createMockModelGateway } from '../../src/gateway/mock-provider.js';
 import { RefereeDaemon } from '../../src/server/daemon.js';
@@ -688,5 +691,460 @@ describe('PR-6.1: Localhost HTTP & SSE Service Daemon', () => {
 
     expect(maxConcurrentTurns).toBe(1);
     expect([t1.turn, t2.turn, t3.turn].sort((a, b) => a - b)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('PR-7.12: Daemon dataDir Wiring & Complete REST API', () => {
+  const activeDaemons: RefereeDaemon[] = [];
+  const tempDirs: string[] = [];
+
+  async function makeTempDir(prefix: string): Promise<string> {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+    tempDirs.push(dir);
+    return dir;
+  }
+
+  afterEach(async () => {
+    while (activeDaemons.length > 0) {
+      const daemon = activeDaemons.pop();
+      if (daemon !== undefined) {
+        await daemon.stop();
+      }
+    }
+    while (tempDirs.length > 0) {
+      const dir = tempDirs.pop();
+      if (dir !== undefined) {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('persists connections (with sampling params & role removal) and named profiles across daemon restart', async () => {
+    const dataDir = await makeTempDir('referee-daemon-conn-');
+    const daemon1 = new RefereeDaemon({ host: '127.0.0.1', port: 0, dataDir });
+    activeDaemons.push(daemon1);
+    const addr1 = await daemon1.start();
+
+    // Update connections with full sampling params + timeoutMs + supportsJsonSchema
+    const putRes = await fetch(`${addr1.url}/api/connections`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        defaultConnection: {
+          provider: 'openai_compatible',
+          baseUrl: 'http://127.0.0.1:8080/v1',
+          model: 'default-model',
+          apiKey: 'secret-default-key',
+          timeoutMs: 15000,
+          supportsJsonSchema: true,
+          temperature: 0.65,
+          maxTokens: 1024,
+          topP: 0.92,
+          minP: 0.05,
+        },
+        connections: {
+          narrator: {
+            provider: 'openai_compatible',
+            baseUrl: 'http://127.0.0.1:8080/v1',
+            model: 'narrator-model',
+            apiKey: 'secret-narrator-key',
+            temperature: 0.85,
+          },
+          state_tracker: {
+            provider: 'ollama',
+            baseUrl: 'http://127.0.0.1:11434',
+            model: 'tracker-model',
+          },
+        },
+      }),
+    });
+    expect(putRes.status).toBe(200);
+    const putJson = (await putRes.json()) as {
+      ok: boolean;
+      defaultConnection: { model: string; temperature: number; timeoutMs: number; supportsJsonSchema: boolean };
+      connections: Record<string, { model: string; temperature?: number }>;
+    };
+    expect(putJson.defaultConnection.temperature).toBe(0.65);
+    expect(putJson.defaultConnection.timeoutMs).toBe(15000);
+    expect(putJson.defaultConnection.supportsJsonSchema).toBe(true);
+    expect(putJson.connections.narrator?.model).toBe('narrator-model');
+    expect(putJson.connections.state_tracker?.model).toBe('tracker-model');
+
+    // Remove state_tracker override with null
+    const removeRoleRes = await fetch(`${addr1.url}/api/connections`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        connections: {
+          state_tracker: null,
+        },
+      }),
+    });
+    expect(removeRoleRes.status).toBe(200);
+    const removeRoleJson = (await removeRoleRes.json()) as {
+      connections: Record<string, unknown>;
+    };
+    expect(removeRoleJson.connections.state_tracker).toBeUndefined();
+
+    // Save named profile & activate it
+    const saveProfileRes = await fetch(`${addr1.url}/api/connections/profiles`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'local-fast',
+        defaultConnection: {
+          provider: 'ollama',
+          baseUrl: 'http://127.0.0.1:11434',
+          model: 'llama3.2',
+          apiKey: 'profile-secret',
+          temperature: 0.5,
+        },
+      }),
+    });
+    expect(saveProfileRes.status).toBe(201);
+
+    const activateRes = await fetch(`${addr1.url}/api/connections/profiles/local-fast/activate`, {
+      method: 'POST',
+    });
+    expect(activateRes.status).toBe(200);
+    const activateJson = (await activateRes.json()) as {
+      activeProfile: string;
+      defaultConnection: { model: string };
+    };
+    expect(activateJson.activeProfile).toBe('local-fast');
+    expect(activateJson.defaultConnection.model).toBe('llama3.2');
+
+    // Verify redaction on GET /api/connections?redact=true
+    const redactedRes = await fetch(`${addr1.url}/api/connections?redact=true`);
+    expect(redactedRes.status).toBe(200);
+    const redactedJson = (await redactedRes.json()) as {
+      defaultConnection: { apiKey?: string };
+      activeProfile: string;
+      profiles: Record<string, { defaultConnection?: { apiKey?: string } }>;
+    };
+    expect(redactedJson.defaultConnection.apiKey).toBe('***');
+    expect(redactedJson.profiles['local-fast']?.defaultConnection?.apiKey).toBe('***');
+
+    await daemon1.stop();
+
+    // Restart daemon on same dataDir and verify connections & profiles reloaded
+    const daemon2 = new RefereeDaemon({ host: '127.0.0.1', port: 0, dataDir });
+    activeDaemons.push(daemon2);
+    const addr2 = await daemon2.start();
+
+    const getRes2 = await fetch(`${addr2.url}/api/connections`);
+    expect(getRes2.status).toBe(200);
+    const getJson2 = (await getRes2.json()) as {
+      activeProfile: string;
+      defaultConnection: { model: string; temperature: number };
+      profiles: Record<string, unknown>;
+    };
+    expect(getJson2.activeProfile).toBe('local-fast');
+    expect(getJson2.defaultConnection.model).toBe('llama3.2');
+    expect(getJson2.defaultConnection.temperature).toBe(0.5);
+    expect(getJson2.profiles['local-fast']).toBeDefined();
+
+    // Delete profile
+    const delRes = await fetch(`${addr2.url}/api/connections/profiles/local-fast`, {
+      method: 'DELETE',
+    });
+    expect(delRes.status).toBe(200);
+    const delJson = (await delRes.json()) as {
+      deleted: string;
+      activeProfile: string | null;
+      profiles: Record<string, unknown>;
+    };
+    expect(delJson.deleted).toBe('local-fast');
+    expect(delJson.activeProfile).toBeNull();
+    expect(delJson.profiles['local-fast']).toBeUndefined();
+  });
+
+  it('supports ST preset import, apply to session, sheetPresetId, export round-trip, and preset deletion', async () => {
+    const dataDir = await makeTempDir('referee-daemon-presets-');
+    const daemon = new RefereeDaemon({ host: '127.0.0.1', port: 0, dataDir });
+    activeDaemons.push(daemon);
+    const addr = await daemon.start();
+
+    // Create a session
+    const sessRes = await fetch(`${addr.url}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'preset-sess' }),
+    });
+    expect(sessRes.status).toBe(201);
+
+    // Import ST Chat Completion preset and apply to session
+    const importRes = await fetch(`${addr.url}/api/presets/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: 'noir-chat-preset',
+        name: 'Noir Chat Preset',
+        sessionId: 'preset-sess',
+        preset: {
+          temperature: 0.77,
+          openai_max_tokens: 600,
+          openai_max_context: 8192,
+          prompts: [
+            {
+              identifier: 'main',
+              name: 'Main Prompt',
+              role: 'system',
+              content: 'Write atmospheric noir prose.',
+            },
+          ],
+          prompt_order: [
+            {
+              character_id: 100000,
+              order: [{ identifier: 'main', enabled: true }],
+            },
+          ],
+        },
+      }),
+    });
+    expect(importRes.status).toBe(201);
+    const importJson = (await importRes.json()) as {
+      ok: boolean;
+      presetId: string;
+      format: string;
+      generation: { temperature?: number; maxTokens?: number };
+    };
+    expect(importJson.ok).toBe(true);
+    expect(importJson.presetId).toBe('noir-chat-preset');
+    expect(importJson.format).toBe('st_chat_completion');
+    expect(importJson.generation.temperature).toBe(0.77);
+
+    // Verify GET /api/presets lists it
+    const listRes = await fetch(`${addr.url}/api/presets`);
+    expect(listRes.status).toBe(200);
+    const listJson = (await listRes.json()) as { presets: Array<{ id: string }> };
+    expect(listJson.presets.map((p) => p.id)).toContain('noir-chat-preset');
+
+    // Apply sheetPresetId + presetId via /control-room/apply-preset
+    const applyRes = await fetch(`${addr.url}/api/sessions/preset-sess/control-room/apply-preset`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        presetId: 'noir-chat-preset',
+        sheetPresetId: 'dnd-adventurer',
+        target: 'pc',
+      }),
+    });
+    expect(applyRes.status).toBe(200);
+    const applyJson = (await applyRes.json()) as {
+      ok: boolean;
+      config: { generation?: { temperature?: number }; pcCoreSections: Array<{ id: string }> };
+    };
+    expect(applyJson.config.generation?.temperature).toBe(0.77);
+    expect(applyJson.config.pcCoreSections.length).toBeGreaterThan(0);
+
+    // Export in st_chat, st_text, and referee formats
+    const exportChat = await fetch(`${addr.url}/api/sessions/preset-sess/preset/export?format=st_chat`);
+    expect(exportChat.status).toBe(200);
+    const exportChatJson = (await exportChat.json()) as {
+      ok: boolean;
+      format: string;
+      preset: { temperature?: number; prompts?: unknown[] };
+    };
+    expect(exportChatJson.format).toBe('st_chat');
+    expect(exportChatJson.preset.temperature).toBe(0.77);
+    expect(Array.isArray(exportChatJson.preset.prompts)).toBe(true);
+
+    const exportText = await fetch(`${addr.url}/api/sessions/preset-sess/preset/export?format=st_text`);
+    expect(exportText.status).toBe(200);
+    const exportTextJson = (await exportText.json()) as { format: string; preset: { temp?: number } };
+    expect(exportTextJson.format).toBe('st_text');
+
+    const exportRef = await fetch(`${addr.url}/api/sessions/preset-sess/preset/export?format=referee`);
+    expect(exportRef.status).toBe(200);
+    const exportRefJson = (await exportRef.json()) as { format: string; preset: { packId: string } };
+    expect(exportRefJson.format).toBe('referee');
+    expect(exportRefJson.preset.packId).toBe('stock-freeform');
+
+    // Delete preset
+    const delPresetRes = await fetch(`${addr.url}/api/presets/noir-chat-preset`, { method: 'DELETE' });
+    expect(delPresetRes.status).toBe(200);
+  });
+
+  it('supports user personas, character roster/dossier/upsert, session resume/branch across restart, and combat start', async () => {
+    const dataDir = await makeTempDir('referee-daemon-full-');
+    const gateway = createMockModelGateway({
+      narrator: { kind: 'text', text: 'The neon sign flickers above the alley.' },
+      state_tracker: { kind: 'json', value: { scene: { location: 'Neon Alley', mood: 'gritty' } } },
+    });
+
+    const daemon1 = new RefereeDaemon({ host: '127.0.0.1', port: 0, dataDir, gateway });
+    activeDaemons.push(daemon1);
+    const addr1 = await daemon1.start();
+
+    // 1. Save a persona
+    const postPersonaRes = await fetch(`${addr1.url}/api/personas`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: 'detective-kael',
+        name: 'Kael Vance',
+        description: 'A cybernetic private investigator.',
+      }),
+    });
+    expect(postPersonaRes.status).toBe(201);
+
+    // 2. Start session with personaId
+    const sessRes = await fetch(`${addr1.url}/api/sessions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 'noir-run-1',
+        systemPackId: 'stock-tactical-rpg',
+        personaId: 'detective-kael',
+      }),
+    });
+    expect(sessRes.status).toBe(201);
+
+    // Verify [PERSONA] in compile-prompt
+    const compileRes = await fetch(`${addr1.url}/api/sessions/noir-run-1/compile-prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ latestInput: 'Check my trenchcoat.' }),
+    });
+    expect(compileRes.status).toBe(200);
+    const compileJson = (await compileRes.json()) as {
+      compiledPrompt: { messages: Array<{ content: string }> };
+    };
+    const combinedPrompt = compileJson.compiledPrompt.messages.map((m) => m.content).join('\n');
+    expect(combinedPrompt).toContain('[PERSONA]');
+    expect(combinedPrompt).toContain('Kael Vance');
+
+    // 3. Execute a turn and persist across daemon restart
+    const turnRes = await fetch(`${addr1.url}/api/sessions/noir-run-1/turn`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'I step into the alley.' }),
+    });
+    expect(turnRes.status).toBe(200);
+
+    await daemon1.stop();
+
+    // 4. Restart daemon on same dataDir, discover saved session, resume & branch
+    const daemon2 = new RefereeDaemon({ host: '127.0.0.1', port: 0, dataDir, gateway });
+    activeDaemons.push(daemon2);
+    const addr2 = await daemon2.start();
+
+    const listSessRes = await fetch(`${addr2.url}/api/sessions`);
+    expect(listSessRes.status).toBe(200);
+    const listSessJson = (await listSessRes.json()) as {
+      activeSessions: unknown[];
+      savedSessionIds: string[];
+    };
+    expect(listSessJson.activeSessions).toEqual([]);
+    expect(listSessJson.savedSessionIds).toContain('noir-run-1');
+
+    const resumeRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(resumeRes.status).toBe(200);
+    const resumeJson = (await resumeRes.json()) as {
+      sessionId: string;
+      state: { meta: { turn: number } };
+    };
+    expect(resumeJson.sessionId).toBe('noir-run-1');
+    expect(resumeJson.state.meta.turn).toBe(1);
+
+    const branchRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        targetSessionId: 'noir-run-branch',
+        branchAtTurn: 1,
+        load: true,
+      }),
+    });
+    expect(branchRes.status).toBe(201);
+    const branchJson = (await branchRes.json()) as {
+      ok: boolean;
+      targetSessionId: string;
+      session: { sessionId: string; state: { meta: { turn: number } } };
+    };
+    expect(branchJson.ok).toBe(true);
+    expect(branchJson.targetSessionId).toBe('noir-run-branch');
+    expect(branchJson.session.sessionId).toBe('noir-run-branch');
+    expect(branchJson.session.state.meta.turn).toBe(1);
+
+    // 5. Upsert and inspect characters on the resumed session
+    const addCharRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/characters`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        characterId: 'npc-lyra',
+        name: 'Lyra Chen',
+        allegiance: 'syndicate',
+        mood: 'guarded',
+      }),
+    });
+    expect(addCharRes.status).toBe(201);
+
+    const patchCharRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/characters/npc-lyra`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mood: 'cooperative' }),
+    });
+    expect(patchCharRes.status).toBe(200);
+
+    const rosterRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/characters?query=Lyra`);
+    expect(rosterRes.status).toBe(200);
+    const rosterJson = (await rosterRes.json()) as {
+      characters: Array<{ id: string; mood: string }>;
+    };
+    expect(rosterJson.characters.some((c) => c.id === 'npc-lyra' && c.mood === 'cooperative')).toBe(
+      true
+    );
+
+    const dossierRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/characters/npc-lyra`);
+    expect(dossierRes.status).toBe(200);
+    const dossierJson = (await dossierRes.json()) as {
+      dossier: { summary: { name: string }; agency: { mood: string } };
+    };
+    expect(dossierJson.dossier.summary.name).toBe('Lyra Chen');
+    expect(dossierJson.dossier.agency.mood).toBe('cooperative');
+
+    const missingDossierRes = await fetch(
+      `${addr2.url}/api/sessions/noir-run-1/characters/nonexistent`
+    );
+    expect(missingDossierRes.status).toBe(404);
+
+    // 6. Start combat on the resumed session
+    const combatRes = await fetch(`${addr2.url}/api/sessions/noir-run-1/combat/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        participants: [
+          {
+            id: 'player',
+            name: 'Kael Vance',
+            team: 'ally',
+            hp: 30,
+            maxHp: 30,
+            stats: { initiative: 2 },
+          },
+          {
+            id: 'thug-1',
+            name: 'Street Enforcer',
+            team: 'enemy',
+            hp: 18,
+            maxHp: 18,
+            stats: { initiative: 1 },
+          },
+        ],
+      }),
+    });
+    expect(combatRes.status).toBe(200);
+    const combatJson = (await combatRes.json()) as {
+      ok: boolean;
+      combatState: { active: boolean; initiativeOrder: string[] };
+    };
+    expect(combatJson.combatState.active).toBe(true);
+    expect(combatJson.combatState.initiativeOrder.length).toBe(2);
   });
 });

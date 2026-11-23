@@ -11,6 +11,7 @@ import {
   ProviderFailure,
   ProviderKind,
   RoleConnectionConfig,
+  SamplingParameters,
   StreamChunk,
 } from './types.js';
 
@@ -31,8 +32,157 @@ export interface ModelGatewayOptions {
   readonly fetchImpl?: typeof fetch;
 }
 
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isSafeKey(key: string): boolean {
+  return key.length > 0 && !FORBIDDEN_KEYS.has(key);
+}
+
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function finiteOrUndefined(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) ? value : undefined;
+}
+
+function resolveSamplingParameters(
+  config: RoleConnectionConfig,
+  req: SamplingParameters
+): SamplingParameters {
+  const stopSequences = req.stopSequences ?? config.stopSequences;
+  return {
+    temperature: finiteOrUndefined(req.temperature ?? config.temperature),
+    maxTokens: finiteOrUndefined(req.maxTokens ?? config.maxTokens),
+    maxContextTokens: finiteOrUndefined(req.maxContextTokens ?? config.maxContextTokens),
+    topP: finiteOrUndefined(req.topP ?? config.topP),
+    topK: finiteOrUndefined(req.topK ?? config.topK),
+    minP: finiteOrUndefined(req.minP ?? config.minP),
+    topA: finiteOrUndefined(req.topA ?? config.topA),
+    typicalP: finiteOrUndefined(req.typicalP ?? config.typicalP),
+    tfs: finiteOrUndefined(req.tfs ?? config.tfs),
+    frequencyPenalty: finiteOrUndefined(req.frequencyPenalty ?? config.frequencyPenalty),
+    presencePenalty: finiteOrUndefined(req.presencePenalty ?? config.presencePenalty),
+    repetitionPenalty: finiteOrUndefined(req.repetitionPenalty ?? config.repetitionPenalty),
+    stopSequences: stopSequences !== undefined ? [...stopSequences] : undefined,
+    seed: finiteOrUndefined(req.seed ?? config.seed),
+  };
+}
+
+function cloneConnectionFields<T extends Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }>(
+  config: T,
+  redactApiKeys = false
+): T {
+  const copy = {
+    ...config,
+    ...(config.stopSequences !== undefined ? { stopSequences: [...config.stopSequences] } : {}),
+  };
+  if (redactApiKeys && copy.apiKey !== undefined && copy.apiKey.length > 0) {
+    return { ...copy, apiKey: '***' };
+  }
+  return copy;
+}
+
+function serializeChatMessages(
+  messages: readonly ChatMessage[]
+): Array<{ role: ChatMessage['role']; content: string; name?: string }> {
+  return messages.map((msg) =>
+    msg.name !== undefined
+      ? { role: msg.role, content: msg.content, name: msg.name }
+      : { role: msg.role, content: msg.content }
+  );
+}
+
+function invokeFetchImpl(
+  customFetch: typeof fetch | undefined,
+  url: string,
+  init: RequestInit
+): Promise<Response> {
+  if (customFetch !== undefined) {
+    return customFetch(url, init);
+  }
+  if (typeof globalThis.fetch !== 'function') {
+    throw new Error('Global fetch is unavailable in the current runtime');
+  }
+  return globalThis.fetch(url, init);
+}
+
+function buildBearerHeaders(config: RoleConnectionConfig): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (config.apiKey !== undefined && config.apiKey.length > 0) {
+    headers.Authorization = `Bearer ${config.apiKey}`;
+  }
+  return headers;
+}
+
+function buildOpenAICompatibleRequestBody(
+  config: RoleConnectionConfig,
+  req: GatewayGenerateTextRequest | GatewayStructuredRequest,
+  stream: boolean,
+  structuredReq?: GatewayStructuredRequest
+): Record<string, unknown> {
+  const sampling = resolveSamplingParameters(config, req);
+
+  const body: Record<string, unknown> = {
+    model: config.model,
+    messages: serializeChatMessages(req.messages),
+    stream,
+  };
+
+  if (sampling.temperature !== undefined) {
+    body.temperature = sampling.temperature;
+  }
+  if (sampling.maxTokens !== undefined) {
+    body.max_tokens = sampling.maxTokens;
+  }
+  if (sampling.topP !== undefined) {
+    body.top_p = sampling.topP;
+  }
+  if (sampling.topK !== undefined && sampling.topK > 0) {
+    body.top_k = sampling.topK;
+  }
+  if (sampling.minP !== undefined && sampling.minP > 0) {
+    body.min_p = sampling.minP;
+  }
+  if (sampling.topA !== undefined && sampling.topA > 0) {
+    body.top_a = sampling.topA;
+  }
+  if (sampling.typicalP !== undefined && sampling.typicalP < 1) {
+    body.typical_p = sampling.typicalP;
+  }
+  if (sampling.tfs !== undefined && sampling.tfs < 1) {
+    body.tfs = sampling.tfs;
+  }
+  if (sampling.frequencyPenalty !== undefined) {
+    body.frequency_penalty = sampling.frequencyPenalty;
+  }
+  if (sampling.presencePenalty !== undefined) {
+    body.presence_penalty = sampling.presencePenalty;
+  }
+  if (sampling.repetitionPenalty !== undefined) {
+    body.repetition_penalty = sampling.repetitionPenalty;
+  }
+  if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
+    body.stop = [...sampling.stopSequences];
+  }
+  if (sampling.seed !== undefined) {
+    body.seed = sampling.seed;
+  }
+
+  if (structuredReq !== undefined && config.supportsJsonSchema === true) {
+    body.response_format = {
+      type: 'json_schema',
+      json_schema: {
+        name: structuredReq.schemaName ?? 'structured_output',
+        strict: true,
+        schema: structuredReq.schema,
+      },
+    };
+  }
+
+  return body;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -212,6 +362,344 @@ function sleepWithAbort(delayMs: number, signal?: AbortSignal): Promise<boolean>
   });
 }
 
+interface ParsedStreamLineResult {
+  readonly text?: string;
+  readonly done?: boolean;
+  readonly error?: ProviderFailure;
+}
+
+async function executeJsonCompletion(
+  customFetch: typeof fetch | undefined,
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  config: RoleConnectionConfig,
+  req: GatewayGenerateTextRequest | GatewayStructuredRequest,
+  extractContent: (payload: unknown) => string | undefined,
+  missingContentMessage: string
+): Promise<Result<string, ProviderFailure>> {
+  if (req.signal?.aborted) {
+    return err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+  }
+
+  const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
+  try {
+    const response = await invokeFetchImpl(customFetch, url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: signalHandle.signal,
+    });
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      return err(classifyHttpFailure(response.status, bodyText));
+    }
+
+    let payload: unknown;
+    try {
+      payload = (await response.json()) as unknown;
+    } catch (caught) {
+      return err({
+        code: 'INVALID_PROVIDER_RESPONSE',
+        message: `Failed to decode provider JSON response: ${caught instanceof Error ? caught.message : String(caught)}`,
+        retryable: false,
+      });
+    }
+
+    const content = extractContent(payload);
+    if (content === undefined) {
+      return err({
+        code: 'INVALID_PROVIDER_RESPONSE',
+        message: missingContentMessage,
+        retryable: false,
+      });
+    }
+
+    return ok(content);
+  } catch (caught) {
+    return err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
+  } finally {
+    signalHandle.cleanup();
+  }
+}
+
+async function* executeLineStream(
+  customFetch: typeof fetch | undefined,
+  url: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  config: RoleConnectionConfig,
+  req: GatewayGenerateTextRequest,
+  parseLine: (trimmedLine: string) => ParsedStreamLineResult
+): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
+  if (req.signal?.aborted) {
+    yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+    return;
+  }
+
+  const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+
+  try {
+    const response = await invokeFetchImpl(customFetch, url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: signalHandle.signal,
+    });
+
+    if (!response.ok) {
+      const bodyText = await response.text().catch(() => '');
+      yield err(classifyHttpFailure(response.status, bodyText));
+      return;
+    }
+
+    if (response.body === null) {
+      yield err({
+        code: 'EMPTY_RESPONSE_BODY',
+        message: 'Streaming response did not include a readable body',
+        retryable: false,
+      });
+      return;
+    }
+
+    reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let lineBuffer = '';
+    let emittedDone = false;
+
+    while (true) {
+      if (req.signal?.aborted) {
+        yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+        return;
+      }
+
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      lineBuffer += decoder.decode(value, { stream: true });
+      const lines = lineBuffer.split(/\r?\n/);
+      lineBuffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (line.length === 0) {
+          continue;
+        }
+        const parsed = parseLine(line);
+        if (parsed.error !== undefined) {
+          yield err(parsed.error);
+          return;
+        }
+        if (parsed.text !== undefined && parsed.text.length > 0) {
+          yield ok({ text: parsed.text, done: false });
+        }
+        if (parsed.done === true) {
+          emittedDone = true;
+          yield ok({ text: '', done: true });
+          return;
+        }
+      }
+    }
+
+    const trailing = (lineBuffer + decoder.decode()).trim();
+    if (trailing.length > 0) {
+      const parsed = parseLine(trailing);
+      if (parsed.error !== undefined) {
+        yield err(parsed.error);
+        return;
+      }
+      if (parsed.text !== undefined && parsed.text.length > 0) {
+        yield ok({ text: parsed.text, done: false });
+      }
+      if (parsed.done === true) {
+        emittedDone = true;
+        yield ok({ text: '', done: true });
+        return;
+      }
+    }
+
+    if (!emittedDone) {
+      yield ok({ text: '', done: true });
+    }
+  } catch (caught) {
+    yield err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
+  } finally {
+    if (reader !== undefined) {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+    signalHandle.cleanup();
+  }
+}
+
+function parseOpenAISseLine(trimmedLine: string): ParsedStreamLineResult {
+  if (trimmedLine.startsWith(':') || !trimmedLine.startsWith('data:')) {
+    return {};
+  }
+  const payloadText = trimmedLine.slice(5).trim();
+  if (payloadText === '[DONE]') {
+    return { done: true };
+  }
+  if (payloadText.length === 0) {
+    return {};
+  }
+
+  let parsedChunk: unknown;
+  try {
+    parsedChunk = JSON.parse(payloadText) as unknown;
+  } catch (caught) {
+    return {
+      error: {
+        code: 'INVALID_STREAM_PAYLOAD',
+        message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
+        retryable: false,
+      },
+    };
+  }
+
+  const delta = extractOpenAIStreamDelta(parsedChunk);
+  return delta !== undefined && delta.length > 0 ? { text: delta } : {};
+}
+
+function extractOllamaMessageContent(payload: unknown): string | undefined {
+  if (isPlainRecord(payload) && isPlainRecord(payload.message) && typeof payload.message.content === 'string') {
+    return payload.message.content;
+  }
+  return extractOpenAIMessageContent(payload);
+}
+
+function parseOllamaNativeLine(trimmedLine: string): ParsedStreamLineResult {
+  if (trimmedLine.startsWith(':')) {
+    return {};
+  }
+  const payloadText = trimmedLine.startsWith('data:') ? trimmedLine.slice(5).trim() : trimmedLine;
+  if (payloadText === '[DONE]') {
+    return { done: true };
+  }
+  if (payloadText.length === 0) {
+    return {};
+  }
+
+  let parsedChunk: unknown;
+  try {
+    parsedChunk = JSON.parse(payloadText) as unknown;
+  } catch (caught) {
+    return {
+      error: {
+        code: 'INVALID_STREAM_PAYLOAD',
+        message: `Malformed Ollama stream JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
+        retryable: false,
+      },
+    };
+  }
+
+  if (isPlainRecord(parsedChunk) && typeof parsedChunk.error === 'string') {
+    return {
+      error: {
+        code: 'PROVIDER_STREAM_ERROR',
+        message: parsedChunk.error,
+        retryable: false,
+      },
+    };
+  }
+
+  let delta: string | undefined;
+  if (
+    isPlainRecord(parsedChunk) &&
+    isPlainRecord(parsedChunk.message) &&
+    typeof parsedChunk.message.content === 'string'
+  ) {
+    delta = parsedChunk.message.content;
+  } else {
+    delta = extractOpenAIStreamDelta(parsedChunk);
+  }
+
+  const done = isPlainRecord(parsedChunk) && parsedChunk.done === true;
+  return {
+    ...(delta !== undefined && delta.length > 0 ? { text: delta } : {}),
+    ...(done ? { done: true } : {}),
+  };
+}
+
+function extractAnthropicMessageContent(payload: unknown): string | undefined {
+  if (!isPlainRecord(payload) || !Array.isArray(payload.content)) {
+    return undefined;
+  }
+  const parts: string[] = [];
+  for (const block of payload.content) {
+    if (isPlainRecord(block) && block.type === 'text' && typeof block.text === 'string') {
+      parts.push(block.text);
+    }
+  }
+  return parts.length > 0 ? parts.join('') : undefined;
+}
+
+function parseAnthropicSseLine(trimmedLine: string): ParsedStreamLineResult {
+  if (trimmedLine.startsWith(':') || !trimmedLine.startsWith('data:')) {
+    return {};
+  }
+  const payloadText = trimmedLine.slice(5).trim();
+  if (payloadText === '[DONE]') {
+    return { done: true };
+  }
+  if (payloadText.length === 0) {
+    return {};
+  }
+
+  let parsedChunk: unknown;
+  try {
+    parsedChunk = JSON.parse(payloadText) as unknown;
+  } catch (caught) {
+    return {
+      error: {
+        code: 'INVALID_STREAM_PAYLOAD',
+        message: `Malformed Anthropic SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
+        retryable: false,
+      },
+    };
+  }
+
+  if (!isPlainRecord(parsedChunk)) {
+    return {};
+  }
+
+  if (parsedChunk.type === 'message_stop') {
+    return { done: true };
+  }
+
+  if (parsedChunk.type === 'error') {
+    const errRecord = isPlainRecord(parsedChunk.error) ? parsedChunk.error : undefined;
+    const message =
+      errRecord !== undefined && typeof errRecord.message === 'string'
+        ? errRecord.message
+        : 'Anthropic stream returned an error event';
+    return {
+      error: {
+        code: 'PROVIDER_STREAM_ERROR',
+        message,
+        retryable: false,
+      },
+    };
+  }
+
+  if (parsedChunk.type === 'content_block_delta' && isPlainRecord(parsedChunk.delta)) {
+    const delta = parsedChunk.delta;
+    if (
+      (delta.type === undefined || delta.type === 'text_delta') &&
+      typeof delta.text === 'string' &&
+      delta.text.length > 0
+    ) {
+      return { text: delta.text };
+    }
+  }
+
+  return {};
+}
+
 /**
  * Built-in provider targeting OpenAI-compatible `/chat/completions` endpoints via native `fetch`.
  */
@@ -223,16 +711,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.customFetch = fetchImpl;
   }
 
-  private invokeFetch(url: string, init: RequestInit): Promise<Response> {
-    if (this.customFetch !== undefined) {
-      return this.customFetch(url, init);
-    }
-    if (typeof globalThis.fetch !== 'function') {
-      throw new Error('Global fetch is unavailable in the current runtime');
-    }
-    return globalThis.fetch(url, init);
-  }
-
   private buildEndpointUrl(baseUrl: string): string {
     const normalized = baseUrl.replace(/\/+$/, '');
     if (normalized.endsWith('/chat/completions')) {
@@ -241,12 +719,247 @@ export class OpenAICompatibleProvider implements ModelProvider {
     return `${normalized}/chat/completions`;
   }
 
+  private buildRequestBody(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
+    stream: boolean,
+    structuredReq?: GatewayStructuredRequest
+  ): Record<string, unknown> {
+    return buildOpenAICompatibleRequestBody(config, req, stream, structuredReq);
+  }
+
+  async generateText(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest
+  ): Promise<Result<string, ProviderFailure>> {
+    return executeJsonCompletion(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      buildBearerHeaders(config),
+      this.buildRequestBody(config, req, false),
+      config,
+      req,
+      extractOpenAIMessageContent,
+      'Provider response did not include choices[0].message.content'
+    );
+  }
+
+  async generateStructuredRaw(
+    config: RoleConnectionConfig,
+    req: GatewayStructuredRequest
+  ): Promise<Result<string, ProviderFailure>> {
+    return executeJsonCompletion(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      buildBearerHeaders(config),
+      this.buildRequestBody(config, req, false, req),
+      config,
+      req,
+      extractOpenAIMessageContent,
+      'Provider response did not include choices[0].message.content'
+    );
+  }
+
+  streamText(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest
+  ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
+    return executeLineStream(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      buildBearerHeaders(config),
+      this.buildRequestBody(config, req, true),
+      config,
+      req,
+      parseOpenAISseLine
+    );
+  }
+}
+
+/**
+ * Built-in provider for Ollama instances supporting both OpenAI-compatible `/v1/chat/completions`
+ * normalization and native `/api/chat` when the configured endpoint targets `/api/chat`.
+ */
+export class OllamaProvider implements ModelProvider {
+  readonly kind = 'ollama' as const;
+  private readonly customFetch: typeof fetch | undefined;
+
+  constructor(fetchImpl?: typeof fetch) {
+    this.customFetch = fetchImpl;
+  }
+
+  private resolveEndpoint(baseUrl: string): { readonly url: string; readonly nativeApiChat: boolean } {
+    const normalized = baseUrl.replace(/\/+$/, '');
+    if (normalized.endsWith('/api/chat')) {
+      return { url: normalized, nativeApiChat: true };
+    }
+    if (normalized.endsWith('/v1/chat/completions') || normalized.endsWith('/chat/completions')) {
+      return { url: normalized, nativeApiChat: false };
+    }
+    if (normalized.endsWith('/v1')) {
+      return { url: `${normalized}/chat/completions`, nativeApiChat: false };
+    }
+    return { url: `${normalized}/v1/chat/completions`, nativeApiChat: false };
+  }
+
+  private buildNativeRequestBody(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
+    stream: boolean,
+    structuredReq?: GatewayStructuredRequest
+  ): Record<string, unknown> {
+    const sampling = resolveSamplingParameters(config, req);
+    const options: Record<string, unknown> = {};
+
+    if (sampling.temperature !== undefined) {
+      options.temperature = sampling.temperature;
+    }
+    if (sampling.maxTokens !== undefined) {
+      options.num_predict = sampling.maxTokens;
+    }
+    if (sampling.maxContextTokens !== undefined) {
+      options.num_ctx = sampling.maxContextTokens;
+    }
+    if (sampling.topP !== undefined) {
+      options.top_p = sampling.topP;
+    }
+    if (sampling.topK !== undefined && sampling.topK > 0) {
+      options.top_k = sampling.topK;
+    }
+    if (sampling.minP !== undefined && sampling.minP > 0) {
+      options.min_p = sampling.minP;
+    }
+    if (sampling.typicalP !== undefined && sampling.typicalP < 1) {
+      options.typical_p = sampling.typicalP;
+    }
+    if (sampling.tfs !== undefined && sampling.tfs < 1) {
+      options.tfs_z = sampling.tfs;
+    }
+    if (sampling.frequencyPenalty !== undefined) {
+      options.frequency_penalty = sampling.frequencyPenalty;
+    }
+    if (sampling.presencePenalty !== undefined) {
+      options.presence_penalty = sampling.presencePenalty;
+    }
+    if (sampling.repetitionPenalty !== undefined) {
+      options.repeat_penalty = sampling.repetitionPenalty;
+    }
+    if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
+      options.stop = [...sampling.stopSequences];
+    }
+    if (sampling.seed !== undefined) {
+      options.seed = sampling.seed;
+    }
+
+    const body: Record<string, unknown> = {
+      model: config.model,
+      messages: serializeChatMessages(req.messages),
+      stream,
+    };
+
+    if (Object.keys(options).length > 0) {
+      body.options = options;
+    }
+    if (structuredReq !== undefined && config.supportsJsonSchema === true) {
+      body.format = structuredReq.schema;
+    }
+
+    return body;
+  }
+
+  async generateText(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest
+  ): Promise<Result<string, ProviderFailure>> {
+    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
+    const body = nativeApiChat
+      ? this.buildNativeRequestBody(config, req, false)
+      : buildOpenAICompatibleRequestBody(config, req, false);
+    return executeJsonCompletion(
+      this.customFetch,
+      url,
+      buildBearerHeaders(config),
+      body,
+      config,
+      req,
+      nativeApiChat ? extractOllamaMessageContent : extractOpenAIMessageContent,
+      nativeApiChat
+        ? 'Ollama response did not include message.content'
+        : 'Provider response did not include choices[0].message.content'
+    );
+  }
+
+  async generateStructuredRaw(
+    config: RoleConnectionConfig,
+    req: GatewayStructuredRequest
+  ): Promise<Result<string, ProviderFailure>> {
+    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
+    const body = nativeApiChat
+      ? this.buildNativeRequestBody(config, req, false, req)
+      : buildOpenAICompatibleRequestBody(config, req, false, req);
+    return executeJsonCompletion(
+      this.customFetch,
+      url,
+      buildBearerHeaders(config),
+      body,
+      config,
+      req,
+      nativeApiChat ? extractOllamaMessageContent : extractOpenAIMessageContent,
+      nativeApiChat
+        ? 'Ollama response did not include message.content'
+        : 'Provider response did not include choices[0].message.content'
+    );
+  }
+
+  streamText(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest
+  ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
+    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
+    const body = nativeApiChat
+      ? this.buildNativeRequestBody(config, req, true)
+      : buildOpenAICompatibleRequestBody(config, req, true);
+    return executeLineStream(
+      this.customFetch,
+      url,
+      buildBearerHeaders(config),
+      body,
+      config,
+      req,
+      nativeApiChat ? parseOllamaNativeLine : parseOpenAISseLine
+    );
+  }
+}
+
+/**
+ * Built-in provider targeting Anthropic's `/v1/messages` API via native `fetch`.
+ */
+export class AnthropicProvider implements ModelProvider {
+  readonly kind = 'anthropic' as const;
+  private readonly customFetch: typeof fetch | undefined;
+
+  constructor(fetchImpl?: typeof fetch) {
+    this.customFetch = fetchImpl;
+  }
+
+  private buildEndpointUrl(baseUrl: string): string {
+    const normalized = baseUrl.replace(/\/+$/, '');
+    if (normalized.endsWith('/v1/messages') || normalized.endsWith('/messages')) {
+      return normalized;
+    }
+    if (normalized.endsWith('/v1')) {
+      return `${normalized}/messages`;
+    }
+    return `${normalized}/v1/messages`;
+  }
+
   private buildHeaders(config: RoleConnectionConfig): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
     };
     if (config.apiKey !== undefined && config.apiKey.length > 0) {
-      headers.Authorization = `Bearer ${config.apiKey}`;
+      headers['x-api-key'] = config.apiKey;
     }
     return headers;
   }
@@ -254,236 +967,93 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private buildRequestBody(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-    stream: boolean,
-    structuredReq?: GatewayStructuredRequest
+    stream: boolean
   ): Record<string, unknown> {
-    const temperature = req.temperature ?? config.temperature;
-    const maxTokens = req.maxTokens ?? config.maxTokens;
+    const sampling = resolveSamplingParameters(config, req);
+    const systemParts: string[] = [];
+    const conversationMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+    for (const msg of req.messages) {
+      if (msg.role === 'system') {
+        if (msg.content.length > 0) {
+          systemParts.push(msg.content);
+        }
+      } else {
+        conversationMessages.push({ role: msg.role, content: msg.content });
+      }
+    }
 
     const body: Record<string, unknown> = {
       model: config.model,
-      messages: req.messages.map((msg) =>
-        msg.name !== undefined
-          ? { role: msg.role, content: msg.content, name: msg.name }
-          : { role: msg.role, content: msg.content }
-      ),
+      max_tokens: sampling.maxTokens ?? 1024,
+      messages: conversationMessages,
       stream,
     };
 
-    if (temperature !== undefined) {
-      body.temperature = temperature;
+    if (systemParts.length > 0) {
+      body.system = systemParts.join('\n\n');
     }
-    if (maxTokens !== undefined) {
-      body.max_tokens = maxTokens;
+    if (sampling.temperature !== undefined) {
+      body.temperature = sampling.temperature;
     }
-
-    if (structuredReq !== undefined && config.supportsJsonSchema === true) {
-      body.response_format = {
-        type: 'json_schema',
-        json_schema: {
-          name: structuredReq.schemaName ?? 'structured_output',
-          strict: true,
-          schema: structuredReq.schema,
-        },
-      };
+    if (sampling.topP !== undefined) {
+      body.top_p = sampling.topP;
+    }
+    if (sampling.topK !== undefined && sampling.topK > 0) {
+      body.top_k = sampling.topK;
+    }
+    if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
+      body.stop_sequences = [...sampling.stopSequences];
     }
 
     return body;
-  }
-
-  private async executeCompletion(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-    structuredReq?: GatewayStructuredRequest
-  ): Promise<Result<string, ProviderFailure>> {
-    if (req.signal?.aborted) {
-      return err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-    }
-
-    const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
-    try {
-      const response = await this.invokeFetch(this.buildEndpointUrl(config.baseUrl), {
-        method: 'POST',
-        headers: this.buildHeaders(config),
-        body: JSON.stringify(this.buildRequestBody(config, req, false, structuredReq)),
-        signal: signalHandle.signal,
-      });
-
-      if (!response.ok) {
-        const bodyText = await response.text().catch(() => '');
-        return err(classifyHttpFailure(response.status, bodyText));
-      }
-
-      let payload: unknown;
-      try {
-        payload = (await response.json()) as unknown;
-      } catch (caught) {
-        return err({
-          code: 'INVALID_PROVIDER_RESPONSE',
-          message: `Failed to decode provider JSON response: ${caught instanceof Error ? caught.message : String(caught)}`,
-          retryable: false,
-        });
-      }
-
-      const content = extractOpenAIMessageContent(payload);
-      if (content === undefined) {
-        return err({
-          code: 'INVALID_PROVIDER_RESPONSE',
-          message: 'Provider response did not include choices[0].message.content',
-          retryable: false,
-        });
-      }
-
-      return ok(content);
-    } catch (caught) {
-      return err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
-    } finally {
-      signalHandle.cleanup();
-    }
   }
 
   async generateText(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): Promise<Result<string, ProviderFailure>> {
-    return this.executeCompletion(config, req);
+    return executeJsonCompletion(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      this.buildHeaders(config),
+      this.buildRequestBody(config, req, false),
+      config,
+      req,
+      extractAnthropicMessageContent,
+      'Anthropic response did not include content text blocks'
+    );
   }
 
   async generateStructuredRaw(
     config: RoleConnectionConfig,
     req: GatewayStructuredRequest
   ): Promise<Result<string, ProviderFailure>> {
-    return this.executeCompletion(config, req, req);
+    return executeJsonCompletion(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      this.buildHeaders(config),
+      this.buildRequestBody(config, req, false),
+      config,
+      req,
+      extractAnthropicMessageContent,
+      'Anthropic response did not include content text blocks'
+    );
   }
 
-  async *streamText(
+  streamText(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-    if (req.signal?.aborted) {
-      yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-      return;
-    }
-
-    const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-
-    try {
-      const response = await this.invokeFetch(this.buildEndpointUrl(config.baseUrl), {
-        method: 'POST',
-        headers: this.buildHeaders(config),
-        body: JSON.stringify(this.buildRequestBody(config, req, true)),
-        signal: signalHandle.signal,
-      });
-
-      if (!response.ok) {
-        const bodyText = await response.text().catch(() => '');
-        yield err(classifyHttpFailure(response.status, bodyText));
-        return;
-      }
-
-      if (response.body === null) {
-        yield err({
-          code: 'EMPTY_RESPONSE_BODY',
-          message: 'Streaming response did not include a readable body',
-          retryable: false,
-        });
-        return;
-      }
-
-      reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let lineBuffer = '';
-      let emittedDone = false;
-
-      while (true) {
-        if (req.signal?.aborted) {
-          yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-          return;
-        }
-
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
-        }
-
-        lineBuffer += decoder.decode(value, { stream: true });
-        const lines = lineBuffer.split(/\r?\n/);
-        lineBuffer = lines.pop() ?? '';
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim();
-          if (line.length === 0 || line.startsWith(':')) {
-            continue;
-          }
-          if (!line.startsWith('data:')) {
-            continue;
-          }
-          const payloadText = line.slice(5).trim();
-          if (payloadText === '[DONE]') {
-            emittedDone = true;
-            yield ok({ text: '', done: true });
-            return;
-          }
-
-          let parsedChunk: unknown;
-          try {
-            parsedChunk = JSON.parse(payloadText) as unknown;
-          } catch (caught) {
-            yield err({
-              code: 'INVALID_STREAM_PAYLOAD',
-              message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-              retryable: false,
-            });
-            return;
-          }
-
-          const delta = extractOpenAIStreamDelta(parsedChunk);
-          if (delta !== undefined && delta.length > 0) {
-            yield ok({ text: delta, done: false });
-          }
-        }
-      }
-
-      const trailing = (lineBuffer + decoder.decode()).trim();
-      if (trailing.startsWith('data:')) {
-        const payloadText = trailing.slice(5).trim();
-        if (payloadText === '[DONE]') {
-          emittedDone = true;
-          yield ok({ text: '', done: true });
-          return;
-        }
-        if (payloadText.length > 0) {
-          let parsedChunk: unknown;
-          try {
-            parsedChunk = JSON.parse(payloadText) as unknown;
-          } catch (caught) {
-            yield err({
-              code: 'INVALID_STREAM_PAYLOAD',
-              message: `Malformed trailing SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-              retryable: false,
-            });
-            return;
-          }
-          const delta = extractOpenAIStreamDelta(parsedChunk);
-          if (delta !== undefined && delta.length > 0) {
-            yield ok({ text: delta, done: false });
-          }
-        }
-      }
-
-      if (!emittedDone) {
-        yield ok({ text: '', done: true });
-      }
-    } catch (caught) {
-      yield err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
-    } finally {
-      if (reader !== undefined) {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
-      signalHandle.cleanup();
-    }
+    return executeLineStream(
+      this.customFetch,
+      this.buildEndpointUrl(config.baseUrl),
+      this.buildHeaders(config),
+      this.buildRequestBody(config, req, true),
+      config,
+      req,
+      parseAnthropicSseLine
+    );
   }
 }
 
@@ -504,22 +1074,27 @@ export class ModelGateway {
     if (options.connections !== undefined) {
       if (options.connections instanceof Map) {
         for (const [role, config] of options.connections.entries()) {
-          this.connections.set(role, { ...config, role });
+          if (isSafeKey(role)) {
+            this.connections.set(role, cloneConnectionFields({ ...config, role }));
+          }
         }
       } else {
         for (const [roleKey, config] of Object.entries(options.connections)) {
-          if (config !== undefined) {
+          if (config !== undefined && isSafeKey(roleKey)) {
             const role = roleKey as AgentRole;
-            this.connections.set(role, { ...config, role });
+            this.connections.set(role, cloneConnectionFields({ ...config, role }));
           }
         }
       }
     }
 
-    this.defaultConnection = options.defaultConnection !== undefined ? { ...options.defaultConnection } : undefined;
+    this.defaultConnection =
+      options.defaultConnection !== undefined ? cloneConnectionFields(options.defaultConnection) : undefined;
 
     this.providers = new Map<ProviderKind, ModelProvider>([
       ['openai_compatible', new OpenAICompatibleProvider(options.fetchImpl)],
+      ['ollama', new OllamaProvider(options.fetchImpl)],
+      ['anthropic', new AnthropicProvider(options.fetchImpl)],
     ]);
 
     if (options.providers !== undefined) {
@@ -529,7 +1104,7 @@ export class ModelGateway {
         }
       } else {
         for (const [kindKey, provider] of Object.entries(options.providers)) {
-          if (provider !== undefined) {
+          if (provider !== undefined && isSafeKey(kindKey)) {
             this.providers.set(kindKey as ProviderKind, provider);
           }
         }
@@ -547,30 +1122,55 @@ export class ModelGateway {
   setDefaultConnection(
     config: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined
   ): void {
-    this.defaultConnection = config !== undefined ? { ...config } : undefined;
+    this.defaultConnection = config !== undefined ? cloneConnectionFields(config) : undefined;
   }
 
   /**
    * Set or update the connection profile for a specific {@link AgentRole} at runtime.
    */
   setRoleConnection(role: AgentRole, config: Omit<RoleConnectionConfig, 'role'>): void {
-    this.connections.set(role, { ...config, role });
+    if (!isSafeKey(role)) {
+      return;
+    }
+    this.connections.set(role, cloneConnectionFields({ ...config, role }));
+  }
+
+  /**
+   * Remove a specific {@link AgentRole} override, returning `true` if it was present.
+   */
+  removeRoleConnection(role: AgentRole): boolean {
+    return this.connections.delete(role);
+  }
+
+  /**
+   * Remove all per-role connection overrides (preserving any default connection).
+   */
+  clearRoleConnections(): void {
+    this.connections.clear();
   }
 
   /**
    * Return a snapshot of the configured default and per-role connections.
    */
-  getConnectionsSnapshot(): {
+  getConnectionsSnapshot(options?: { readonly redactApiKeys?: boolean }): {
     readonly defaultConnection?: Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole };
     readonly connections: Partial<Record<AgentRole, RoleConnectionConfig>>;
   } {
+    const redact = options?.redactApiKeys === true;
     const connections: Partial<Record<AgentRole, RoleConnectionConfig>> = {};
     for (const [role, cfg] of this.connections.entries()) {
-      connections[role] = { ...cfg };
+      if (isSafeKey(role)) {
+        Object.defineProperty(connections, role, {
+          value: cloneConnectionFields(cfg, redact),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
     }
     return {
       ...(this.defaultConnection !== undefined
-        ? { defaultConnection: { ...this.defaultConnection } }
+        ? { defaultConnection: cloneConnectionFields(this.defaultConnection, redact) }
         : {}),
       connections,
     };
@@ -582,10 +1182,10 @@ export class ModelGateway {
   resolveConnection(role: AgentRole): Result<RoleConnectionConfig, ValidationError[]> {
     const specific = this.connections.get(role);
     if (specific !== undefined) {
-      return ok({ ...specific });
+      return ok(cloneConnectionFields(specific));
     }
     if (this.defaultConnection !== undefined) {
-      return ok({ ...this.defaultConnection, role });
+      return ok(cloneConnectionFields({ ...this.defaultConnection, role }));
     }
     return err([
       validationError('role', 'MISSING_ROLE_CONFIG', `No model connection configured for role '${role}'`),

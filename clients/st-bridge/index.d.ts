@@ -1,4 +1,5 @@
-import type { RefereeBridgeClient } from './bridge-client.js';
+import type { RefereeBridgeClient, RefereeBridgeError } from './bridge-client.js';
+import type { ControlRoomModalHandlers } from './control-room-modal.js';
 import type { DirectorBarState } from './director-bar.js';
 
 export const REFEREE_CONTEXT_TAG: '[REFEREE_CONTEXT]';
@@ -40,10 +41,36 @@ export function refereeGenerateInterceptor(
 ): Promise<Record<string, unknown> | undefined>;
 export function initialize(options?: BridgeInitializeOptions): BridgeRuntimeState;
 export function dispose(): void;
+export function syncActiveSillyTavernPreset(options?: {
+  ctx?: unknown;
+  client?: RefereeBridgeClient;
+  sessionId?: string | null;
+  presetName?: string;
+}): Promise<Record<string, unknown>>;
+export function syncActiveSillyTavernPersona(options?: {
+  ctx?: unknown;
+  client?: RefereeBridgeClient;
+  sessionId?: string | null;
+  savePreset?: boolean;
+}): Promise<Record<string, unknown>>;
+export function createControlRoomBridgeHandlers(options?: {
+  client?: RefereeBridgeClient;
+  sessionId?: string | null;
+  ctx?: unknown;
+  onUpdated?: (result: unknown, action: string) => void;
+  onError?: (err: unknown, action: string) => void;
+}): ControlRoomModalHandlers;
 
 export {
   RefereeBridgeClient,
-  DirectorBarState,
-};
-export { renderHudStateHtml, bindHudPanelDom } from './hud-panel.js';
-export { buildControlRoomViewModel, renderControlRoomModalHtml } from './control-room-modal.js';
+  RefereeBridgeError,
+} from './bridge-client.js';
+export { DirectorBarState } from './director-bar.js';
+export { renderHudStateHtml, renderHudPanel, bindHudPanelDom } from './hud-panel.js';
+export {
+  buildControlRoomViewModel,
+  renderControlRoomModalHtml,
+  bindControlRoomModalDom,
+  extractActiveSillyTavernPreset,
+  extractActiveSillyTavernPersona,
+} from './control-room-modal.js';

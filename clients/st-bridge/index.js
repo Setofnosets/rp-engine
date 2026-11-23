@@ -1,13 +1,17 @@
 import {
   RefereeBridgeClient,
+  RefereeBridgeError,
   getSafeOwn,
   isSafePropertyKey,
   setSafeOwn,
 } from './bridge-client.js';
 import { DirectorBarState } from './director-bar.js';
-import { bindHudPanelDom, renderHudStateHtml } from './hud-panel.js';
+import { bindHudPanelDom, renderHudPanel, renderHudStateHtml } from './hud-panel.js';
 import {
+  bindControlRoomModalDom,
   buildControlRoomViewModel,
+  extractActiveSillyTavernPersona,
+  extractActiveSillyTavernPreset,
   renderControlRoomModalHtml,
 } from './control-room-modal.js';
 
@@ -610,13 +614,210 @@ export function initialize(options = {}) {
   return runtime;
 }
 
+/**
+ * Extract the active SillyTavern preset from `ctx` (or `getSillyTavernContext()`) and import/apply
+ * it into the active Referee session.
+ *
+ * @param {{
+ *   ctx?: any;
+ *   client?: RefereeBridgeClient;
+ *   sessionId?: string | null;
+ *   presetName?: string;
+ * }} [options]
+ */
+export async function syncActiveSillyTavernPreset(options = {}) {
+  const ctx = options.ctx ?? getSillyTavernContext();
+  const client = options.client ?? runtime.client;
+  const preset = extractActiveSillyTavernPreset(ctx);
+  if (!preset) {
+    throw new RefereeBridgeError('No active SillyTavern preset settings found in context', {
+      status: 0,
+    });
+  }
+
+  const sessionId =
+    typeof options.sessionId === 'string' && options.sessionId.trim().length > 0
+      ? options.sessionId.trim()
+      : ctx
+        ? await runtime.ensureSession(ctx)
+        : runtime.activeSessionId;
+
+  const payload = {
+    preset,
+    ...(sessionId ? { sessionId } : {}),
+    ...(typeof options.presetName === 'string' && options.presetName.trim().length > 0
+      ? { name: options.presetName.trim() }
+      : {}),
+  };
+
+  const result = await client.importPreset(payload);
+  if (sessionId && client === runtime.client) {
+    await runtime.notifyStateUpdated(sessionId);
+  }
+  return result;
+}
+
+/**
+ * Extract the active SillyTavern persona from `ctx` (or `getSillyTavernContext()`) and apply
+ * it into the active Referee session.
+ *
+ * @param {{
+ *   ctx?: any;
+ *   client?: RefereeBridgeClient;
+ *   sessionId?: string | null;
+ *   savePreset?: boolean;
+ * }} [options]
+ */
+export async function syncActiveSillyTavernPersona(options = {}) {
+  const ctx = options.ctx ?? getSillyTavernContext();
+  const client = options.client ?? runtime.client;
+  const persona = extractActiveSillyTavernPersona(ctx);
+
+  const sessionId =
+    typeof options.sessionId === 'string' && options.sessionId.trim().length > 0
+      ? options.sessionId.trim()
+      : ctx
+        ? await runtime.ensureSession(ctx)
+        : runtime.activeSessionId;
+
+  if (!sessionId) {
+    throw new RefereeBridgeError('No active Referee sessionId to apply SillyTavern persona to', {
+      status: 0,
+    });
+  }
+
+  if (options.savePreset === true) {
+    await client.savePersona(persona);
+  }
+
+  const result = await client.applySessionPersona(sessionId, { persona });
+  if (client === runtime.client) {
+    await runtime.notifyStateUpdated(sessionId);
+  }
+  return result;
+}
+
+/**
+ * Create Control Room modal DOM handlers wired to the active bridge client & session.
+ *
+ * @param {{
+ *   client?: RefereeBridgeClient;
+ *   sessionId?: string | null;
+ *   ctx?: any;
+ *   onUpdated?: (result: unknown, action: string) => void;
+ *   onError?: (err: unknown, action: string) => void;
+ * }} [options]
+ */
+export function createControlRoomBridgeHandlers(options = {}) {
+  const client = options.client ?? runtime.client;
+  const resolveSession = async () => {
+    if (typeof options.sessionId === 'string' && options.sessionId.trim().length > 0) {
+      return options.sessionId.trim();
+    }
+    const ctx = options.ctx ?? getSillyTavernContext();
+    if (ctx) {
+      return runtime.ensureSession(ctx);
+    }
+    return runtime.activeSessionId;
+  };
+  const notifyIfRuntime = async (sessionId, res, action) => {
+    if (sessionId && client === runtime.client) {
+      await runtime.notifyStateUpdated(sessionId);
+    }
+    if (typeof options.onUpdated === 'function') {
+      options.onUpdated(res, action);
+    }
+    return res;
+  };
+
+  return {
+    client,
+    sessionId: options.sessionId ?? runtime.activeSessionId,
+    stContext: options.ctx,
+    onError: options.onError,
+    onApplyPack: async (payload) => {
+      const sid = await resolveSession();
+      if (!sid) return null;
+      const res = await client.patchControlRoom(sid, payload);
+      return notifyIfRuntime(sid, res, 'apply-pack');
+    },
+    onToggleModule: async (payload) => {
+      const sid = await resolveSession();
+      if (!sid) return null;
+      const res = await client.patchControlRoom(sid, payload);
+      return notifyIfRuntime(sid, res, 'toggle-module');
+    },
+    onWizardGenerate: async (req) => {
+      const res = await client.generateWizardSystem(req);
+      if (typeof options.onUpdated === 'function') {
+        options.onUpdated(res, 'wizard-generate');
+      }
+      return res;
+    },
+    onWizardApply: async (payload) => {
+      const sid = await resolveSession();
+      if (!sid) return null;
+      const res = await client.patchControlRoom(sid, payload);
+      return notifyIfRuntime(sid, res, 'wizard-apply');
+    },
+    onSyncStPreset: async ({ ctx: modalCtx, sessionId: modalSid }) => {
+      const sid = modalSid ?? (await resolveSession());
+      return syncActiveSillyTavernPreset({
+        ctx: modalCtx ?? options.ctx,
+        client,
+        sessionId: sid,
+      });
+    },
+    onSyncStPersona: async ({ ctx: modalCtx, sessionId: modalSid }) => {
+      const sid = modalSid ?? (await resolveSession());
+      return syncActiveSillyTavernPersona({
+        ctx: modalCtx ?? options.ctx,
+        client,
+        sessionId: sid,
+      });
+    },
+    onApplySheetPreset: async (payload) => {
+      const sid = await resolveSession();
+      if (!sid) return null;
+      const res = await client.applyPreset(sid, payload);
+      return notifyIfRuntime(sid, res, 'apply-sheet-preset');
+    },
+    onUpdateConnections: async (payload) => {
+      const res = await client.updateConnections(payload);
+      if (typeof options.onUpdated === 'function') {
+        options.onUpdated(res, 'update-connections');
+      }
+      return res;
+    },
+    onSaveConnectionProfile: async (name, payload) => {
+      const res = await client.saveConnectionProfile(name, { ...payload, activate: true });
+      if (typeof options.onUpdated === 'function') {
+        options.onUpdated(res, 'save-connection-profile');
+      }
+      return res;
+    },
+    onActivateConnectionProfile: async (name) => {
+      const res = await client.activateConnectionProfile(name);
+      if (typeof options.onUpdated === 'function') {
+        options.onUpdated(res, 'activate-connection-profile');
+      }
+      return res;
+    },
+  };
+}
+
 export {
   RefereeBridgeClient,
+  RefereeBridgeError,
   DirectorBarState,
   renderHudStateHtml,
+  renderHudPanel,
   bindHudPanelDom,
   buildControlRoomViewModel,
   renderControlRoomModalHtml,
+  bindControlRoomModalDom,
+  extractActiveSillyTavernPreset,
+  extractActiveSillyTavernPersona,
 };
 
 // Auto-initialize only in real browser DOM contexts where SillyTavern is already loaded

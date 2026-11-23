@@ -31,6 +31,7 @@ import {
   THREAT_STATUSES,
   WORLD_ARCS,
   type CharacterEntity,
+  type CharacterProgression,
   type CharacterStatus,
   type ChronicleCategory,
   type ChronicleEntry,
@@ -98,6 +99,16 @@ const VALID_COLLECTIONS: ReadonlySet<string> = new Set([
 
 function isSafeKey(key: string): boolean {
   return key.length > 0 && !FORBIDDEN_KEYS.has(key);
+}
+
+function isSafeEntityId(key: string): boolean {
+  return (
+    isSafeKey(key) &&
+    key.trim().length > 0 &&
+    !key.includes('.') &&
+    !key.includes('/') &&
+    !key.includes('\\')
+  );
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1698,6 +1709,664 @@ function recordChangedIfDifferent(
   }
 }
 
+const VALID_CHARACTER_UPSERT_KEYS: ReadonlySet<string> = new Set([
+  'id',
+  'name',
+  'status',
+  'presentInScene',
+  'locationId',
+  'formId',
+  'formGroup',
+  'sections',
+  'customFields',
+  'progression',
+  'resources',
+  'corruption',
+  'abilities',
+  'goals',
+  'agenda',
+  'allegiance',
+  'mood',
+  'traits',
+]);
+
+function cloneCharacterForUpsert(char: CharacterEntity): CharacterEntity {
+  const sections: Record<string, string | string[]> = {};
+  for (const [k, v] of Object.entries(char.sections)) {
+    if (isSafeKey(k)) {
+      setOwn(sections, k, Array.isArray(v) ? [...v] : v);
+    }
+  }
+  const clonedCustom = cloneForAudit(char.customFields);
+  const cloned: CharacterEntity = {
+    id: char.id,
+    name: char.name,
+    status: char.status,
+    presentInScene: char.presentInScene,
+    locationId: char.locationId,
+    formId: char.formId,
+    formGroup: char.formGroup,
+    sections,
+    customFields: isPlainObject(clonedCustom) ? clonedCustom : {},
+    abilities: [...char.abilities],
+    goals: [...char.goals],
+    agenda: char.agenda,
+    allegiance: char.allegiance,
+    mood: char.mood,
+    traits: [...char.traits],
+  };
+  if (char.progression !== undefined) {
+    cloned.progression = {
+      level: char.progression.level,
+      xp: char.progression.xp,
+      ...(char.progression.className !== undefined ? { className: char.progression.className } : {}),
+      ...(char.progression.subclass !== undefined ? { subclass: char.progression.subclass } : {}),
+      ...(char.progression.attributes !== undefined
+        ? { attributes: { ...(cloneForAudit(char.progression.attributes) as Record<string, number>) } }
+        : {}),
+    };
+  }
+  if (char.resources !== undefined) {
+    const resources: Record<string, ResourcePool> = {};
+    for (const [k, pool] of Object.entries(char.resources)) {
+      if (isSafeKey(k)) {
+        setOwn(resources, k, { current: pool.current, max: pool.max });
+      }
+    }
+    cloned.resources = resources;
+  }
+  if (char.corruption !== undefined) {
+    cloned.corruption = { ...char.corruption };
+  }
+  return cloned;
+}
+
+function applyUpsertRecordEntries(
+  ctx: ExecContext,
+  characterId: string,
+  opName: string,
+  kind: 'sections' | 'customFields' | 'resources',
+  rawRecord: unknown,
+  targetChar: CharacterEntity,
+  existingChar: CharacterEntity | undefined,
+  opErrPath: string
+): Result<void, ValidationError[]> {
+  if (!isPlainObject(rawRecord)) {
+    return err([
+      validationError(`${opErrPath}.character.${kind}`, 'INVALID_TYPE', `${kind} must be a plain record`),
+    ]);
+  }
+  const keys = Object.getOwnPropertyNames(rawRecord).sort();
+  for (const key of keys) {
+    if (!isSafeKey(key)) {
+      return err([
+        validationError(`${opErrPath}.character.${kind}.${key}`, 'UNSAFE_KEY', `Forbidden key "${key}"`),
+      ]);
+    }
+    const rawVal = Object.getOwnPropertyDescriptor(rawRecord, key)?.value;
+    if (rawVal === undefined) {
+      continue;
+    }
+
+    const canonicalPath = `entities.characters.${characterId}.${kind}.${key}`;
+    const policy = lookupFieldPolicy(ctx.options.compiledSchema, canonicalPath, ctx.nextState);
+    const oldContainer =
+      existingChar === undefined
+        ? undefined
+        : kind === 'sections'
+          ? existingChar.sections
+          : kind === 'customFields'
+            ? existingChar.customFields
+            : existingChar.resources;
+    const oldVal = oldContainer ? cloneForAudit(getOwn(oldContainer, key)) : undefined;
+    const gate = evaluateTrackerGate(ctx.batch.source, canonicalPath, policy);
+
+    const makeDivertedOp = (): PatchOperation => {
+      if (kind === 'sections') {
+        return {
+          op: 'section_patch',
+          target: { characterId },
+          sectionId: key,
+          value: cloneForAudit(rawVal) as string | string[],
+        };
+      }
+      if (kind === 'customFields') {
+        return {
+          op: 'custom_field_patch',
+          target: { characterId },
+          fieldId: key,
+          value: cloneForAudit(rawVal),
+        };
+      }
+      return {
+        op: 'set',
+        path: canonicalPath,
+        value: cloneForAudit(rawVal),
+      };
+    };
+
+    if (gate.action === 'reject') {
+      ctx.rejectedOperations.push({ op: makeDivertedOp(), reason: gate.reason });
+      emitAudit(ctx, opName, canonicalPath, oldVal, rawVal, 'rejected', gate.reason);
+      continue;
+    }
+    if (gate.action === 'pending') {
+      ctx.pendingConfirmations.push(makeDivertedOp());
+      emitAudit(ctx, opName, canonicalPath, oldVal, rawVal, 'pending_confirmation', gate.reason);
+      continue;
+    }
+
+    if (kind === 'sections') {
+      if (typeof rawVal !== 'string' && !isStringArray(rawVal)) {
+        return err([
+          validationError(canonicalPath, 'INVALID_TYPE', 'Section value must be string or string[]'),
+        ]);
+      }
+      let nextVal: unknown = typeof rawVal === 'string' ? rawVal : [...rawVal];
+      if (policy) {
+        const specRes = enforceDynamicFieldSpec(policy.spec, nextVal, canonicalPath);
+        if (!specRes.ok) {
+          return specRes;
+        }
+        nextVal = specRes.value;
+      }
+      setOwn(targetChar.sections, key, nextVal as string | string[]);
+    } else if (kind === 'customFields') {
+      const safeRes = cloneSafeValue(rawVal, canonicalPath);
+      if (!safeRes.ok) {
+        return safeRes;
+      }
+      let nextVal = safeRes.value;
+      if (policy) {
+        const specRes = enforceDynamicFieldSpec(policy.spec, nextVal, canonicalPath);
+        if (!specRes.ok) {
+          return specRes;
+        }
+        nextVal = specRes.value;
+      }
+      setOwn(targetChar.customFields, key, nextVal);
+    } else {
+      const poolRes = validateResourcePool(rawVal, canonicalPath);
+      if (!poolRes.ok) {
+        return poolRes;
+      }
+      if (!targetChar.resources) {
+        targetChar.resources = {};
+      }
+      setOwn(targetChar.resources, key, poolRes.value);
+    }
+  }
+  return ok(undefined);
+}
+
+function applyUpsertProgression(
+  ctx: ExecContext,
+  characterId: string,
+  rawProg: unknown,
+  targetChar: CharacterEntity,
+  existingChar: CharacterEntity | undefined,
+  opErrPath: string
+): Result<void, ValidationError[]> {
+  if (!isPlainObject(rawProg)) {
+    return err([
+      validationError(`${opErrPath}.character.progression`, 'INVALID_TYPE', 'progression must be an object'),
+    ]);
+  }
+  const progKeys = Object.getOwnPropertyNames(rawProg).sort();
+  for (const key of progKeys) {
+    if (!isSafeKey(key)) {
+      return err([
+        validationError(
+          `${opErrPath}.character.progression.${key}`,
+          'UNSAFE_KEY',
+          `Forbidden progression key "${key}"`
+        ),
+      ]);
+    }
+    if (
+      key !== 'level' &&
+      key !== 'xp' &&
+      key !== 'className' &&
+      key !== 'subclass' &&
+      key !== 'attributes'
+    ) {
+      return err([
+        validationError(
+          `${opErrPath}.character.progression.${key}`,
+          'INVALID_PATH',
+          `Unknown progression field "${key}"`
+        ),
+      ]);
+    }
+  }
+
+  const baseProg: Partial<CharacterProgression> = targetChar.progression
+    ? {
+        level: targetChar.progression.level,
+        xp: targetChar.progression.xp,
+        ...(targetChar.progression.className !== undefined
+          ? { className: targetChar.progression.className }
+          : {}),
+        ...(targetChar.progression.subclass !== undefined
+          ? { subclass: targetChar.progression.subclass }
+          : {}),
+        ...(targetChar.progression.attributes !== undefined
+          ? {
+              attributes: {
+                ...(cloneForAudit(targetChar.progression.attributes) as Record<string, number>),
+              },
+            }
+          : {}),
+      }
+    : {};
+
+  for (const key of progKeys) {
+    const rawVal = Object.getOwnPropertyDescriptor(rawProg, key)?.value;
+    if (rawVal === undefined) {
+      continue;
+    }
+
+    if (key === 'attributes') {
+      if (!isPlainObject(rawVal)) {
+        return err([
+          validationError(
+            `${opErrPath}.character.progression.attributes`,
+            'INVALID_TYPE',
+            'progression.attributes must be a plain record'
+          ),
+        ]);
+      }
+      const attrMap: Record<string, number> = baseProg.attributes ? { ...baseProg.attributes } : {};
+      for (const attrKey of Object.getOwnPropertyNames(rawVal).sort()) {
+        if (!isSafeKey(attrKey)) {
+          return err([
+            validationError(
+              `${opErrPath}.character.progression.attributes.${attrKey}`,
+              'UNSAFE_KEY',
+              `Forbidden attribute key "${attrKey}"`
+            ),
+          ]);
+        }
+        const attrVal = Object.getOwnPropertyDescriptor(rawVal, attrKey)?.value;
+        if (attrVal === undefined) {
+          continue;
+        }
+        const attrPath = `entities.characters.${characterId}.progression.attributes.${attrKey}`;
+        const policy = lookupFieldPolicy(ctx.options.compiledSchema, attrPath, ctx.nextState);
+        const oldVal = existingChar?.progression?.attributes
+          ? getOwn(existingChar.progression.attributes, attrKey)
+          : undefined;
+        const gate = evaluateTrackerGate(ctx.batch.source, attrPath, policy);
+        if (gate.action === 'reject') {
+          ctx.rejectedOperations.push({
+            op: { op: 'set', path: attrPath, value: cloneForAudit(attrVal) },
+            reason: gate.reason,
+          });
+          emitAudit(ctx, 'character_upsert', attrPath, oldVal, attrVal, 'rejected', gate.reason);
+          continue;
+        }
+        if (gate.action === 'pending') {
+          ctx.pendingConfirmations.push({
+            op: 'set',
+            path: attrPath,
+            value: cloneForAudit(attrVal),
+          });
+          emitAudit(
+            ctx,
+            'character_upsert',
+            attrPath,
+            oldVal,
+            attrVal,
+            'pending_confirmation',
+            gate.reason
+          );
+          continue;
+        }
+        const numRes = validateFiniteNumber(attrVal, attrPath);
+        if (!numRes.ok) {
+          return numRes;
+        }
+        setOwn(attrMap, attrKey, numRes.value);
+      }
+      baseProg.attributes = attrMap;
+      continue;
+    }
+
+    const fieldPath = `entities.characters.${characterId}.progression.${key}`;
+    const policy = lookupFieldPolicy(ctx.options.compiledSchema, fieldPath, ctx.nextState);
+    const oldVal = existingChar?.progression ? getOwn(existingChar.progression, key) : undefined;
+    const gate = evaluateTrackerGate(ctx.batch.source, fieldPath, policy);
+    if (gate.action === 'reject') {
+      ctx.rejectedOperations.push({
+        op: { op: 'set', path: fieldPath, value: cloneForAudit(rawVal) },
+        reason: gate.reason,
+      });
+      emitAudit(ctx, 'character_upsert', fieldPath, oldVal, rawVal, 'rejected', gate.reason);
+      continue;
+    }
+    if (gate.action === 'pending') {
+      ctx.pendingConfirmations.push({ op: 'set', path: fieldPath, value: cloneForAudit(rawVal) });
+      emitAudit(
+        ctx,
+        'character_upsert',
+        fieldPath,
+        oldVal,
+        rawVal,
+        'pending_confirmation',
+        gate.reason
+      );
+      continue;
+    }
+
+    if (key === 'level') {
+      if (typeof rawVal !== 'number' || !Number.isInteger(rawVal) || rawVal < 1) {
+        return err([validationError(fieldPath, 'INVALID_INTEGER', 'level must be >= 1')]);
+      }
+      baseProg.level = rawVal;
+    } else if (key === 'xp') {
+      if (typeof rawVal !== 'number' || !Number.isFinite(rawVal) || rawVal < 0) {
+        return err([validationError(fieldPath, 'INVALID_NUMBER', 'xp must be >= 0')]);
+      }
+      baseProg.xp = normalizeZero(rawVal);
+    } else if (key === 'className') {
+      if (typeof rawVal !== 'string') {
+        return err([validationError(fieldPath, 'INVALID_TYPE', 'className must be a string')]);
+      }
+      baseProg.className = rawVal;
+    } else {
+      if (typeof rawVal !== 'string') {
+        return err([validationError(fieldPath, 'INVALID_TYPE', 'subclass must be a string')]);
+      }
+      baseProg.subclass = rawVal;
+    }
+  }
+
+  if (baseProg.level !== undefined && baseProg.xp !== undefined) {
+    targetChar.progression = {
+      level: baseProg.level,
+      xp: baseProg.xp,
+      ...(baseProg.className !== undefined ? { className: baseProg.className } : {}),
+      ...(baseProg.subclass !== undefined ? { subclass: baseProg.subclass } : {}),
+      ...(baseProg.attributes !== undefined ? { attributes: baseProg.attributes } : {}),
+    };
+  } else if (targetChar.progression === undefined && ctx.batch.source !== 'tracker') {
+    return err([
+      validationError(
+        `${opErrPath}.character.progression`,
+        'REQUIRED',
+        'New character progression requires integer level >= 1 and finite xp >= 0'
+      ),
+    ]);
+  }
+  return ok(undefined);
+}
+
+function applyCharacterUpsertOperation(
+  ctx: ExecContext,
+  op: Extract<PatchOperation, { op: 'character_upsert' }>,
+  opIndex: number
+): Result<void, ValidationError[]> {
+  const opErrPath = `operations[${opIndex}]`;
+
+  if (typeof op.characterId !== 'string' || op.characterId.trim().length === 0) {
+    return err([
+      validationError(
+        `${opErrPath}.characterId`,
+        'REQUIRED',
+        'character_upsert characterId must be a non-empty string'
+      ),
+    ]);
+  }
+  if (!isSafeEntityId(op.characterId)) {
+    return err([
+      validationError(
+        `${opErrPath}.characterId`,
+        'UNSAFE_KEY',
+        `Invalid characterId "${op.characterId}"`
+      ),
+    ]);
+  }
+  if (op.mergeIfExists !== undefined && typeof op.mergeIfExists !== 'boolean') {
+    return err([
+      validationError(
+        `${opErrPath}.mergeIfExists`,
+        'INVALID_TYPE',
+        'mergeIfExists must be a boolean'
+      ),
+    ]);
+  }
+  if (!isPlainObject(op.character)) {
+    return err([
+      validationError(
+        `${opErrPath}.character`,
+        'INVALID_TYPE',
+        'character_upsert character must be a plain object'
+      ),
+    ]);
+  }
+
+  const providedKeys = Object.getOwnPropertyNames(op.character).sort();
+  for (const key of providedKeys) {
+    if (!isSafeKey(key)) {
+      return err([
+        validationError(
+          `${opErrPath}.character`,
+          'UNSAFE_KEY',
+          `Forbidden key "${key}" in character_upsert`
+        ),
+      ]);
+    }
+    if (!VALID_CHARACTER_UPSERT_KEYS.has(key)) {
+      return err([
+        validationError(
+          `${opErrPath}.character.${key}`,
+          'INVALID_PATH',
+          `Unknown CharacterEntity field "${key}"`
+        ),
+      ]);
+    }
+  }
+
+  const rawName = getOwn(op.character, 'name');
+  if (typeof rawName !== 'string' || rawName.trim().length === 0) {
+    return err([
+      validationError(
+        `${opErrPath}.character.name`,
+        'REQUIRED',
+        'character_upsert character.name must be a non-empty string'
+      ),
+    ]);
+  }
+  if (
+    Object.hasOwn(op.character, 'id') &&
+    getOwn(op.character, 'id') !== undefined &&
+    getOwn(op.character, 'id') !== op.characterId
+  ) {
+    return err([
+      validationError(
+        `${opErrPath}.character.id`,
+        'ID_IMMUTABLE',
+        `Character id must match characterId "${op.characterId}"`
+      ),
+    ]);
+  }
+
+  const existing = getOwn(ctx.nextState.entities.characters, op.characterId) as
+    | CharacterEntity
+    | undefined;
+  if (existing !== undefined && op.mergeIfExists === false) {
+    return err([
+      validationError(
+        `${opErrPath}.characterId`,
+        'ENTITY_ALREADY_EXISTS',
+        `Character "${op.characterId}" already exists and mergeIfExists is false`
+      ),
+    ]);
+  }
+
+  const nextChar: CharacterEntity =
+    existing !== undefined
+      ? cloneCharacterForUpsert(existing)
+      : {
+          id: op.characterId,
+          name: rawName,
+          status: 'active',
+          presentInScene: ctx.nextState.scene.locationId === null,
+          locationId: ctx.nextState.scene.locationId,
+          formId: null,
+          formGroup: null,
+          sections: {},
+          customFields: {},
+          abilities: [],
+          goals: [],
+          agenda: '',
+          allegiance: '',
+          mood: 'neutral',
+          traits: [],
+        };
+
+  for (const key of providedKeys) {
+    if (key === 'id') {
+      continue;
+    }
+    const rawVal = Object.getOwnPropertyDescriptor(op.character, key)?.value;
+    if (rawVal === undefined) {
+      continue;
+    }
+
+    if (key === 'sections' || key === 'customFields' || key === 'resources') {
+      const recRes = applyUpsertRecordEntries(
+        ctx,
+        op.characterId,
+        op.op,
+        key,
+        rawVal,
+        nextChar,
+        existing,
+        opErrPath
+      );
+      if (!recRes.ok) {
+        return recRes;
+      }
+      continue;
+    }
+
+    if (key === 'progression') {
+      const progRes = applyUpsertProgression(
+        ctx,
+        op.characterId,
+        rawVal,
+        nextChar,
+        existing,
+        opErrPath
+      );
+      if (!progRes.ok) {
+        return progRes;
+      }
+      continue;
+    }
+
+    const canonicalFieldPath = `entities.characters.${op.characterId}.${key}`;
+    const policy = lookupFieldPolicy(ctx.options.compiledSchema, canonicalFieldPath, ctx.nextState);
+    const oldVal = existing !== undefined ? cloneForAudit(getOwn(existing, key)) : undefined;
+    const gate = evaluateTrackerGate(ctx.batch.source, canonicalFieldPath, policy);
+    if (gate.action === 'reject') {
+      ctx.rejectedOperations.push({
+        op: {
+          op: 'entity_patch',
+          collection: 'characters',
+          entityId: op.characterId,
+          patch: { [key]: cloneForAudit(rawVal) },
+        },
+        reason: gate.reason,
+      });
+      emitAudit(ctx, op.op, canonicalFieldPath, oldVal, rawVal, 'rejected', gate.reason);
+      continue;
+    }
+    if (gate.action === 'pending') {
+      ctx.pendingConfirmations.push({
+        op: 'entity_patch',
+        collection: 'characters',
+        entityId: op.characterId,
+        patch: { [key]: cloneForAudit(rawVal) },
+      });
+      emitAudit(
+        ctx,
+        op.op,
+        canonicalFieldPath,
+        oldVal,
+        rawVal,
+        'pending_confirmation',
+        gate.reason
+      );
+      continue;
+    }
+
+    const safeRes = cloneSafeValue(rawVal, `${opErrPath}.character.${key}`);
+    if (!safeRes.ok) {
+      return safeRes;
+    }
+    let nextVal = safeRes.value;
+    if (policy) {
+      const specRes = enforceDynamicFieldSpec(policy.spec, nextVal, canonicalFieldPath);
+      if (!specRes.ok) {
+        return specRes;
+      }
+      nextVal = specRes.value;
+    }
+    const validated = validateEntityFieldValue(
+      'characters',
+      nextChar,
+      key,
+      nextVal,
+      canonicalFieldPath,
+      ctx.nextState
+    );
+    if (!validated.ok) {
+      return validated;
+    }
+    setOwn(nextChar, key, validated.value);
+  }
+
+  setOwn(ctx.nextState.entities.characters, op.characterId, nextChar);
+  const entityPath = `entities.characters.${op.characterId}`;
+  if (existing === undefined) {
+    ctx.changedPaths.add(entityPath);
+  } else {
+    recordChangedIfDifferent(ctx, entityPath, existing, nextChar);
+  }
+  emitAudit(ctx, op.op, entityPath, existing, nextChar, 'committed');
+
+  const isPlayerChar = ctx.nextState.player.characterId === op.characterId;
+  if (!isPlayerChar) {
+    const isPresentHere =
+      ctx.nextState.capabilities.spatialMode === 'scene_only'
+        ? nextChar.presentInScene
+        : ctx.nextState.scene.locationId !== null &&
+          nextChar.locationId === ctx.nextState.scene.locationId;
+    const isActiveAndPresent = nextChar.status === 'active' && isPresentHere;
+    const alreadyPresent = ctx.nextState.scene.presentCharacterIds.includes(op.characterId);
+    if (isActiveAndPresent && !alreadyPresent) {
+      ctx.nextState.scene.presentCharacterIds = [
+        ...ctx.nextState.scene.presentCharacterIds,
+        op.characterId,
+      ];
+      ctx.changedPaths.add('scene.presentCharacterIds');
+    } else if (
+      !isActiveAndPresent &&
+      alreadyPresent &&
+      (nextChar.status !== 'active' ||
+        !ctx.nextState.scene.pinnedCharacterIds.includes(op.characterId))
+    ) {
+      ctx.nextState.scene.presentCharacterIds =
+        ctx.nextState.scene.presentCharacterIds.filter((id) => id !== op.characterId);
+      ctx.changedPaths.add('scene.presentCharacterIds');
+    }
+  }
+
+  return ok(undefined);
+}
+
 function applySingleOperation(
   ctx: ExecContext,
   op: PatchOperation,
@@ -2763,6 +3432,10 @@ function applySingleOperation(
         ctx.batch.reason ?? `route_lock:${op.routeId}`
       );
       return ok(undefined);
+    }
+
+    case 'character_upsert': {
+      return applyCharacterUpsertOperation(ctx, op, opIndex);
     }
   }
 }

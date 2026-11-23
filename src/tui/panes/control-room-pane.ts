@@ -1,7 +1,13 @@
 import type { ResolvedControlRoomConfig } from '../../config/control-room-config.js';
 import type { ControlRoomDiffReport, ImpactBadge } from '../../config/prompt-diff.js';
 import type { CadencePolicy } from '../../schema/tracker-module.js';
-import { compareStringsDeterministic, getSafeOwn, truncateLine, wrapText } from './layout-helpers.js';
+import {
+  compareStringsDeterministic,
+  getSafeOwn,
+  isSafeRecordKey,
+  truncateLine,
+  wrapText,
+} from './layout-helpers.js';
 
 export interface RenderControlRoomPaneParams {
   readonly config: ResolvedControlRoomConfig;
@@ -63,6 +69,34 @@ export function renderControlRoomPane(params: RenderControlRoomPaneParams): stri
       width
     )
   );
+
+  const gen = config.generation;
+  const customBlockCount =
+    config.customPromptBlocks !== undefined
+      ? Object.keys(config.customPromptBlocks).filter(isSafeRecordKey).length
+      : 0;
+  const genParts: string[] = [];
+  if (gen?.temperature !== undefined) {
+    genParts.push(`temp=${gen.temperature}`);
+  }
+  if (gen?.maxTokens !== undefined) {
+    genParts.push(`maxTokens=${gen.maxTokens}`);
+  }
+  if (gen?.topP !== undefined) {
+    genParts.push(`topP=${gen.topP}`);
+  }
+  if (gen?.repetitionPenalty !== undefined) {
+    genParts.push(`repPen=${gen.repetitionPenalty}`);
+  }
+  if (gen?.maxContextTokens !== undefined) {
+    genParts.push(`maxContext=${gen.maxContextTokens}`);
+  }
+  const genSummary = genParts.length > 0 ? genParts.join(' | ') : 'defaults';
+  const presetTag = gen?.presetName ? ` [${gen.presetName}]` : '';
+  const genLine = `Generation:${presetTag} ${genSummary} | ST Blocks: ${customBlockCount}`;
+  for (const wrapped of wrapText(genLine, width)) {
+    lines.push(wrapped);
+  }
 
   const sysBadge = formatBadgeLabel(diffReport?.groupBadges.gameSystems);
   lines.push(truncateLine(`Game Systems (${config.gameSystems.length}):${sysBadge}`, width));

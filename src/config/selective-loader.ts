@@ -14,8 +14,11 @@ import {
   cloneCapabilitiesPartial,
   cloneCombatRulesPartial,
   cloneControlRoomLayer,
+  cloneCustomPromptBlocks,
   cloneGameSystemOverrides,
+  cloneGenerationPresetConfig,
   cloneStringRecord,
+  cloneTokenBudgetsPartial,
   cloneTuningDialsPartial,
 } from './control-room-config.js';
 import { computeNormalizedFingerprint } from './prompt-diff.js';
@@ -64,6 +67,11 @@ export const PAYLOAD_GROUP_DEFINITIONS: readonly PayloadGroupDefinition[] = Obje
     id: 'tuningDials',
     label: 'Tuning Dials',
     description: 'Beat pressure, narrative pacing, CYOA toggle, and date/time display formats',
+  },
+  {
+    id: 'generation',
+    label: 'Generation & Token Budgets',
+    description: 'Sampling presets, SillyTavern format templates, and prompt section token budgets',
   },
 ]);
 
@@ -156,6 +164,12 @@ export function applySelectivePayloadGroups(
     } else {
       delete next.syspromptSectionOrder;
     }
+
+    if (incomingBundle.customPromptBlocks !== undefined) {
+      next.customPromptBlocks = cloneCustomPromptBlocks(incomingBundle.customPromptBlocks);
+    } else {
+      delete next.customPromptBlocks;
+    }
   }
 
   if (selected.has('combatRules')) {
@@ -174,6 +188,20 @@ export function applySelectivePayloadGroups(
     }
   }
 
+  if (selected.has('generation')) {
+    if (incomingBundle.generation !== undefined) {
+      next.generation = cloneGenerationPresetConfig(incomingBundle.generation);
+    } else {
+      delete next.generation;
+    }
+
+    if (incomingBundle.tokenBudgets !== undefined) {
+      next.tokenBudgets = cloneTokenBudgetsPartial(incomingBundle.tokenBudgets);
+    } else {
+      delete next.tokenBudgets;
+    }
+  }
+
   return next;
 }
 
@@ -185,7 +213,14 @@ export function createPayloadBundleFromSystemPack(
   extras?: Readonly<
     Pick<
       PayloadBundle,
-      'combatRules' | 'tuningDials' | 'unlockedPromptSections' | 'gameSystemOverrides' | 'version'
+      | 'combatRules'
+      | 'tuningDials'
+      | 'unlockedPromptSections'
+      | 'gameSystemOverrides'
+      | 'customPromptBlocks'
+      | 'generation'
+      | 'tokenBudgets'
+      | 'version'
     >
   >
 ): PayloadBundle {
@@ -209,11 +244,20 @@ export function createPayloadBundleFromSystemPack(
     ...(extras?.gameSystemOverrides !== undefined
       ? { gameSystemOverrides: cloneGameSystemOverrides(extras.gameSystemOverrides) }
       : {}),
+    ...(extras?.customPromptBlocks !== undefined
+      ? { customPromptBlocks: cloneCustomPromptBlocks(extras.customPromptBlocks) }
+      : {}),
     ...(extras?.combatRules !== undefined
       ? { combatRules: cloneCombatRulesPartial(extras.combatRules) }
       : {}),
     ...(extras?.tuningDials !== undefined
       ? { tuningDials: cloneTuningDialsPartial(extras.tuningDials) }
+      : {}),
+    ...(extras?.generation !== undefined
+      ? { generation: cloneGenerationPresetConfig(extras.generation) }
+      : {}),
+    ...(extras?.tokenBudgets !== undefined
+      ? { tokenBudgets: cloneTokenBudgetsPartial(extras.tokenBudgets) }
       : {}),
     ...(extras?.version !== undefined ? { version: extras.version } : {}),
   };
@@ -278,12 +322,18 @@ function extractLayerGroupValue(
           unlockedPromptSections: layer.unlockedPromptSections ?? {},
           syspromptSectionOrder:
             layer.syspromptSectionOrder ?? resolvedBaseline.syspromptSectionOrder,
+          ...(layer.customPromptBlocks !== undefined
+            ? { customPromptBlocks: layer.customPromptBlocks }
+            : {}),
         };
       }
       return {
         basePrompts: layer.basePrompts,
         unlockedPromptSections: layer.unlockedPromptSections,
         syspromptSectionOrder: layer.syspromptSectionOrder,
+        ...(layer.customPromptBlocks !== undefined
+          ? { customPromptBlocks: layer.customPromptBlocks }
+          : {}),
       };
     case 'combatRules':
       if (resolvedBaseline !== undefined) {
@@ -309,6 +359,14 @@ function extractLayerGroupValue(
         };
       }
       return layer.tuningDials;
+    case 'generation':
+      if (layer.generation === undefined && layer.tokenBudgets === undefined) {
+        return undefined;
+      }
+      return {
+        ...(layer.generation !== undefined ? { generation: layer.generation } : {}),
+        ...(layer.tokenBudgets !== undefined ? { tokenBudgets: layer.tokenBudgets } : {}),
+      };
   }
 }
 
@@ -333,7 +391,7 @@ export function isPayloadGroupModified(
 }
 
 /**
- * Compute per-group modification flags across all 6 {@link PayloadGroupId}s.
+ * Compute per-group modification flags across all {@link PayloadGroupId}s.
  */
 export function getPayloadBundleGroupDiffs(
   incomingBundle: Readonly<PayloadBundle>,

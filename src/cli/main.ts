@@ -4,15 +4,30 @@ import readline from 'node:readline/promises';
 import { fileURLToPath } from 'node:url';
 import type { CartridgeBundle } from '../cartridge/cartridge-schema.js';
 import { importSillyTavernCard } from '../cartridge/importers/st-card-importer.js';
+import {
+  type SillyTavernPresetImportResult,
+  importSillyTavernPreset,
+} from '../cartridge/importers/st-preset-importer.js';
 import { loadCartridgeFromDirectory } from '../cartridge/loader.js';
+import { type ControlRoomLayer } from '../config/control-room-config.js';
+import { type UserPersonaPreset, validateUserPersonaPreset } from '../config/persona-preset.js';
 import { type ValidationError, formatValidationErrors, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
+import {
+  type ConnectionsFileDocument,
+  applyConnectionsFileToGateway,
+  loadConnectionsFile,
+  saveConnectionsFile,
+  snapshotGatewayToConnectionsDoc,
+} from '../gateway/connection-store.js';
 import { ModelGateway } from '../gateway/model-gateway.js';
-import type { AgentRole, RoleConnectionConfig } from '../gateway/types.js';
+import type { AgentRole } from '../gateway/types.js';
 import { SessionRuntime } from '../runtime/session-runtime.js';
 import { STOCK_FREEFORM_PACK, getStockSystemPack } from '../schema/stock-system-packs.js';
 import type { SystemPack } from '../schema/tracker-module.js';
 import { RefereeDaemon } from '../server/daemon.js';
+import { loadSessionSave } from '../state/persistence.js';
+import { RefereeDataStore } from '../storage/data-store.js';
 import { TuiController, type TuiViewport } from '../tui/app.js';
 import { runSimCli } from './sim-cli.js';
 
@@ -22,6 +37,7 @@ export interface CliConnectionOptions {
   readonly apiKey?: string;
   readonly trackerModel?: string;
   readonly connectionsPath?: string;
+  readonly dataDir?: string;
 }
 
 export type ParsedMainCliCommand =
@@ -37,6 +53,10 @@ export type ParsedMainCliCommand =
       readonly host: string;
       readonly port: number;
       readonly dataDir?: string;
+      readonly saveDirPath?: string;
+      readonly resumePath?: string;
+      readonly presetPath?: string;
+      readonly personaPath?: string;
     } & CliConnectionOptions)
   | ({
       readonly command: 'play';
@@ -47,6 +67,11 @@ export type ParsedMainCliCommand =
       readonly daemon: boolean;
       readonly port: number;
       readonly seed?: string;
+      readonly dataDir?: string;
+      readonly saveDirPath?: string;
+      readonly resumePath?: string;
+      readonly presetPath?: string;
+      readonly personaPath?: string;
     } & CliConnectionOptions);
 
 export interface MainCliIo {
@@ -68,6 +93,25 @@ function parsePortOption(raw: string | undefined, flag: string): Result<number, 
     return err([validationError(flag, 'INVALID_PORT', `${flag} must be an integer between 0 and 65535`)]);
   }
   return ok(port);
+}
+
+function readFlagValue(
+  argv: readonly string[],
+  index: number,
+  flag: string,
+  acc: ErrorAccumulator,
+  requiredMessage: string
+): { value: string | undefined; nextIndex: number } {
+  const val = argv[index + 1];
+  if (val === undefined || val.startsWith('--')) {
+    acc.add(flag, 'REQUIRED', requiredMessage);
+    return { value: undefined, nextIndex: index };
+  }
+  if (val.includes('\0')) {
+    acc.add(flag, 'INVALID_PATH', `${flag} must not contain NUL bytes`);
+    return { value: undefined, nextIndex: index + 1 };
+  }
+  return { value: val, nextIndex: index + 1 };
 }
 
 /**
@@ -93,6 +137,10 @@ export function parseMainCliArgs(
     let host = '127.0.0.1';
     let port = 4120;
     let dataDir: string | undefined;
+    let saveDirPath: string | undefined;
+    let resumePath: string | undefined;
+    let presetPath: string | undefined;
+    let personaPath: string | undefined;
     let baseUrl: string | undefined;
     let model: string | undefined;
     let apiKey: string | undefined;
@@ -102,14 +150,13 @@ export function parseMainCliArgs(
 
     for (let i = 1; i < argv.length; i += 1) {
       const token = argv[i];
+      if (token === '--help' || token === '-h') {
+        return ok({ command: 'help' });
+      }
       if (token === '--host') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--host', 'REQUIRED', '--host requires a hostname or IP');
-        } else {
-          host = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--host', acc, '--host requires a hostname or IP');
+        if (res.value !== undefined) host = res.value;
+        i = res.nextIndex;
       } else if (token === '--port') {
         const portRes = parsePortOption(argv[i + 1], '--port');
         if (!portRes.ok) {
@@ -119,53 +166,45 @@ export function parseMainCliArgs(
           i += 1;
         }
       } else if (token === '--data-dir') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--data-dir', 'REQUIRED', '--data-dir requires a directory path');
-        } else {
-          dataDir = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--data-dir', acc, '--data-dir requires a directory path');
+        if (res.value !== undefined) dataDir = res.value;
+        i = res.nextIndex;
+      } else if (token === '--save-dir') {
+        const res = readFlagValue(argv, i, '--save-dir', acc, '--save-dir requires a directory path');
+        if (res.value !== undefined) saveDirPath = res.value;
+        i = res.nextIndex;
+      } else if (token === '--resume') {
+        const res = readFlagValue(argv, i, '--resume', acc, '--resume requires a save directory path');
+        if (res.value !== undefined) resumePath = res.value;
+        i = res.nextIndex;
+      } else if (token === '--preset') {
+        const res = readFlagValue(argv, i, '--preset', acc, '--preset requires a preset JSON path');
+        if (res.value !== undefined) presetPath = res.value;
+        i = res.nextIndex;
+      } else if (token === '--persona') {
+        const res = readFlagValue(argv, i, '--persona', acc, '--persona requires a persona JSON path');
+        if (res.value !== undefined) personaPath = res.value;
+        i = res.nextIndex;
       } else if (token === '--base-url') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--base-url', 'REQUIRED', '--base-url requires an endpoint URL');
-        } else {
-          baseUrl = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--base-url', acc, '--base-url requires an endpoint URL');
+        if (res.value !== undefined) baseUrl = res.value;
+        i = res.nextIndex;
       } else if (token === '--model') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--model', 'REQUIRED', '--model requires a model identifier');
-        } else {
-          model = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--model', acc, '--model requires a model identifier');
+        if (res.value !== undefined) model = res.value;
+        i = res.nextIndex;
       } else if (token === '--api-key') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--api-key', 'REQUIRED', '--api-key requires an API key value');
-        } else {
-          apiKey = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--api-key', acc, '--api-key requires an API key value');
+        if (res.value !== undefined) apiKey = res.value;
+        i = res.nextIndex;
       } else if (token === '--tracker-model') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--tracker-model', 'REQUIRED', '--tracker-model requires a model identifier');
-        } else {
-          trackerModel = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--tracker-model', acc, '--tracker-model requires a model identifier');
+        if (res.value !== undefined) trackerModel = res.value;
+        i = res.nextIndex;
       } else if (token === '--connections') {
-        const val = argv[i + 1];
-        if (val === undefined || val.startsWith('--')) {
-          acc.add('--connections', 'REQUIRED', '--connections requires a JSON file path');
-        } else {
-          connectionsPath = val;
-          i += 1;
-        }
+        const res = readFlagValue(argv, i, '--connections', acc, '--connections requires a JSON file path');
+        if (res.value !== undefined) connectionsPath = res.value;
+        i = res.nextIndex;
       } else {
         acc.add(String(token), 'UNKNOWN_FLAG', `Unknown daemon option "${String(token)}"`);
       }
@@ -179,6 +218,10 @@ export function parseMainCliArgs(
       host,
       port,
       ...(dataDir !== undefined ? { dataDir } : {}),
+      ...(saveDirPath !== undefined ? { saveDirPath } : {}),
+      ...(resumePath !== undefined ? { resumePath } : {}),
+      ...(presetPath !== undefined ? { presetPath } : {}),
+      ...(personaPath !== undefined ? { personaPath } : {}),
       ...(baseUrl !== undefined ? { baseUrl } : {}),
       ...(model !== undefined ? { model } : {}),
       ...(apiKey !== undefined ? { apiKey } : {}),
@@ -195,6 +238,11 @@ export function parseMainCliArgs(
   let daemon = false;
   let port = 4120;
   let seed: string | undefined;
+  let dataDir: string | undefined;
+  let saveDirPath: string | undefined;
+  let resumePath: string | undefined;
+  let presetPath: string | undefined;
+  let personaPath: string | undefined;
   let baseUrl: string | undefined;
   let model: string | undefined;
   let apiKey: string | undefined;
@@ -212,29 +260,17 @@ export function parseMainCliArgs(
     } else if (token === '--daemon') {
       daemon = true;
     } else if (token === '--card') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--card', 'REQUIRED', '--card requires a file path');
-      } else {
-        cardPath = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--card', acc, '--card requires a file path');
+      if (res.value !== undefined) cardPath = res.value;
+      i = res.nextIndex;
     } else if (token === '--cartridge') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--cartridge', 'REQUIRED', '--cartridge requires a directory path');
-      } else {
-        cartridgePath = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--cartridge', acc, '--cartridge requires a directory path');
+      if (res.value !== undefined) cartridgePath = res.value;
+      i = res.nextIndex;
     } else if (token === '--pack') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--pack', 'REQUIRED', '--pack requires a System Pack ID');
-      } else {
-        packId = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--pack', acc, '--pack requires a System Pack ID');
+      if (res.value !== undefined) packId = res.value;
+      i = res.nextIndex;
     } else if (token === '--port') {
       const portRes = parsePortOption(argv[i + 1], '--port');
       if (!portRes.ok) {
@@ -244,53 +280,49 @@ export function parseMainCliArgs(
         i += 1;
       }
     } else if (token === '--seed') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--seed', 'REQUIRED', '--seed requires a seed string');
-      } else {
-        seed = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--seed', acc, '--seed requires a seed string');
+      if (res.value !== undefined) seed = res.value;
+      i = res.nextIndex;
+    } else if (token === '--data-dir') {
+      const res = readFlagValue(argv, i, '--data-dir', acc, '--data-dir requires a directory path');
+      if (res.value !== undefined) dataDir = res.value;
+      i = res.nextIndex;
+    } else if (token === '--save-dir') {
+      const res = readFlagValue(argv, i, '--save-dir', acc, '--save-dir requires a directory path');
+      if (res.value !== undefined) saveDirPath = res.value;
+      i = res.nextIndex;
+    } else if (token === '--resume') {
+      const res = readFlagValue(argv, i, '--resume', acc, '--resume requires a save directory path');
+      if (res.value !== undefined) resumePath = res.value;
+      i = res.nextIndex;
+    } else if (token === '--preset') {
+      const res = readFlagValue(argv, i, '--preset', acc, '--preset requires a preset JSON path');
+      if (res.value !== undefined) presetPath = res.value;
+      i = res.nextIndex;
+    } else if (token === '--persona') {
+      const res = readFlagValue(argv, i, '--persona', acc, '--persona requires a persona JSON path');
+      if (res.value !== undefined) personaPath = res.value;
+      i = res.nextIndex;
     } else if (token === '--base-url') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--base-url', 'REQUIRED', '--base-url requires an endpoint URL');
-      } else {
-        baseUrl = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--base-url', acc, '--base-url requires an endpoint URL');
+      if (res.value !== undefined) baseUrl = res.value;
+      i = res.nextIndex;
     } else if (token === '--model') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--model', 'REQUIRED', '--model requires a model identifier');
-      } else {
-        model = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--model', acc, '--model requires a model identifier');
+      if (res.value !== undefined) model = res.value;
+      i = res.nextIndex;
     } else if (token === '--api-key') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--api-key', 'REQUIRED', '--api-key requires an API key value');
-      } else {
-        apiKey = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--api-key', acc, '--api-key requires an API key value');
+      if (res.value !== undefined) apiKey = res.value;
+      i = res.nextIndex;
     } else if (token === '--tracker-model') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--tracker-model', 'REQUIRED', '--tracker-model requires a model identifier');
-      } else {
-        trackerModel = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--tracker-model', acc, '--tracker-model requires a model identifier');
+      if (res.value !== undefined) trackerModel = res.value;
+      i = res.nextIndex;
     } else if (token === '--connections') {
-      const val = argv[i + 1];
-      if (val === undefined || val.startsWith('--')) {
-        acc.add('--connections', 'REQUIRED', '--connections requires a JSON file path');
-      } else {
-        connectionsPath = val;
-        i += 1;
-      }
+      const res = readFlagValue(argv, i, '--connections', acc, '--connections requires a JSON file path');
+      if (res.value !== undefined) connectionsPath = res.value;
+      i = res.nextIndex;
     } else {
       acc.add(String(token), 'UNKNOWN_FLAG', `Unknown play option "${String(token)}"`);
     }
@@ -313,6 +345,11 @@ export function parseMainCliArgs(
     daemon,
     port,
     ...(seed !== undefined ? { seed } : {}),
+    ...(dataDir !== undefined ? { dataDir } : {}),
+    ...(saveDirPath !== undefined ? { saveDirPath } : {}),
+    ...(resumePath !== undefined ? { resumePath } : {}),
+    ...(presetPath !== undefined ? { presetPath } : {}),
+    ...(personaPath !== undefined ? { personaPath } : {}),
     ...(baseUrl !== undefined ? { baseUrl } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(apiKey !== undefined ? { apiKey } : {}),
@@ -326,9 +363,9 @@ export function formatMainHelpText(): string {
     'Referee Engine CLI / Native TUI',
     '',
     'Usage:',
-    '  referee play [--freeform] [--card <path>] [--cartridge <path>] [--pack <id>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>] [--daemon] [--port <n>] [--seed <seed>]',
+    '  referee play [--freeform] [--card <path>] [--cartridge <path>] [--pack <id>] [--save-dir <path>] [--resume <path>] [--preset <path>] [--persona <path>] [--data-dir <path>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>] [--daemon] [--port <n>] [--seed <seed>]',
     '  referee sim <validate|run> ...',
-    '  referee daemon [--host <host>] [--port <n>] [--data-dir <path>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>]',
+    '  referee daemon [--host <host>] [--port <n>] [--data-dir <path>] [--save-dir <path>] [--resume <path>] [--preset <path>] [--persona <path>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>]',
   ].join('\n');
 }
 
@@ -443,21 +480,63 @@ async function runInteractiveTuiLoop(
   }
 }
 
-const VALID_AGENT_ROLES: ReadonlySet<AgentRole> = new Set<AgentRole>([
-  'narrator',
-  'intent_parser',
-  'combat_agent',
-  'state_tracker',
-  'storyline_planner',
-  'cast_director',
-  'chronicle_router',
-  'game_system_wizard',
-]);
+/**
+ * Load and validate a preset file (SillyTavern Chat/Text Completion or Referee ControlRoomLayer)
+ * for `--preset <path>`.
+ */
+export async function loadCliPresetFile(
+  presetPath: string
+): Promise<Result<SillyTavernPresetImportResult, ValidationError[]>> {
+  if (typeof presetPath !== 'string' || presetPath.trim().length === 0 || presetPath.includes('\0')) {
+    return err([validationError('--preset', 'INVALID_PATH', '--preset requires a valid file path')]);
+  }
+  let rawText: string;
+  try {
+    rawText = await readFile(path.resolve(presetPath), 'utf8');
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : 'Unable to read preset file';
+    return err([validationError('--preset', 'READ_FAILED', msg)]);
+  }
+  return importSillyTavernPreset(rawText);
+}
 
 /**
- * Construct a {@link ModelGateway} from optional `referee.connections.json`,
+ * Load and validate a {@link UserPersonaPreset} JSON file for `--persona <path>`.
+ */
+export async function loadCliPersonaFile(
+  personaPath: string
+): Promise<Result<UserPersonaPreset, ValidationError[]>> {
+  if (
+    typeof personaPath !== 'string' ||
+    personaPath.trim().length === 0 ||
+    personaPath.includes('\0')
+  ) {
+    return err([
+      validationError('--persona', 'INVALID_PATH', '--persona requires a valid file path'),
+    ]);
+  }
+  let rawText: string;
+  try {
+    rawText = await readFile(path.resolve(personaPath), 'utf8');
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : 'Unable to read persona file';
+    return err([validationError('--persona', 'READ_FAILED', msg)]);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText) as unknown;
+  } catch (caught) {
+    const msg = caught instanceof Error ? caught.message : 'Invalid JSON';
+    return err([validationError('--persona', 'INVALID_JSON', msg)]);
+  }
+  return validateUserPersonaPreset(parsed);
+}
+
+/**
+ * Construct a {@link ModelGateway} from optional `referee.connections.json` (or `<dataDir>/connections.json`),
  * environment variables (`REFEREE_BASE_URL` / `OPENAI_BASE_URL`, `REFEREE_MODEL` / `OPENAI_MODEL`,
- * `REFEREE_API_KEY` / `OPENAI_API_KEY`, `REFEREE_TRACKER_MODEL`), and CLI flags.
+ * `REFEREE_API_KEY` / `OPENAI_API_KEY`, `REFEREE_TRACKER_MODEL`), and CLI flags,
+ * preserving `provider`, `SamplingParameters`, `timeoutMs`, `supportsJsonSchema`, and `activeProfile`.
  */
 export async function buildCliModelGateway(
   options: CliConnectionOptions = {},
@@ -465,87 +544,55 @@ export async function buildCliModelGateway(
 ): Promise<Result<ModelGateway, ValidationError[]>> {
   const gateway = new ModelGateway();
 
-  // 1. Load JSON file if --connections was given or ./referee.connections.json exists
-  const filePath = options.connectionsPath ?? path.resolve('referee.connections.json');
-  let rawJsonText: string | undefined;
-  try {
-    rawJsonText = await readFile(filePath, 'utf-8');
-  } catch (caught) {
-    if (options.connectionsPath !== undefined) {
-      const msg = caught instanceof Error ? caught.message : 'Unable to read connections file';
-      return err([validationError('--connections', 'READ_FAILED', msg)]);
+  // 1. Load versioned or legacy connections file via connection-store.ts
+  const explicitPath = options.connectionsPath;
+  const candidatePaths: Array<{ filePath: string; required: boolean }> =
+    explicitPath !== undefined
+      ? [{ filePath: explicitPath, required: true }]
+      : [
+          { filePath: path.resolve('referee.connections.json'), required: false },
+          ...(options.dataDir !== undefined
+            ? [{ filePath: new RefereeDataStore(options.dataDir).getConnectionsPath(), required: false }]
+            : []),
+        ];
+
+  let loadedDoc: ConnectionsFileDocument | undefined;
+  for (const candidate of candidatePaths) {
+    const loadRes = await loadConnectionsFile(candidate.filePath);
+    if (loadRes.ok) {
+      loadedDoc = loadRes.value;
+      applyConnectionsFileToGateway(gateway, loadedDoc);
+      break;
+    }
+    const isNotFoundOnly = loadRes.error.every((e) => e.code === 'NOT_FOUND');
+    if (candidate.required || !isNotFoundOnly) {
+      return err(
+        loadRes.error.map((e) => validationError('--connections', e.code, e.message))
+      );
     }
   }
 
-  if (rawJsonText !== undefined) {
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(rawJsonText) as unknown;
-    } catch (caught) {
-      const msg = caught instanceof Error ? caught.message : 'Invalid JSON';
-      return err([validationError('--connections', 'INVALID_JSON', msg)]);
-    }
-    if (typeof parsedJson === 'object' && parsedJson !== null && !Array.isArray(parsedJson)) {
-      const root = parsedJson as Record<string, unknown>;
-      const def = root.defaultConnection;
-      if (typeof def === 'object' && def !== null && !Array.isArray(def)) {
-        const d = def as Record<string, unknown>;
-        if (typeof d.baseUrl === 'string' && typeof d.model === 'string') {
-          gateway.setDefaultConnection({
-            provider: 'openai_compatible',
-            baseUrl: d.baseUrl,
-            model: d.model,
-            ...(typeof d.apiKey === 'string' ? { apiKey: d.apiKey } : {}),
-            ...(typeof d.temperature === 'number' ? { temperature: d.temperature } : {}),
-            ...(typeof d.maxTokens === 'number' ? { maxTokens: d.maxTokens } : {}),
-          });
-        }
-      }
-      const conns = root.connections;
-      if (typeof conns === 'object' && conns !== null && !Array.isArray(conns)) {
-        const cMap = conns as Record<string, unknown>;
-        for (const role of VALID_AGENT_ROLES) {
-          const entry = cMap[role];
-          if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
-            const e = entry as Record<string, unknown>;
-            if (typeof e.baseUrl === 'string' && typeof e.model === 'string') {
-              const roleCfg: Omit<RoleConnectionConfig, 'role'> = {
-                provider: 'openai_compatible',
-                baseUrl: e.baseUrl,
-                model: e.model,
-                ...(typeof e.apiKey === 'string' ? { apiKey: e.apiKey } : {}),
-                ...(typeof e.temperature === 'number' ? { temperature: e.temperature } : {}),
-                ...(typeof e.maxTokens === 'number' ? { maxTokens: e.maxTokens } : {}),
-              };
-              gateway.setRoleConnection(role, roleCfg);
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // 2. Environment variables + CLI flag overrides
+  // 2. Environment variables + CLI flag overrides (preserving provider, sampling, timeout, etc.)
   const existingDefault = gateway.getConnectionsSnapshot().defaultConnection;
-  const baseUrl =
-    options.baseUrl ??
-    env.REFEREE_BASE_URL ??
-    env.OPENAI_BASE_URL ??
-    existingDefault?.baseUrl;
-  const model =
-    options.model ??
-    env.REFEREE_MODEL ??
-    env.OPENAI_MODEL ??
-    existingDefault?.model;
-  const apiKey =
-    options.apiKey ??
-    env.REFEREE_API_KEY ??
-    env.OPENAI_API_KEY ??
-    existingDefault?.apiKey;
+  const overrideBaseUrl = options.baseUrl ?? env.REFEREE_BASE_URL ?? env.OPENAI_BASE_URL;
+  const overrideModel = options.model ?? env.REFEREE_MODEL ?? env.OPENAI_MODEL;
+  const overrideApiKey = options.apiKey ?? env.REFEREE_API_KEY ?? env.OPENAI_API_KEY;
+  const hasDefaultOverride =
+    overrideBaseUrl !== undefined || overrideModel !== undefined || overrideApiKey !== undefined;
 
-  if (baseUrl !== undefined && model !== undefined) {
+  const baseUrl = overrideBaseUrl ?? existingDefault?.baseUrl;
+  const model = overrideModel ?? existingDefault?.model;
+  const apiKey = overrideApiKey ?? existingDefault?.apiKey;
+
+  if (hasDefaultOverride && baseUrl !== undefined && model !== undefined) {
+    const { role: _ignoredRole, ...preservedFields } = existingDefault ?? {
+      provider: 'openai_compatible' as const,
+      baseUrl,
+      model,
+    };
     gateway.setDefaultConnection({
-      provider: 'openai_compatible',
+      ...preservedFields,
+      provider: existingDefault?.provider ?? 'openai_compatible',
       baseUrl,
       model,
       ...(apiKey !== undefined ? { apiKey } : {}),
@@ -562,9 +609,17 @@ export async function buildCliModelGateway(
       'chronicle_router',
     ];
     for (const r of trackerRoles) {
+      const existingRole = gateway.getConnectionsSnapshot().connections[r];
+      const { role: _ignoredRole, ...preservedRoleFields } = existingRole ??
+        existingDefault ?? {
+          provider: 'openai_compatible' as const,
+          baseUrl,
+          model: trackerModel,
+        };
       gateway.setRoleConnection(r, {
-        provider: 'openai_compatible',
-        baseUrl,
+        ...preservedRoleFields,
+        provider: existingRole?.provider ?? existingDefault?.provider ?? 'openai_compatible',
+        baseUrl: existingRole?.baseUrl ?? baseUrl,
         model: trackerModel,
         ...(apiKey !== undefined ? { apiKey } : {}),
       });
@@ -572,6 +627,29 @@ export async function buildCliModelGateway(
   }
 
   return ok(gateway);
+}
+
+/**
+ * Snapshot and atomically persist a CLI {@link ModelGateway}'s connections using `connection-store.ts`.
+ */
+export async function saveCliModelGatewayConnections(
+  filePath: string,
+  gateway: ModelGateway,
+  existingDoc?: ConnectionsFileDocument
+): Promise<Result<ConnectionsFileDocument, ValidationError[]>> {
+  let baselineDoc = existingDoc;
+  if (baselineDoc === undefined) {
+    const loaded = await loadConnectionsFile(filePath);
+    if (loaded.ok) {
+      baselineDoc = loaded.value;
+    }
+  }
+  const nextDoc = snapshotGatewayToConnectionsDoc(gateway, baselineDoc);
+  const saveRes = await saveConnectionsFile(filePath, nextDoc);
+  if (!saveRes.ok) {
+    return saveRes;
+  }
+  return ok(nextDoc);
 }
 
 /**
@@ -601,6 +679,36 @@ export async function runMainCli(
     return runSimCli(cmd.simArgs, io);
   }
 
+  let dataStore: RefereeDataStore | undefined;
+  if (cmd.dataDir !== undefined) {
+    dataStore = new RefereeDataStore(cmd.dataDir);
+    const initRes = await dataStore.init();
+    if (!initRes.ok) {
+      io.stderr(formatValidationErrors(initRes.error));
+      return 1;
+    }
+  }
+
+  let importedPreset: SillyTavernPresetImportResult | undefined;
+  if (cmd.presetPath !== undefined) {
+    const presetRes = await loadCliPresetFile(cmd.presetPath);
+    if (!presetRes.ok) {
+      io.stderr(formatValidationErrors(presetRes.error));
+      return 1;
+    }
+    importedPreset = presetRes.value;
+  }
+
+  let loadedPersona: UserPersonaPreset | undefined;
+  if (cmd.personaPath !== undefined) {
+    const personaRes = await loadCliPersonaFile(cmd.personaPath);
+    if (!personaRes.ok) {
+      io.stderr(formatValidationErrors(personaRes.error));
+      return 1;
+    }
+    loadedPersona = personaRes.value;
+  }
+
   const gatewayRes = await buildCliModelGateway(cmd);
   if (!gatewayRes.ok) {
     io.stderr(formatValidationErrors(gatewayRes.error));
@@ -614,8 +722,52 @@ export async function runMainCli(
       port: cmd.port,
       gateway,
       ...(cmd.dataDir !== undefined ? { dataDir: cmd.dataDir } : {}),
+      ...(cmd.connectionsPath !== undefined ? { connectionsPath: cmd.connectionsPath } : {}),
     });
     const info = await daemon.start();
+    const registry = daemon.getRegistry();
+
+    if (importedPreset !== undefined) {
+      const presetId = importedPreset.presetName
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-+|-+$/g, '') || 'cli-preset';
+      registry.presets.set(presetId, {
+        id: presetId,
+        name: importedPreset.presetName,
+        sourceFormat: importedPreset.format,
+        layer: importedPreset.layer,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    if (loadedPersona !== undefined) {
+      registry.personas.set(loadedPersona.id, loadedPersona);
+    }
+    if (cmd.resumePath !== undefined) {
+      const savePeek = await loadSessionSave(cmd.resumePath);
+      if (!savePeek.ok) {
+        io.stderr(formatValidationErrors(savePeek.error));
+        await daemon.stop();
+        return 1;
+      }
+      const manifestPack =
+        registry.systemPacks.get(savePeek.value.manifest.systemPackId) ??
+        getStockSystemPack(savePeek.value.manifest.systemPackId);
+      const resumed = await SessionRuntime.fromSaveDirectory(cmd.resumePath, {
+        sessionId: savePeek.value.manifest.sessionId || 'cli-session-1',
+        gateway,
+        ...(manifestPack !== undefined ? { systemPack: manifestPack } : {}),
+        ...(importedPreset !== undefined ? { overrideUserLayer: importedPreset.layer } : {}),
+        ...(loadedPersona !== undefined ? { overrideUserPersona: loadedPersona } : {}),
+      });
+      if (!resumed.ok) {
+        io.stderr(formatValidationErrors(resumed.error));
+        await daemon.stop();
+        return 1;
+      }
+      registry.registerSession(resumed.value);
+    }
+
     io.stdout(`RefereeDaemon listening at ${info.url}`);
 
     await new Promise<void>((resolve) => {
@@ -630,24 +782,52 @@ export async function runMainCli(
     return 0;
   }
 
+  let effectivePackId = cmd.packId;
+  let resumeSessionId = 'cli-session-1';
+  if (cmd.resumePath !== undefined) {
+    const savePeek = await loadSessionSave(cmd.resumePath);
+    if (!savePeek.ok) {
+      io.stderr(formatValidationErrors(savePeek.error));
+      return 1;
+    }
+    resumeSessionId = savePeek.value.manifest.sessionId || 'cli-session-1';
+    if (effectivePackId === undefined && !cmd.freeform) {
+      effectivePackId = savePeek.value.manifest.systemPackId;
+    }
+  }
+
+  let customPackFromStore: SystemPack | undefined;
+  if (effectivePackId !== undefined && getStockSystemPack(effectivePackId) === undefined && dataStore !== undefined) {
+    const storePackRes = await dataStore.getSystemPack(effectivePackId);
+    if (storePackRes.ok) {
+      customPackFromStore = storePackRes.value;
+    }
+  }
+
   const inputsRes = await loadPlaySessionInputs({
     freeform: cmd.freeform,
     ...(cmd.cardPath !== undefined ? { cardPath: cmd.cardPath } : {}),
     ...(cmd.cartridgePath !== undefined ? { cartridgePath: cmd.cartridgePath } : {}),
-    ...(cmd.packId !== undefined ? { packId: cmd.packId } : {}),
+    ...(customPackFromStore === undefined && effectivePackId !== undefined
+      ? { packId: effectivePackId }
+      : {}),
   });
   if (!inputsRes.ok) {
     io.stderr(formatValidationErrors(inputsRes.error));
     return 1;
   }
 
-  const { cartridge, systemPack } = inputsRes.value;
+  const cartridge = inputsRes.value.cartridge;
+  const systemPack = customPackFromStore ?? inputsRes.value.systemPack;
+  const userControlRoomLayer: ControlRoomLayer | undefined = importedPreset?.layer;
 
   if (cmd.daemon) {
     const daemon = new RefereeDaemon({
       host: '127.0.0.1',
       port: cmd.port,
       gateway,
+      ...(cmd.dataDir !== undefined ? { dataDir: cmd.dataDir } : {}),
+      ...(cmd.connectionsPath !== undefined ? { connectionsPath: cmd.connectionsPath } : {}),
     });
     const info = await daemon.start();
     const registry = daemon.getRegistry();
@@ -658,16 +838,45 @@ export async function runMainCli(
       cartridgeId = cartridge.card.id;
     }
 
+    let resumedDaemonSessionId: string | undefined;
+    if (cmd.resumePath !== undefined) {
+      const resumedRes = await SessionRuntime.fromSaveDirectory(cmd.resumePath, {
+        sessionId: resumeSessionId,
+        gateway,
+        cartridge,
+        ...(systemPack !== undefined ? { systemPack } : {}),
+        ...(cmd.seed !== undefined ? { seed: cmd.seed } : {}),
+        ...(userControlRoomLayer !== undefined ? { overrideUserLayer: userControlRoomLayer } : {}),
+        ...(loadedPersona !== undefined ? { overrideUserPersona: loadedPersona } : {}),
+      });
+      if (!resumedRes.ok) {
+        io.stderr(formatValidationErrors(resumedRes.error));
+        await daemon.stop();
+        return 1;
+      }
+      registry.registerSession(resumedRes.value, {
+        cartridge,
+        ...(systemPack !== undefined ? { basePack: systemPack } : {}),
+      });
+      resumedDaemonSessionId = resumedRes.value.sessionId;
+    }
+
     const controller = new TuiController({
       daemonUrl: info.url,
+      ...(resumedDaemonSessionId !== undefined ? { sessionId: resumedDaemonSessionId } : {}),
       cartridge,
       ...(systemPack !== undefined ? { basePack: systemPack } : {}),
+      ...(dataStore !== undefined ? { dataStore } : {}),
+      ...(cmd.connectionsPath !== undefined ? { connectionsPath: cmd.connectionsPath } : {}),
     });
     try {
       await controller.connectDaemonSession({
         ...(systemPack !== undefined ? { systemPackId: systemPack.id } : {}),
         ...(cartridgeId !== undefined ? { cartridgeId } : {}),
         ...(cmd.seed !== undefined ? { seed: cmd.seed } : {}),
+        ...(cmd.saveDirPath !== undefined ? { saveDir: cmd.saveDirPath } : {}),
+        ...(userControlRoomLayer !== undefined ? { userControlRoomLayer } : {}),
+        ...(loadedPersona !== undefined ? { persona: loadedPersona } : {}),
       });
       await runInteractiveTuiLoop(controller, io);
     } finally {
@@ -676,19 +885,42 @@ export async function runMainCli(
     return 0;
   }
 
-  const runtime = new SessionRuntime({
-    sessionId: 'cli-session-1',
-    gateway,
-    cartridge,
-    ...(systemPack !== undefined ? { systemPack } : {}),
-    ...(cmd.seed !== undefined ? { seed: cmd.seed } : {}),
-  });
+  let runtime: SessionRuntime;
+  if (cmd.resumePath !== undefined) {
+    const resumedRes = await SessionRuntime.fromSaveDirectory(cmd.resumePath, {
+      sessionId: resumeSessionId,
+      gateway,
+      cartridge,
+      ...(systemPack !== undefined ? { systemPack } : {}),
+      ...(cmd.seed !== undefined ? { seed: cmd.seed } : {}),
+      ...(userControlRoomLayer !== undefined ? { overrideUserLayer: userControlRoomLayer } : {}),
+      ...(loadedPersona !== undefined ? { overrideUserPersona: loadedPersona } : {}),
+    });
+    if (!resumedRes.ok) {
+      io.stderr(formatValidationErrors(resumedRes.error));
+      return 1;
+    }
+    runtime = resumedRes.value;
+  } else {
+    runtime = new SessionRuntime({
+      sessionId: 'cli-session-1',
+      gateway,
+      cartridge,
+      ...(systemPack !== undefined ? { systemPack } : {}),
+      ...(cmd.seed !== undefined ? { seed: cmd.seed } : {}),
+      ...(cmd.saveDirPath !== undefined ? { saveDir: cmd.saveDirPath } : {}),
+      ...(userControlRoomLayer !== undefined ? { userControlRoomLayer } : {}),
+      ...(loadedPersona !== undefined ? { userPersona: loadedPersona } : {}),
+    });
+  }
 
   const controller = new TuiController({
     runtime,
     gateway,
     cartridge,
     ...(systemPack !== undefined ? { basePack: systemPack } : {}),
+    ...(dataStore !== undefined ? { dataStore } : {}),
+    ...(cmd.connectionsPath !== undefined ? { connectionsPath: cmd.connectionsPath } : {}),
   });
   await runInteractiveTuiLoop(controller, io);
   return 0;

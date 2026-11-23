@@ -1,4 +1,4 @@
-import type { ChronicleEntry } from './world-state.js';
+import type { CharacterEntity, ChronicleEntry } from './world-state.js';
 
 /**
  * Valid origins of a state mutation batch in Referee.
@@ -65,7 +65,13 @@ export type PatchOperation =
     }
   | { op: 'clock_hold'; reason: string }
   | { op: 'clock_release' }
-  | { op: 'route_lock'; routeId: string; lockFlag: string };
+  | { op: 'route_lock'; routeId: string; lockFlag: string }
+  | {
+      op: 'character_upsert';
+      characterId: string;
+      character: Partial<Omit<CharacterEntity, 'id'>> & { name: string };
+      mergeIfExists?: boolean;
+    };
 
 /**
  * Ordered batch of {@link PatchOperation} items applied atomically as a single event.

@@ -1,0 +1,28 @@
+{
+  "characters": {
+    "maya": {
+      "id": "maya",
+      "name": "Maya",
+      "status": "active",
+      "presentInScene": true,
+      "locationId": null,
+      "formId": null,
+      "formGroup": null,
+      "sections": {
+        "sec_equipment": "Canvas barista apron over a rolled-sleeve chambray shirt, flour-dusted at the cuffs",
+        "sec_personality": "Warm, observant, and quick with an easy laugh; attentive to regulars' moods and daily routines",
+        "sec_background": "Head barista at the Sunlit Corner Cafe, known for steady hands for latte art, seasonal chalkboard drinks, and welcoming morning conversation."
+      },
+      "customFields": {},
+      "abilities": [],
+      "goals": [
+        "Keep the morning coffee rush warm and welcoming",
+        "Craft seasonal espresso drinks and fresh pastries"
+      ],
+      "agenda": "Greet guests at the counter and share warm everyday conversation",
+      "allegiance": "sunlit_corner_cafe",
+      "mood": "warm",
+      "traits": ["warm", "observant", "hospitable"]
+    }
+  }
+}

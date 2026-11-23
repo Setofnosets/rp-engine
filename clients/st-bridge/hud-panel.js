@@ -288,11 +288,131 @@ function renderCombatWidget(combatState, combatMode) {
     return '';
   }
   const round = combatState.round ?? 1;
-  const activeId = combatState.activeCombatantId ?? 'none';
+  const activeId =
+    combatState.initiativeOrder?.[combatState.turnIndex] ?? combatState.activeCombatantId ?? 'none';
   return `<section class="referee-bridge-widget" data-widget="combat-panel">
     <div class="referee-bridge-widget-title">Combat (${escapeHtml(combatMode)})</div>
     <div>Round <strong>${escapeHtml(round)}</strong> · Active: <strong>${escapeHtml(activeId)}</strong></div>
   </section>`;
+}
+
+function buildSettingRosterEntries(state, settingRoster) {
+  if (settingRoster && Array.isArray(settingRoster.characters)) {
+    return settingRoster.characters
+      .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({
+        id: typeof entry.id === 'string' ? entry.id : '',
+        name: typeof entry.name === 'string' && entry.name.length > 0 ? entry.name : String(entry.id ?? ''),
+        isPlayer: entry.isPlayer === true || entry.presence === 'player',
+        status: typeof entry.status === 'string' && entry.status.length > 0 ? entry.status : 'active',
+        presentInScene:
+          entry.presentInScene === true ||
+          entry.presence === 'in_scene' ||
+          entry.presence === 'in_scene_pinned' ||
+          entry.presence === 'player',
+        isPinned: entry.isPinned === true || entry.presence === 'in_scene_pinned',
+        locationName:
+          typeof entry.locationName === 'string' && entry.locationName.length > 0
+            ? entry.locationName
+            : typeof entry.locationId === 'string' && entry.locationId.length > 0
+              ? entry.locationId
+              : null,
+        mood: typeof entry.mood === 'string' ? entry.mood : '',
+        allegiance:
+          typeof entry.allegianceName === 'string' && entry.allegianceName.length > 0
+            ? entry.allegianceName
+            : typeof entry.allegiance === 'string'
+              ? entry.allegiance
+              : '',
+      }));
+  }
+
+  const chars = state?.entities?.characters;
+  const locations = state?.entities?.locations ?? {};
+  const presentSet = new Set(
+    Array.isArray(state?.scene?.presentCharacterIds) ? state.scene.presentCharacterIds : []
+  );
+  const pinnedSet = new Set(
+    Array.isArray(state?.scene?.pinnedCharacterIds) ? state.scene.pinnedCharacterIds : []
+  );
+
+  const entries = [];
+  for (const [id, char] of safeEntries(chars)) {
+    if (!char || typeof char !== 'object') continue;
+    const status = typeof char.status === 'string' && char.status.length > 0 ? char.status : 'active';
+    const isPinned = pinnedSet.has(id);
+    const presentInScene =
+      status === 'active' && (char.presentInScene === true || presentSet.has(id) || isPinned);
+    const locationId = typeof char.locationId === 'string' && char.locationId.length > 0 ? char.locationId : null;
+    const locEntity = locationId ? getSafeOwn(locations, locationId) : null;
+    const locationName =
+      locEntity && typeof locEntity === 'object' && typeof locEntity.name === 'string' && locEntity.name.length > 0
+        ? locEntity.name
+        : locationId;
+    entries.push({
+      id,
+      name: typeof char.name === 'string' && char.name.length > 0 ? char.name : id,
+      isPlayer: false,
+      status,
+      presentInScene,
+      isPinned,
+      locationName,
+      mood: typeof char.mood === 'string' ? char.mood : '',
+      allegiance: typeof char.allegiance === 'string' ? char.allegiance : '',
+    });
+  }
+  return entries;
+}
+
+function renderSettingRosterWidget(state, settingRoster) {
+  const entries = buildSettingRosterEntries(state, settingRoster);
+  if (entries.length === 0 && !settingRoster) {
+    return '';
+  }
+
+  const presentEntries = entries.filter((e) => e.status === 'active' && e.presentInScene);
+  const offscreenEntries = entries.filter((e) => e.status !== 'active' || !e.presentInScene);
+
+  const renderPresentItem = (entry) => {
+    const badges = ['<span class="referee-bridge-badge">[HERE]</span>'];
+    if (entry.isPinned) {
+      badges.push('<span class="referee-bridge-badge referee-bridge-tag--pinned">[PINNED]</span>');
+    }
+    const metaParts = [entry.mood, entry.allegiance].filter((v) => typeof v === 'string' && v.length > 0);
+    const metaSuffix = metaParts.length > 0 ? ` <small>(${escapeHtml(metaParts.join(' · '))})</small>` : '';
+    return `<div class="referee-bridge-roster-item" data-roster-presence="present" data-character-id="${escapeHtml(
+      entry.id
+    )}">${badges.join(' ')} <strong>${escapeHtml(entry.name)}</strong>${metaSuffix}</div>`;
+  };
+
+  const renderOffscreenItem = (entry) => {
+    const locBadge = entry.locationName
+      ? `<span class="referee-bridge-tag">@ ${escapeHtml(entry.locationName)}</span>`
+      : '<span class="referee-bridge-tag">@ off-screen</span>';
+    const statusBadge =
+      entry.status !== 'active'
+        ? ` <span class="referee-bridge-badge">[${escapeHtml(entry.status)}]</span>`
+        : '';
+    return `<div class="referee-bridge-roster-item" data-roster-presence="offscreen" data-character-id="${escapeHtml(
+      entry.id
+    )}">${locBadge}${statusBadge} <span>${escapeHtml(entry.name)}</span></div>`;
+  };
+
+  const presentHtml =
+    presentEntries.length > 0
+      ? `<div data-roster-group="present">${presentEntries.map(renderPresentItem).join('')}</div>`
+      : '';
+  const offscreenHtml =
+    offscreenEntries.length > 0
+      ? `<div data-roster-group="offscreen" style="margin-top:4px">${offscreenEntries
+          .map(renderOffscreenItem)
+          .join('')}</div>`
+      : '';
+
+  return `<details class="referee-bridge-widget" data-widget="setting-roster" open>
+    <summary class="referee-bridge-widget-title">Setting Roster (${presentEntries.length} here · ${offscreenEntries.length} off-screen)</summary>
+    ${presentHtml || offscreenHtml ? `${presentHtml}${offscreenHtml}` : '<div><em>No characters in setting</em></div>'}
+  </details>`;
 }
 
 function renderActiveGateBeatWidget(beatLedger, beatsEnabled) {
@@ -389,9 +509,10 @@ function renderPendingConfirmationsToast(pendingConfirmations) {
  * Completely omits RPG/combat/faction panels when disabled (e.g., `stock-slice-of-life` or `stock-freeform`).
  *
  * @param {any} sessionState
+ * @param {{ settingRoster?: any }} [options]
  * @returns {string}
  */
-export function renderHudStateHtml(sessionState) {
+export function renderHudStateHtml(sessionState, options = {}) {
   if (!sessionState || typeof sessionState !== 'object') {
     return '<div class="referee-bridge-root" data-referee-hud="empty"><em>No active Referee session</em></div>';
   }
@@ -418,6 +539,10 @@ export function renderHudStateHtml(sessionState) {
 
   const sceneHtml = renderSceneCastWidget(state);
   if (sceneHtml) widgets.push(sceneHtml);
+
+  const settingRoster = options?.settingRoster ?? sessionState.settingRoster;
+  const rosterHtml = renderSettingRosterWidget(state, settingRoster);
+  if (rosterHtml) widgets.push(rosterHtml);
 
   for (const mod of modules) {
     if (!mod || typeof mod !== 'object') continue;
@@ -449,18 +574,31 @@ export function renderHudStateHtml(sessionState) {
 }
 
 /**
+ * Alias for `renderHudStateHtml` supporting `{ settingRoster }` options.
+ *
+ * @param {any} sessionState
+ * @param {{ settingRoster?: any }} [options]
+ * @returns {string}
+ */
+export function renderHudPanel(sessionState, options = {}) {
+  return renderHudStateHtml(sessionState, options);
+}
+
+/**
  * Optional DOM binder for mounting the HUD panel into a container element.
  *
  * @param {HTMLElement} container
  * @param {any} sessionState
- * @param {{ onAcceptAll?: () => void; onRejectAll?: () => void; onAcceptIndex?: (idx: number) => void }} [handlers]
+ * @param {{ onAcceptAll?: () => void; onRejectAll?: () => void; onAcceptIndex?: (idx: number) => void; settingRoster?: any }} [handlers]
  * @returns {() => void}
  */
 export function bindHudPanelDom(container, sessionState, handlers = {}) {
   if (!container || typeof container !== 'object') {
     return () => {};
   }
-  container.innerHTML = renderHudStateHtml(sessionState);
+  container.innerHTML = renderHudStateHtml(sessionState, {
+    settingRoster: handlers?.settingRoster,
+  });
 
   const onClick = (event) => {
     const target = event?.target?.closest?.('[data-action]');

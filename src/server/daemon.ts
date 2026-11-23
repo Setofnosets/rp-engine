@@ -8,6 +8,7 @@ export interface RefereeDaemonOptions {
   readonly port?: number;
   readonly gateway?: ModelGateway;
   readonly dataDir?: string;
+  readonly connectionsPath?: string;
 }
 
 export interface DaemonAddressInfo {
@@ -34,6 +35,7 @@ export class RefereeDaemon {
     this.registry = new DaemonRegistry({
       ...(options.gateway !== undefined ? { gateway: options.gateway } : {}),
       ...(options.dataDir !== undefined ? { dataDir: options.dataDir } : {}),
+      ...(options.connectionsPath !== undefined ? { connectionsPath: options.connectionsPath } : {}),
     });
 
     const handler = createDaemonRequestHandler(this.registry);
@@ -60,37 +62,46 @@ export class RefereeDaemon {
       return this.startPromise;
     }
 
-    this.startPromise = new Promise<DaemonAddressInfo>((resolve, reject) => {
-      const onError = (error: Error): void => {
-        this.server.off('listening', onListening);
+    this.startPromise = (async (): Promise<DaemonAddressInfo> => {
+      try {
+        await this.registry.init();
+      } catch (error) {
         this.startPromise = null;
-        reject(error);
-      };
+        throw error;
+      }
 
-      const onListening = (): void => {
-        this.server.off('error', onError);
-        const rawAddr = this.server.address();
-        if (rawAddr === null || typeof rawAddr === 'string') {
+      return await new Promise<DaemonAddressInfo>((resolve, reject) => {
+        const onError = (error: Error): void => {
+          this.server.off('listening', onListening);
           this.startPromise = null;
-          reject(new Error('HTTP server did not return a TCP AddressInfo'));
-          return;
-        }
-        const addrInfo = rawAddr as AddressInfo;
-        const hostForUrl = this.host.includes(':') ? `[${this.host}]` : this.host;
-        const info: DaemonAddressInfo = {
-          host: this.host,
-          port: addrInfo.port,
-          url: `http://${hostForUrl}:${addrInfo.port}`,
+          reject(error);
         };
-        this.activeInfo = info;
-        this.startPromise = null;
-        resolve(info);
-      };
 
-      this.server.once('error', onError);
-      this.server.once('listening', onListening);
-      this.server.listen(this.requestedPort, this.host);
-    });
+        const onListening = (): void => {
+          this.server.off('error', onError);
+          const rawAddr = this.server.address();
+          if (rawAddr === null || typeof rawAddr === 'string') {
+            this.startPromise = null;
+            reject(new Error('HTTP server did not return a TCP AddressInfo'));
+            return;
+          }
+          const addrInfo = rawAddr as AddressInfo;
+          const hostForUrl = this.host.includes(':') ? `[${this.host}]` : this.host;
+          const info: DaemonAddressInfo = {
+            host: this.host,
+            port: addrInfo.port,
+            url: `http://${hostForUrl}:${addrInfo.port}`,
+          };
+          this.activeInfo = info;
+          this.startPromise = null;
+          resolve(info);
+        };
+
+        this.server.once('error', onError);
+        this.server.once('listening', onListening);
+        this.server.listen(this.requestedPort, this.host);
+      });
+    })();
 
     return this.startPromise;
   }
