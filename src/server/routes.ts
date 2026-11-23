@@ -1822,6 +1822,72 @@ export function createDaemonRequestHandler(
         return;
       }
 
+      // GET /api/connections
+      if (method === 'GET' && pathname === '/api/connections') {
+        const snap = registry.gateway.getConnectionsSnapshot();
+        sendJson(res, 200, { ok: true, ...snap });
+        return;
+      }
+
+      // PUT /api/connections
+      if (method === 'PUT' && pathname === '/api/connections') {
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          sendErrors(res, parsed.status, parsed.errors);
+          return;
+        }
+        if (!isPlainObject(parsed.value)) {
+          sendErrors(res, 400, [
+            validationError('body', 'INVALID_TYPE', 'Request body must be a JSON object'),
+          ]);
+          return;
+        }
+        const rawDefault = getOwn(parsed.value, 'defaultConnection');
+        if (isPlainObject(rawDefault)) {
+          const baseUrl = getOwn(rawDefault, 'baseUrl');
+          const model = getOwn(rawDefault, 'model');
+          const apiKey = getOwn(rawDefault, 'apiKey');
+          const provider = getOwn(rawDefault, 'provider');
+          if (typeof baseUrl === 'string' && typeof model === 'string') {
+            registry.gateway.setDefaultConnection({
+              provider:
+                provider === 'ollama' || provider === 'anthropic' || provider === 'mock'
+                  ? provider
+                  : 'openai_compatible',
+              baseUrl,
+              model,
+              ...(typeof apiKey === 'string' ? { apiKey } : {}),
+            });
+          }
+        }
+        const rawConns = getOwn(parsed.value, 'connections');
+        if (isPlainObject(rawConns)) {
+          for (const roleKey of Object.keys(rawConns)) {
+            if (!isSafeKey(roleKey)) continue;
+            const cfg = getOwn(rawConns, roleKey);
+            if (isPlainObject(cfg)) {
+              const baseUrl = getOwn(cfg, 'baseUrl');
+              const model = getOwn(cfg, 'model');
+              const apiKey = getOwn(cfg, 'apiKey');
+              const provider = getOwn(cfg, 'provider');
+              if (typeof baseUrl === 'string' && typeof model === 'string') {
+                registry.gateway.setRoleConnection(roleKey as AgentRole, {
+                  provider:
+                    provider === 'ollama' || provider === 'anthropic' || provider === 'mock'
+                      ? provider
+                      : 'openai_compatible',
+                  baseUrl,
+                  model,
+                  ...(typeof apiKey === 'string' ? { apiKey } : {}),
+                });
+              }
+            }
+          }
+        }
+        sendJson(res, 200, { ok: true, ...registry.gateway.getConnectionsSnapshot() });
+        return;
+      }
+
       // GET /api/system-packs
       if (method === 'GET' && pathname === '/api/system-packs') {
         const systemPacks = Array.from(registry.systemPacks.values())

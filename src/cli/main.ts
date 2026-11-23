@@ -8,12 +8,21 @@ import { loadCartridgeFromDirectory } from '../cartridge/loader.js';
 import { type ValidationError, formatValidationErrors, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import { ModelGateway } from '../gateway/model-gateway.js';
+import type { AgentRole, RoleConnectionConfig } from '../gateway/types.js';
 import { SessionRuntime } from '../runtime/session-runtime.js';
 import { STOCK_FREEFORM_PACK, getStockSystemPack } from '../schema/stock-system-packs.js';
 import type { SystemPack } from '../schema/tracker-module.js';
 import { RefereeDaemon } from '../server/daemon.js';
 import { TuiController, type TuiViewport } from '../tui/app.js';
 import { runSimCli } from './sim-cli.js';
+
+export interface CliConnectionOptions {
+  readonly baseUrl?: string;
+  readonly model?: string;
+  readonly apiKey?: string;
+  readonly trackerModel?: string;
+  readonly connectionsPath?: string;
+}
 
 export type ParsedMainCliCommand =
   | {
@@ -23,13 +32,13 @@ export type ParsedMainCliCommand =
       readonly command: 'sim';
       readonly simArgs: readonly string[];
     }
-  | {
+  | ({
       readonly command: 'daemon';
       readonly host: string;
       readonly port: number;
       readonly dataDir?: string;
-    }
-  | {
+    } & CliConnectionOptions)
+  | ({
       readonly command: 'play';
       readonly freeform: boolean;
       readonly cardPath?: string;
@@ -38,7 +47,7 @@ export type ParsedMainCliCommand =
       readonly daemon: boolean;
       readonly port: number;
       readonly seed?: string;
-    };
+    } & CliConnectionOptions);
 
 export interface MainCliIo {
   readonly stdout: (text: string) => void;
@@ -84,6 +93,11 @@ export function parseMainCliArgs(
     let host = '127.0.0.1';
     let port = 4120;
     let dataDir: string | undefined;
+    let baseUrl: string | undefined;
+    let model: string | undefined;
+    let apiKey: string | undefined;
+    let trackerModel: string | undefined;
+    let connectionsPath: string | undefined;
     const acc = new ErrorAccumulator('daemon');
 
     for (let i = 1; i < argv.length; i += 1) {
@@ -112,6 +126,46 @@ export function parseMainCliArgs(
           dataDir = val;
           i += 1;
         }
+      } else if (token === '--base-url') {
+        const val = argv[i + 1];
+        if (val === undefined || val.startsWith('--')) {
+          acc.add('--base-url', 'REQUIRED', '--base-url requires an endpoint URL');
+        } else {
+          baseUrl = val;
+          i += 1;
+        }
+      } else if (token === '--model') {
+        const val = argv[i + 1];
+        if (val === undefined || val.startsWith('--')) {
+          acc.add('--model', 'REQUIRED', '--model requires a model identifier');
+        } else {
+          model = val;
+          i += 1;
+        }
+      } else if (token === '--api-key') {
+        const val = argv[i + 1];
+        if (val === undefined || val.startsWith('--')) {
+          acc.add('--api-key', 'REQUIRED', '--api-key requires an API key value');
+        } else {
+          apiKey = val;
+          i += 1;
+        }
+      } else if (token === '--tracker-model') {
+        const val = argv[i + 1];
+        if (val === undefined || val.startsWith('--')) {
+          acc.add('--tracker-model', 'REQUIRED', '--tracker-model requires a model identifier');
+        } else {
+          trackerModel = val;
+          i += 1;
+        }
+      } else if (token === '--connections') {
+        const val = argv[i + 1];
+        if (val === undefined || val.startsWith('--')) {
+          acc.add('--connections', 'REQUIRED', '--connections requires a JSON file path');
+        } else {
+          connectionsPath = val;
+          i += 1;
+        }
       } else {
         acc.add(String(token), 'UNKNOWN_FLAG', `Unknown daemon option "${String(token)}"`);
       }
@@ -125,6 +179,11 @@ export function parseMainCliArgs(
       host,
       port,
       ...(dataDir !== undefined ? { dataDir } : {}),
+      ...(baseUrl !== undefined ? { baseUrl } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(apiKey !== undefined ? { apiKey } : {}),
+      ...(trackerModel !== undefined ? { trackerModel } : {}),
+      ...(connectionsPath !== undefined ? { connectionsPath } : {}),
     });
   }
 
@@ -136,6 +195,11 @@ export function parseMainCliArgs(
   let daemon = false;
   let port = 4120;
   let seed: string | undefined;
+  let baseUrl: string | undefined;
+  let model: string | undefined;
+  let apiKey: string | undefined;
+  let trackerModel: string | undefined;
+  let connectionsPath: string | undefined;
   const acc = new ErrorAccumulator('play');
 
   for (let i = startIdx; i < argv.length; i += 1) {
@@ -187,6 +251,46 @@ export function parseMainCliArgs(
         seed = val;
         i += 1;
       }
+    } else if (token === '--base-url') {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith('--')) {
+        acc.add('--base-url', 'REQUIRED', '--base-url requires an endpoint URL');
+      } else {
+        baseUrl = val;
+        i += 1;
+      }
+    } else if (token === '--model') {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith('--')) {
+        acc.add('--model', 'REQUIRED', '--model requires a model identifier');
+      } else {
+        model = val;
+        i += 1;
+      }
+    } else if (token === '--api-key') {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith('--')) {
+        acc.add('--api-key', 'REQUIRED', '--api-key requires an API key value');
+      } else {
+        apiKey = val;
+        i += 1;
+      }
+    } else if (token === '--tracker-model') {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith('--')) {
+        acc.add('--tracker-model', 'REQUIRED', '--tracker-model requires a model identifier');
+      } else {
+        trackerModel = val;
+        i += 1;
+      }
+    } else if (token === '--connections') {
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith('--')) {
+        acc.add('--connections', 'REQUIRED', '--connections requires a JSON file path');
+      } else {
+        connectionsPath = val;
+        i += 1;
+      }
     } else {
       acc.add(String(token), 'UNKNOWN_FLAG', `Unknown play option "${String(token)}"`);
     }
@@ -209,6 +313,11 @@ export function parseMainCliArgs(
     daemon,
     port,
     ...(seed !== undefined ? { seed } : {}),
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(apiKey !== undefined ? { apiKey } : {}),
+    ...(trackerModel !== undefined ? { trackerModel } : {}),
+    ...(connectionsPath !== undefined ? { connectionsPath } : {}),
   });
 }
 
@@ -217,9 +326,9 @@ export function formatMainHelpText(): string {
     'Referee Engine CLI / Native TUI',
     '',
     'Usage:',
-    '  referee play [--freeform] [--card <path>] [--cartridge <path>] [--pack <id>] [--daemon] [--port <n>] [--seed <seed>]',
+    '  referee play [--freeform] [--card <path>] [--cartridge <path>] [--pack <id>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>] [--daemon] [--port <n>] [--seed <seed>]',
     '  referee sim <validate|run> ...',
-    '  referee daemon [--host <host>] [--port <n>] [--data-dir <path>]',
+    '  referee daemon [--host <host>] [--port <n>] [--data-dir <path>] [--base-url <url>] [--model <id>] [--api-key <key>] [--tracker-model <id>] [--connections <json>]',
   ].join('\n');
 }
 
@@ -334,6 +443,137 @@ async function runInteractiveTuiLoop(
   }
 }
 
+const VALID_AGENT_ROLES: ReadonlySet<AgentRole> = new Set<AgentRole>([
+  'narrator',
+  'intent_parser',
+  'combat_agent',
+  'state_tracker',
+  'storyline_planner',
+  'cast_director',
+  'chronicle_router',
+  'game_system_wizard',
+]);
+
+/**
+ * Construct a {@link ModelGateway} from optional `referee.connections.json`,
+ * environment variables (`REFEREE_BASE_URL` / `OPENAI_BASE_URL`, `REFEREE_MODEL` / `OPENAI_MODEL`,
+ * `REFEREE_API_KEY` / `OPENAI_API_KEY`, `REFEREE_TRACKER_MODEL`), and CLI flags.
+ */
+export async function buildCliModelGateway(
+  options: CliConnectionOptions = {},
+  env: NodeJS.ProcessEnv = process.env
+): Promise<Result<ModelGateway, ValidationError[]>> {
+  const gateway = new ModelGateway();
+
+  // 1. Load JSON file if --connections was given or ./referee.connections.json exists
+  const filePath = options.connectionsPath ?? path.resolve('referee.connections.json');
+  let rawJsonText: string | undefined;
+  try {
+    rawJsonText = await readFile(filePath, 'utf-8');
+  } catch (caught) {
+    if (options.connectionsPath !== undefined) {
+      const msg = caught instanceof Error ? caught.message : 'Unable to read connections file';
+      return err([validationError('--connections', 'READ_FAILED', msg)]);
+    }
+  }
+
+  if (rawJsonText !== undefined) {
+    let parsedJson: unknown;
+    try {
+      parsedJson = JSON.parse(rawJsonText) as unknown;
+    } catch (caught) {
+      const msg = caught instanceof Error ? caught.message : 'Invalid JSON';
+      return err([validationError('--connections', 'INVALID_JSON', msg)]);
+    }
+    if (typeof parsedJson === 'object' && parsedJson !== null && !Array.isArray(parsedJson)) {
+      const root = parsedJson as Record<string, unknown>;
+      const def = root.defaultConnection;
+      if (typeof def === 'object' && def !== null && !Array.isArray(def)) {
+        const d = def as Record<string, unknown>;
+        if (typeof d.baseUrl === 'string' && typeof d.model === 'string') {
+          gateway.setDefaultConnection({
+            provider: 'openai_compatible',
+            baseUrl: d.baseUrl,
+            model: d.model,
+            ...(typeof d.apiKey === 'string' ? { apiKey: d.apiKey } : {}),
+            ...(typeof d.temperature === 'number' ? { temperature: d.temperature } : {}),
+            ...(typeof d.maxTokens === 'number' ? { maxTokens: d.maxTokens } : {}),
+          });
+        }
+      }
+      const conns = root.connections;
+      if (typeof conns === 'object' && conns !== null && !Array.isArray(conns)) {
+        const cMap = conns as Record<string, unknown>;
+        for (const role of VALID_AGENT_ROLES) {
+          const entry = cMap[role];
+          if (typeof entry === 'object' && entry !== null && !Array.isArray(entry)) {
+            const e = entry as Record<string, unknown>;
+            if (typeof e.baseUrl === 'string' && typeof e.model === 'string') {
+              const roleCfg: Omit<RoleConnectionConfig, 'role'> = {
+                provider: 'openai_compatible',
+                baseUrl: e.baseUrl,
+                model: e.model,
+                ...(typeof e.apiKey === 'string' ? { apiKey: e.apiKey } : {}),
+                ...(typeof e.temperature === 'number' ? { temperature: e.temperature } : {}),
+                ...(typeof e.maxTokens === 'number' ? { maxTokens: e.maxTokens } : {}),
+              };
+              gateway.setRoleConnection(role, roleCfg);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Environment variables + CLI flag overrides
+  const existingDefault = gateway.getConnectionsSnapshot().defaultConnection;
+  const baseUrl =
+    options.baseUrl ??
+    env.REFEREE_BASE_URL ??
+    env.OPENAI_BASE_URL ??
+    existingDefault?.baseUrl;
+  const model =
+    options.model ??
+    env.REFEREE_MODEL ??
+    env.OPENAI_MODEL ??
+    existingDefault?.model;
+  const apiKey =
+    options.apiKey ??
+    env.REFEREE_API_KEY ??
+    env.OPENAI_API_KEY ??
+    existingDefault?.apiKey;
+
+  if (baseUrl !== undefined && model !== undefined) {
+    gateway.setDefaultConnection({
+      provider: 'openai_compatible',
+      baseUrl,
+      model,
+      ...(apiKey !== undefined ? { apiKey } : {}),
+    });
+  }
+
+  const trackerModel = options.trackerModel ?? env.REFEREE_TRACKER_MODEL;
+  if (trackerModel !== undefined && baseUrl !== undefined) {
+    const trackerRoles: readonly AgentRole[] = [
+      'state_tracker',
+      'intent_parser',
+      'cast_director',
+      'storyline_planner',
+      'chronicle_router',
+    ];
+    for (const r of trackerRoles) {
+      gateway.setRoleConnection(r, {
+        provider: 'openai_compatible',
+        baseUrl,
+        model: trackerModel,
+        ...(apiKey !== undefined ? { apiKey } : {}),
+      });
+    }
+  }
+
+  return ok(gateway);
+}
+
 /**
  * Execute the Referee CLI command (`play`, `sim`, `daemon`, or `help`).
  */
@@ -361,10 +601,18 @@ export async function runMainCli(
     return runSimCli(cmd.simArgs, io);
   }
 
+  const gatewayRes = await buildCliModelGateway(cmd);
+  if (!gatewayRes.ok) {
+    io.stderr(formatValidationErrors(gatewayRes.error));
+    return 1;
+  }
+  const gateway = gatewayRes.value;
+
   if (cmd.command === 'daemon') {
     const daemon = new RefereeDaemon({
       host: cmd.host,
       port: cmd.port,
+      gateway,
       ...(cmd.dataDir !== undefined ? { dataDir: cmd.dataDir } : {}),
     });
     const info = await daemon.start();
@@ -394,7 +642,6 @@ export async function runMainCli(
   }
 
   const { cartridge, systemPack } = inputsRes.value;
-  const gateway = new ModelGateway();
 
   if (cmd.daemon) {
     const daemon = new RefereeDaemon({

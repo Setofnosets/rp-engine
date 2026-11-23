@@ -493,7 +493,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
  */
 export class ModelGateway {
   private readonly connections: Map<AgentRole, RoleConnectionConfig>;
-  private readonly defaultConnection: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined;
+  private defaultConnection: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined;
   private readonly providers: Map<ProviderKind, ModelProvider>;
   private readonly maxRetries: number;
   private readonly baseRetryDelayMs: number;
@@ -539,6 +539,41 @@ export class ModelGateway {
     this.maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.baseRetryDelayMs = Math.max(0, options.baseRetryDelayMs ?? 50);
     this.defaultMaxRepairAttempts = Math.max(0, options.defaultMaxRepairAttempts ?? 0);
+  }
+
+  /**
+   * Update the fallback default connection at runtime.
+   */
+  setDefaultConnection(
+    config: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined
+  ): void {
+    this.defaultConnection = config !== undefined ? { ...config } : undefined;
+  }
+
+  /**
+   * Set or update the connection profile for a specific {@link AgentRole} at runtime.
+   */
+  setRoleConnection(role: AgentRole, config: Omit<RoleConnectionConfig, 'role'>): void {
+    this.connections.set(role, { ...config, role });
+  }
+
+  /**
+   * Return a snapshot of the configured default and per-role connections.
+   */
+  getConnectionsSnapshot(): {
+    readonly defaultConnection?: Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole };
+    readonly connections: Partial<Record<AgentRole, RoleConnectionConfig>>;
+  } {
+    const connections: Partial<Record<AgentRole, RoleConnectionConfig>> = {};
+    for (const [role, cfg] of this.connections.entries()) {
+      connections[role] = { ...cfg };
+    }
+    return {
+      ...(this.defaultConnection !== undefined
+        ? { defaultConnection: { ...this.defaultConnection } }
+        : {}),
+      connections,
+    };
   }
 
   /**

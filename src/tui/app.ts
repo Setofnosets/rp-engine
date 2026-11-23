@@ -9,6 +9,7 @@ import {
 import { type ControlRoomDiffReport, computeControlRoomDiffReport } from '../config/prompt-diff.js';
 import { formatValidationErrors } from '../core/errors.js';
 import type { ModelGateway } from '../gateway/model-gateway.js';
+import type { AgentRole } from '../gateway/types.js';
 import type { DirectorSteeringInput } from '../runtime/director-steering.js';
 import type { SessionRuntimeEvent } from '../runtime/event-bus.js';
 import type { SessionRuntime } from '../runtime/session-runtime.js';
@@ -171,6 +172,9 @@ function padOrTrimLines(lines: readonly string[], targetCount: number, width: nu
 function formatHelpLines(): string[] {
   return [
     'Available Slash Commands:',
+    '  /connect <url> <model> [key]       Set default LLM endpoint & model live',
+    '  /connect-role <role> <url> <model> Set role-specific LLM endpoint & model',
+    '  /connections                       Show configured LLM connections',
     '  /pack <id>            Switch active System Pack live',
     '  /toggle <module|cap>  Toggle a GameSystemModule or capability live',
     '  /wizard <desc>        Run GameSystemWizard and enable generated module',
@@ -199,6 +203,7 @@ function formatHelpLines(): string[] {
  */
 export class TuiController {
   private readonly runtime: SessionRuntime | null;
+  private readonly gateway: ModelGateway | null;
   private readonly wizard: GameSystemWizard | null;
   private readonly daemonUrl: string | null;
   private sessionId: string | null;
@@ -221,6 +226,7 @@ export class TuiController {
     }
 
     this.runtime = options.runtime ?? null;
+    this.gateway = options.gateway ?? null;
     this.daemonUrl = options.daemonUrl ? options.daemonUrl.replace(/\/+$/, '') : null;
     this.sessionId = options.sessionId ?? options.runtime?.sessionId ?? null;
     this.cartridge = options.cartridge ?? null;
@@ -471,10 +477,108 @@ export class TuiController {
       case '/reject':
         return this.handleConfirmCommand('reject_all');
 
+      case '/connect':
+        return this.handleConnectCommand(arg);
+
+      case '/connect-role':
+        return this.handleConnectRoleCommand(arg);
+
+      case '/connections':
+        return this.handleListConnectionsCommand();
+
       default:
         this.lastStatusMessage = `Unknown command "${command}". Type /help for commands.`;
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
     }
+  }
+
+  private async handleConnectCommand(arg: string): Promise<TuiHandleInputResult> {
+    const tokens = arg.split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.length < 2) {
+      this.lastStatusMessage = 'Usage: /connect <baseUrl> <model> [apiKey]';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const baseUrl = tokens[0] as string;
+    const model = tokens[1] as string;
+    const apiKey = tokens[2];
+    const conn = {
+      provider: 'openai_compatible' as const,
+      baseUrl,
+      model,
+      ...(apiKey !== undefined ? { apiKey } : {}),
+    };
+
+    if (this.daemonUrl !== null) {
+      await this.daemonFetch('/api/connections', 'PUT', { defaultConnection: conn });
+    } else if (this.gateway !== null) {
+      this.gateway.setDefaultConnection(conn);
+    } else {
+      this.lastStatusMessage = 'No ModelGateway bound to TUI controller.';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+
+    this.lastStatusMessage = `Configured default connection: ${baseUrl} (model: ${model})`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private async handleConnectRoleCommand(arg: string): Promise<TuiHandleInputResult> {
+    const tokens = arg.split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.length < 3) {
+      this.lastStatusMessage = 'Usage: /connect-role <role> <baseUrl> <model> [apiKey]';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const role = tokens[0] as AgentRole;
+    const baseUrl = tokens[1] as string;
+    const model = tokens[2] as string;
+    const apiKey = tokens[3];
+    const conn = {
+      role,
+      provider: 'openai_compatible' as const,
+      baseUrl,
+      model,
+      ...(apiKey !== undefined ? { apiKey } : {}),
+    };
+
+    if (this.daemonUrl !== null) {
+      await this.daemonFetch('/api/connections', 'PUT', {
+        connections: { [role]: conn },
+      });
+    } else if (this.gateway !== null) {
+      this.gateway.setRoleConnection(role, conn);
+    } else {
+      this.lastStatusMessage = 'No ModelGateway bound to TUI controller.';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+
+    this.lastStatusMessage = `Configured role "${role}" connection: ${baseUrl} (model: ${model})`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private async handleListConnectionsCommand(): Promise<TuiHandleInputResult> {
+    let snap: {
+      defaultConnection?: { baseUrl: string; model: string };
+      connections: Record<string, { baseUrl: string; model: string } | undefined>;
+    };
+    if (this.daemonUrl !== null) {
+      snap = await this.daemonFetch('/api/connections', 'GET');
+    } else if (this.gateway !== null) {
+      snap = this.gateway.getConnectionsSnapshot();
+    } else {
+      return { outputLines: ['No ModelGateway bound.'], shouldExit: false };
+    }
+
+    const lines: string[] = ['Configured LLM Connections:'];
+    if (snap.defaultConnection !== undefined) {
+      lines.push(`  default: ${snap.defaultConnection.baseUrl} (${snap.defaultConnection.model})`);
+    } else {
+      lines.push('  default: (not configured)');
+    }
+    for (const [role, cfg] of Object.entries(snap.connections)) {
+      if (cfg !== undefined) {
+        lines.push(`  ${role}: ${cfg.baseUrl} (${cfg.model})`);
+      }
+    }
+    return { outputLines: lines, shouldExit: false };
   }
 
   /**
@@ -1068,7 +1172,7 @@ export class TuiController {
 
   private async daemonFetch<T>(
     endpointPath: string,
-    method: 'GET' | 'POST' | 'PATCH',
+    method: 'GET' | 'POST' | 'PATCH' | 'PUT',
     body?: unknown
   ): Promise<T> {
     if (this.daemonUrl === null) {
