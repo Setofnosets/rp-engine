@@ -446,12 +446,20 @@ async function runInteractiveTuiLoop(
     output: process.stdout,
   });
 
+  const isTty = Boolean(process.stdout.isTTY);
+
   const draw = (): void => {
     const viewport = getTerminalViewport();
-    const frame = controller.renderScreen(viewport);
-    if (process.stdout.isTTY) {
+    if (isTty) {
+      // Reserve 1 terminal row for readline's `> ` prompt so the top header stays visible.
+      const ttyViewport: TuiViewport = {
+        width: viewport.width,
+        height: Math.max(8, viewport.height - 1),
+      };
+      const frame = controller.renderScreen(ttyViewport, { hidePromptLine: true });
       process.stdout.write(`\x1b[2J\x1b[H${frame}\n`);
     } else {
+      const frame = controller.renderScreen(viewport);
       io.stdout(frame);
     }
   };
@@ -465,9 +473,25 @@ async function runInteractiveTuiLoop(
       } catch {
         break;
       }
-      const res = await controller.handleInput(line);
-      for (const outLine of res.outputLines) {
-        io.stdout(outLine);
+
+      let res: { readonly outputLines: readonly string[]; readonly shouldExit: boolean };
+      try {
+        res = await controller.handleInput(line);
+      } catch (caught) {
+        const msg = caught instanceof Error ? caught.message : String(caught);
+        if (isTty) {
+          controller.showErrorMessage(msg);
+          draw();
+        } else {
+          io.stderr(`Error: ${msg}`);
+        }
+        continue;
+      }
+
+      if (!isTty || res.shouldExit) {
+        for (const outLine of res.outputLines) {
+          io.stdout(outLine);
+        }
       }
       if (res.shouldExit) {
         break;

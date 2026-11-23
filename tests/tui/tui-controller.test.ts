@@ -1287,4 +1287,88 @@ describe('PR-7.13: Native CLI & TUI Completion', () => {
       expect(resumed.value.getConfig().generation?.temperature).toBe(0.55);
     }
   });
+
+  it('renders /help, /characters, /inspect, /connections, /sampling, and errors in paginated output view within narrow Termux bounds', async () => {
+    const gateway = createMockModelGateway({
+      narrator: [{ kind: 'text', text: 'You step back into the rain.' }],
+      state_tracker: [{ kind: 'json', value: {} }],
+    });
+    gateway.setDefaultConnection({
+      provider: 'mock',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      model: 'local-model',
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'tui-output-view-test',
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway,
+      seed: 'tui-output-seed',
+    });
+    runtime.upsertCharacter('hana', {
+      name: 'Hana',
+      presentInScene: true,
+      mood: 'cheerful',
+      sections: { sec_personality: 'Always greets regulars with fresh roast coffee.' },
+    });
+
+    const controller = new TuiController({ runtime, gateway });
+
+    // /help switches to output mode and renders inside narrow 50x16 Termux screen
+    await controller.handleInput('/help');
+    expect(controller.getViewMode()).toBe('output');
+    const helpPage1 = controller.renderScreen({ width: 50, height: 16 }, { hidePromptLine: true });
+    expect(helpPage1).toContain('HELP | Page 1/');
+    expect(helpPage1).toContain('Available Slash Commands:');
+    expect(helpPage1).not.toContain('> Type action or /command');
+    for (const line of helpPage1.split('\n')) {
+      expect(line.length).toBeLessThanOrEqual(50);
+    }
+    expect(helpPage1.split('\n').length).toBeLessThanOrEqual(16);
+
+    // /next and /prev paginate output cleanly
+    await controller.handleInput('/next');
+    const helpPage2 = controller.renderScreen({ width: 50, height: 16 }, { hidePromptLine: true });
+    expect(helpPage2).toContain('HELP | Page 2/');
+
+    await controller.handleInput('/prev');
+    const backToPage1 = controller.renderScreen({ width: 50, height: 16 }, { hidePromptLine: true });
+    expect(backToPage1).toContain('HELP | Page 1/');
+
+    // /characters & /inspect & /connections & /sampling render directly in renderScreen
+    await controller.handleInput('/characters');
+    expect(controller.getViewMode()).toBe('output');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain('Hana');
+
+    await controller.handleInput('/inspect hana');
+    expect(controller.getViewMode()).toBe('output');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain('Dossier: Hana (hana)');
+
+    await controller.handleInput('/connections');
+    expect(controller.getViewMode()).toBe('output');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain('local-model');
+
+    await controller.handleInput('/sampling');
+    expect(controller.getViewMode()).toBe('output');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain('SAMPLING');
+
+    // /back returns to previous view mode; narrative turn also exits output mode
+    await controller.handleInput('/back');
+    expect(controller.getViewMode()).toBe('play');
+
+    await controller.handleInput('/help');
+    expect(controller.getViewMode()).toBe('output');
+    await controller.handleInput('Wave to Hana');
+    expect(controller.getViewMode()).toBe('play');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain('step back into the rain');
+
+    // showErrorMessage renders cleanly in output view without throwing
+    controller.showErrorMessage('Network timeout contacting endpoint');
+    expect(controller.getViewMode()).toBe('output');
+    expect(controller.renderScreen({ width: 80, height: 24 })).toContain(
+      'Network timeout contacting endpoint'
+    );
+
+    controller.dispose();
+  });
 });

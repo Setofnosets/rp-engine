@@ -92,7 +92,11 @@ import {
   wrapText,
 } from './panes/layout-helpers.js';
 
-export type TuiViewMode = 'play' | 'control_room' | 'combat' | 'audit' | 'chronicle';
+export type TuiViewMode = 'play' | 'control_room' | 'combat' | 'audit' | 'chronicle' | 'output';
+
+export interface TuiRenderOptions {
+  readonly hidePromptLine?: boolean;
+}
 
 export interface TuiViewport {
   readonly width: number;
@@ -608,6 +612,7 @@ function formatHelpLines(): string[] {
     '  /swipe-left | /swipe-right | /regenerate     Navigate or regenerate swipes',
     '  /confirm | /reject                           Confirm or reject pending patches',
     '  /hud | /control-room | /combat | /audit | /chronicle Switch TUI view',
+    '  /next | /prev | /back                        Page output or return to view',
     '  /help | /quit                                Show help or exit TUI',
   ];
 }
@@ -629,6 +634,10 @@ export class TuiController {
 
   private trackedBasePack: SystemPack;
   private viewMode: TuiViewMode;
+  private previousViewMode: Exclude<TuiViewMode, 'output'> = 'play';
+  private commandOutputTitle = '';
+  private commandOutputLines: string[] = [];
+  private commandOutputPage = 0;
   private auditFilter: string | undefined;
   private directorSteering: DirectorSteeringInput = {};
   private lastWizardResult: WizardGeneratedSystem | null = null;
@@ -656,6 +665,9 @@ export class TuiController {
     this.dataStore = options.dataStore ?? null;
     this.connectionsPath = options.connectionsPath ?? null;
     this.viewMode = options.initialViewMode ?? 'play';
+    if (this.viewMode !== 'output') {
+      this.previousViewMode = this.viewMode;
+    }
 
     if (options.wizard !== undefined) {
       this.wizard = options.wizard;
@@ -814,6 +826,18 @@ export class TuiController {
       return this.handleTurnInput(trimmed);
     }
 
+    if (
+      command !== '/next' &&
+      command !== '/n' &&
+      command !== '/more' &&
+      command !== '/prev' &&
+      command !== '/p' &&
+      command !== '/quit' &&
+      command !== '/exit'
+    ) {
+      this.exitOutputViewIfActive();
+    }
+
     switch (command) {
       case '/quit':
       case '/exit':
@@ -821,25 +845,63 @@ export class TuiController {
         return { outputLines: ['Goodbye.'], shouldExit: true };
 
       case '/help':
-        return { outputLines: formatHelpLines(), shouldExit: false };
+        return this.showCommandOutput(
+          'HELP',
+          formatHelpLines(),
+          'Showing help (/next /prev /hud to return).'
+        );
+
+      case '/next':
+      case '/n':
+      case '/more': {
+        if (this.viewMode !== 'output') {
+          this.lastStatusMessage = 'Nothing to page. Use /help, /characters, or /inspect first.';
+          return { outputLines: [this.lastStatusMessage], shouldExit: false };
+        }
+        this.commandOutputPage += 1;
+        this.lastStatusMessage = `Viewing ${this.commandOutputTitle} (page ${this.commandOutputPage + 1}).`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+
+      case '/prev':
+      case '/p': {
+        if (this.viewMode !== 'output') {
+          this.lastStatusMessage = 'Nothing to page. Use /help, /characters, or /inspect first.';
+          return { outputLines: [this.lastStatusMessage], shouldExit: false };
+        }
+        this.commandOutputPage = Math.max(0, this.commandOutputPage - 1);
+        this.lastStatusMessage = `Viewing ${this.commandOutputTitle} (page ${this.commandOutputPage + 1}).`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+
+      case '/back':
+      case '/close': {
+        this.viewMode = this.previousViewMode;
+        this.lastStatusMessage = `Returned to ${this.viewMode} view.`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
 
       case '/hud':
         this.viewMode = 'play';
+        this.previousViewMode = 'play';
         this.lastStatusMessage = 'Switched view to Play + Dynamic HUD.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/control-room':
         this.viewMode = 'control_room';
+        this.previousViewMode = 'control_room';
         this.lastStatusMessage = 'Switched view to Control Room.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/combat':
         this.viewMode = 'combat';
+        this.previousViewMode = 'combat';
         this.lastStatusMessage = 'Switched view to Combat Grid.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/audit':
         this.viewMode = 'audit';
+        this.previousViewMode = 'audit';
         this.auditFilter = arg.length > 0 ? arg : undefined;
         this.lastStatusMessage =
           this.auditFilter !== undefined
@@ -849,10 +911,12 @@ export class TuiController {
 
       case '/chronicle':
         this.viewMode = 'chronicle';
+        this.previousViewMode = 'chronicle';
         this.lastStatusMessage = 'Switched view to Chronicle.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/nudge': {
+        this.exitOutputViewIfActive();
         if (arg.length === 0) {
           const { oocNudge: _removed, ...rest } = this.directorSteering;
           this.directorSteering = rest;
@@ -865,16 +929,19 @@ export class TuiController {
       }
 
       case '/hold-clock':
+        this.exitOutputViewIfActive();
         this.directorSteering = { ...this.directorSteering, clockAction: 'hold' };
         this.lastStatusMessage = 'Staged Director clock action: hold.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/release-clock':
+        this.exitOutputViewIfActive();
         this.directorSteering = { ...this.directorSteering, clockAction: 'release' };
         this.lastStatusMessage = 'Staged Director clock action: release.';
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
 
       case '/advance-slot': {
+        this.exitOutputViewIfActive();
         let slots = 1;
         if (arg.length > 0) {
           const parsed = Number(arg);
@@ -1050,7 +1117,8 @@ export class TuiController {
     } else if (this.gateway !== null) {
       snap = this.gateway.getConnectionsSnapshot();
     } else {
-      return { outputLines: ['No ModelGateway bound.'], shouldExit: false };
+      this.lastStatusMessage = 'No ModelGateway bound.';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
     }
 
     const lines: string[] = ['Configured LLM Connections:'];
@@ -1064,7 +1132,7 @@ export class TuiController {
         lines.push(`  ${role}: ${cfg.baseUrl} (${cfg.model})`);
       }
     }
-    return { outputLines: lines, shouldExit: false };
+    return this.showCommandOutput('CONNECTIONS', lines, 'Listed configured LLM connections.');
   }
 
   private async loadLocalConnectionsDoc(): Promise<ConnectionsFileDocument> {
@@ -1386,8 +1454,7 @@ export class TuiController {
       for (const p of presets) {
         lines.push(`  ${p.id}: ${p.name} (${p.sourceFormat})`);
       }
-      this.lastStatusMessage = `Listed ${presets.length} preset(s).`;
-      return { outputLines: lines, shouldExit: false };
+      return this.showCommandOutput('SAVED PRESETS', lines, `Listed ${presets.length} preset(s).`);
     }
 
     if (sub === 'save') {
@@ -1511,9 +1578,14 @@ export class TuiController {
     if (arg.length === 0) {
       const snap = this.getSnapshot();
       const lines = formatGenerationSummaryLines(snap.config.generation);
-      this.lastStatusMessage = lines[0] ?? 'Generation Sampling';
-      return { outputLines: lines, shouldExit: false };
+      return this.showCommandOutput(
+        'SAMPLING',
+        lines,
+        lines[0] ?? 'Generation Sampling'
+      );
     }
+
+    this.exitOutputViewIfActive();
 
     const tokens = arg.split(/\s+/).filter((t) => t.length > 0);
     const patch: Record<string, number> = {};
@@ -1601,8 +1673,7 @@ export class TuiController {
       for (const p of personas) {
         lines.push(`  ${p.id}: ${p.name}${p.description ? ` - ${p.description}` : ''}`);
       }
-      this.lastStatusMessage = `Listed ${personas.length} persona(s).`;
-      return { outputLines: lines, shouldExit: false };
+      return this.showCommandOutput('SAVED PERSONAS', lines, `Listed ${personas.length} persona(s).`);
     }
 
     if (sub === 'set') {
@@ -1820,8 +1891,11 @@ export class TuiController {
       );
     }
 
-    this.lastStatusMessage = `Cast: ${roster.totalCharacters} character(s) (${roster.presentCount} present).`;
-    return { outputLines: formatSettingRosterLines(roster), shouldExit: false };
+    return this.showCommandOutput(
+      'SETTING CHARACTERS',
+      formatSettingRosterLines(roster),
+      `Cast: ${roster.totalCharacters} character(s) (${roster.presentCount} present).`
+    );
   }
 
   private async handleInspectCommand(arg: string): Promise<TuiHandleInputResult> {
@@ -1853,8 +1927,11 @@ export class TuiController {
       return { outputLines: [this.lastStatusMessage], shouldExit: false };
     }
 
-    this.lastStatusMessage = `Inspected character "${dossier.summary.name}" (${dossier.summary.id}).`;
-    return { outputLines: formatDossierLines(dossier), shouldExit: false };
+    return this.showCommandOutput(
+      `DOSSIER: ${dossier.summary.name}`,
+      formatDossierLines(dossier),
+      `Inspected character "${dossier.summary.name}" (${dossier.summary.id}).`
+    );
   }
 
   private handlePinCommand(arg: string): TuiHandleInputResult {
@@ -2058,10 +2135,70 @@ export class TuiController {
   }
 
   /**
+   * Display an unexpected runtime/network error cleanly in the TUI `'output'` pane.
+   */
+  showErrorMessage(message: string): void {
+    const lines = message.trim().length > 0 ? message.split('\n') : ['Unknown error'];
+    this.showCommandOutput('ERROR', lines, `Error: ${lines[0] ?? 'Unknown error'}`);
+  }
+
+  private showCommandOutput(
+    title: string,
+    lines: readonly string[],
+    statusMessage?: string
+  ): TuiHandleInputResult {
+    if (this.viewMode !== 'output') {
+      this.previousViewMode = this.viewMode;
+    }
+    this.viewMode = 'output';
+    this.commandOutputTitle = title;
+    this.commandOutputLines = [...lines];
+    this.commandOutputPage = 0;
+    this.lastStatusMessage = statusMessage ?? `${title} (/next /prev /hud to return).`;
+    return { outputLines: [...lines], shouldExit: false };
+  }
+
+  private exitOutputViewIfActive(): void {
+    if (this.viewMode === 'output') {
+      this.viewMode = this.previousViewMode;
+    }
+  }
+
+  private renderCommandOutputPane(width: number, bodyHeight: number): string[] {
+    const wrapped: string[] = [];
+    for (const line of this.commandOutputLines) {
+      if (line.length === 0) {
+        wrapped.push('');
+      } else {
+        wrapped.push(...wrapText(line, width));
+      }
+    }
+    if (wrapped.length === 0) {
+      wrapped.push('(no output)');
+    }
+
+    const pageSize = Math.max(1, bodyHeight - 1);
+    const totalPages = Math.max(1, Math.ceil(wrapped.length / pageSize));
+    const page = Math.max(0, Math.min(this.commandOutputPage, totalPages - 1));
+    this.commandOutputPage = page;
+
+    const start = page * pageSize;
+    const slice = wrapped.slice(start, start + pageSize);
+    const header = truncateLine(
+      `[ ${this.commandOutputTitle || 'OUTPUT'} | Page ${page + 1}/${totalPages} | /next /prev /hud ]`,
+      width
+    );
+    return [header, ...slice];
+  }
+
+  /**
    * Render the full terminal frame cleanly bounded to `viewport` (default `80x24` Termux safe).
    * Guarantees every line has `line.length <= viewport.width` and total lines `<= viewport.height`.
    */
-  renderScreen(viewport: TuiViewport = DEFAULT_VIEWPORT): string {
+  renderScreen(
+    viewport: TuiViewport = DEFAULT_VIEWPORT,
+    options: TuiRenderOptions = {}
+  ): string {
     const width = Math.max(20, Math.floor(viewport.width));
     const height = Math.max(8, Math.floor(viewport.height));
 
@@ -2110,15 +2247,26 @@ export class TuiController {
     const statusOrHint =
       this.lastStatusMessage ??
       '/hud /control-room /combat /audit /chronicle /pack /toggle /wizard /help';
-    const footerLine1 = truncateLine(`Director: ${directorStatus}${statusOrHint}`, width);
-    const footerLine2 = truncateLine('> Type action or /command', width);
 
-    const reservedLines = 4; // header + divider + 2 footer lines
+    let footerLines: string[];
+    if (options.hidePromptLine === true) {
+      const wrappedStatus = wrapText(`Director: ${directorStatus}${statusOrHint}`, width);
+      footerLines = wrappedStatus.slice(0, 2).map((line) => truncateLine(line, width));
+      if (footerLines.length === 0) {
+        footerLines = [truncateLine(`Director: ${directorStatus}${statusOrHint}`, width)];
+      }
+    } else {
+      const footerLine1 = truncateLine(`Director: ${directorStatus}${statusOrHint}`, width);
+      const footerLine2 = truncateLine('> Type action or /command', width);
+      footerLines = [footerLine1, footerLine2];
+    }
+
+    const reservedLines = 2 + footerLines.length; // header + divider + footerLines
     const bodyHeight = Math.max(1, height - reservedLines);
     const bodyLines = this.renderBodyPane(snap, diffReport, width, bodyHeight);
     const boundedBody = padOrTrimLines(bodyLines, bodyHeight, width);
 
-    return [headerLine, dividerLine, ...boundedBody, footerLine1, footerLine2].join('\n');
+    return [headerLine, dividerLine, ...boundedBody, ...footerLines].join('\n');
   }
 
   private renderBodyPane(
@@ -2127,6 +2275,10 @@ export class TuiController {
     width: number,
     bodyHeight: number
   ): string[] {
+    if (this.viewMode === 'output') {
+      return this.renderCommandOutputPane(width, bodyHeight);
+    }
+
     if (this.viewMode === 'control_room') {
       return renderControlRoomPane({
         config: snap.config,
@@ -2261,6 +2413,7 @@ export class TuiController {
   }
 
   private async handleTurnInput(text: string): Promise<TuiHandleInputResult> {
+    this.exitOutputViewIfActive();
     const steering = this.consumeStagedSteering();
 
     if (this.runtime !== null) {
@@ -2526,8 +2679,9 @@ export class TuiController {
       this.lastStatusMessage = `Wizard generated & enabled module "${modToEnable.id}".`;
       outputLines.push(this.lastStatusMessage);
     } else {
-      this.lastStatusMessage = `Wizard preview generated for "${generated.module.id}" (not enabled).`;
-      outputLines.push(this.lastStatusMessage);
+      const msg = `Wizard preview generated for "${generated.module.id}" (not enabled).`;
+      outputLines.push(msg);
+      return this.showCommandOutput('WIZARD PREVIEW', outputLines, msg);
     }
 
     return { outputLines, shouldExit: false };
