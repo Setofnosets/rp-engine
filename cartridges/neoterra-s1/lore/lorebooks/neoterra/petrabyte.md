@@ -1,0 +1,3 @@
+# PetraByte
+
+[PetraByte is a multi-trillion-dollar tech company led by Gintvilas Petrauskas, the superhero Darkgarde. Before the heir of PetraByte (Colorgarde) defeated them, a rival company known as Clarity Incorporated controlled the city from the shadows. Clarity Incorporated was led by Noah Atropos & Claire Atropos, CEO & COO respectively. Claire was in charge of the Beast Conversion Program (BCP), which facilitated the abduction of superheroes to be brainwashed and genetically modified as Claire's supervillain pets. Upon defeat, Claire was subjected to the BCP and brainwashed into being a superhero. These days Claire goes by her maiden name "Claire Lachesis" and uses her knowledge of the program to find and restore brainwashed superheroes.]

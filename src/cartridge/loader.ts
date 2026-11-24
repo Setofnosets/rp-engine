@@ -7,6 +7,7 @@ import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import { getStockSystemPack } from '../schema/stock-system-packs.js';
 import type { SystemPack } from '../schema/tracker-module.js';
+import type { FormTransitionRule } from '../state/forms.js';
 import type { WorldState } from '../state/world-state.js';
 import type { AgendaConfig } from '../world/agendas.js';
 import {
@@ -353,6 +354,7 @@ export async function loadCartridgeFromDirectory(
     overridesRes,
     stateRes,
     entitiesRes,
+    formRulesRes,
     agendasRes,
     combatRes,
     beatsRes,
@@ -362,6 +364,7 @@ export async function loadCartridgeFromDirectory(
     readOptionalJsonFile(path.join(dirPath, 'system-overrides.json'), 'systemOverrides', acc),
     readOptionalJsonFile(path.join(dirPath, 'state.json'), 'initialState', acc),
     readOptionalJsonFile(path.join(dirPath, 'entities.json'), 'initialEntities', acc),
+    readOptionalJsonFile(path.join(dirPath, 'form-rules.json'), 'initialEntities.formRules', acc),
     readOptionalJsonFile(path.join(dirPath, 'agendas.json'), 'agendas', acc),
     readOptionalJsonFile(path.join(dirPath, 'combat.json'), 'combat', acc),
     readOptionalJsonFile(path.join(dirPath, 'beats.json'), 'beats', acc),
@@ -440,14 +443,46 @@ export async function loadCartridgeFromDirectory(
     }
   }
 
+  let initialEntities: CartridgeInitialEntities | undefined = entitiesRes.found
+    ? (entitiesRes.value as CartridgeInitialEntities)
+    : undefined;
+
+  if (formRulesRes.found) {
+    let loadedFormRules: FormTransitionRule[] | undefined;
+    if (Array.isArray(formRulesRes.value)) {
+      loadedFormRules = formRulesRes.value as FormTransitionRule[];
+    } else if (isPlainObject(formRulesRes.value) && Array.isArray(formRulesRes.value['formRules'])) {
+      loadedFormRules = formRulesRes.value['formRules'] as FormTransitionRule[];
+    } else {
+      acc.add(
+        'initialEntities.formRules',
+        'INVALID_TYPE',
+        'form-rules.json must be an array or { formRules: [...] }'
+      );
+    }
+
+    if (loadedFormRules !== undefined) {
+      if (initialEntities !== undefined && initialEntities.formRules !== undefined) {
+        acc.add(
+          'initialEntities.formRules',
+          'DUPLICATE_FORM_RULES_SOURCE',
+          'formRules cannot be defined in both entities.json and form-rules.json'
+        );
+      } else {
+        initialEntities = {
+          ...(initialEntities ?? {}),
+          formRules: loadedFormRules,
+        };
+      }
+    }
+  }
+
   const bundle: CartridgeBundle = {
     rootDir: dirPath,
     card: cardRes.value as CartridgeCardSpec,
     ...(overridesRes.found ? { systemOverrides: overridesRes.value as ControlRoomLayer } : {}),
     ...(stateRes.found ? { initialState: stateRes.value as Partial<WorldState> } : {}),
-    ...(entitiesRes.found
-      ? { initialEntities: entitiesRes.value as CartridgeInitialEntities }
-      : {}),
+    ...(initialEntities !== undefined ? { initialEntities } : {}),
     ...(agendasRes.found ? { agendas: agendasRes.value as AgendaConfig } : {}),
     ...(combatRes.found ? { combat: combatRes.value as CartridgeCombatConfig } : {}),
     beats,

@@ -179,7 +179,7 @@ export async function runSimValidateCommand(
   const refErrors = validateCrossFileReferences(bundle);
   collectedErrors.push(...refErrors);
 
-  const report = analyzeCartridgeGraph(bundle);
+  const report = analyzeCartridgeGraph(bundle, { maxExploreStates: 4096 });
   if (!report.ok) {
     collectedErrors.push(...report.errors);
   }

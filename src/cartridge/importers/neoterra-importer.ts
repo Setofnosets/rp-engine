@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { BeatDefinition, BeatEffect, BeatFlexibility } from '../../beats/beat-ledger.js';
 import type { ComparisonOp, PredicateAst } from '../../beats/predicate-ast.js';
@@ -11,8 +11,14 @@ import type {
 import { type ValidationError, validationError } from '../../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../../core/result.js';
 import { parseIsoDate } from '../../core/world-clock.js';
-import type { FormDefinition } from '../../state/forms.js';
-import type { LocationEntity } from '../../state/spatial-topology.js';
+import { type CharacterCardSheet, cloneCharacterCardSheet } from '../../state/character-card-sheet.js';
+import type { FormDefinition, FormTransitionRule } from '../../state/forms.js';
+import type {
+  ConnectionMeta,
+  LocationEntity,
+  LocationGeometry,
+  LocationMapAssets,
+} from '../../state/spatial-topology.js';
 import {
   CHARACTER_STATUSES,
   FACTION_SIDES,
@@ -36,14 +42,35 @@ import {
   setSafeProperty,
   validateCartridgeStructure,
 } from '../cartridge-schema.js';
+import { PNG_SIGNATURE, extractCharaJsonFromPngBuffer } from '../png-card-codec.js';
+import { parseStCardContext } from './st-card-importer.js';
+
+export interface NeoTerraCharacterCardAsset {
+  card: unknown;
+  portraitBytes?: Uint8Array;
+  portraitPath?: string;
+}
+
+export interface NeoTerraMapAssetsInput {
+  imagePath?: string;
+  svgPaths?: readonly string[];
+  width?: number;
+  height?: number;
+}
 
 export interface NeoTerraImportData {
   season: unknown;
   factions?: unknown;
   locations?: unknown;
+  districts?: unknown;
   agendas?: unknown;
   characters?: unknown;
+  avatars?: unknown;
   formGroups?: unknown;
+  formRules?: unknown;
+  characterCards?: Record<string, NeoTerraCharacterCardAsset>;
+  lorebooks?: Record<string, unknown>;
+  mapAssets?: NeoTerraMapAssetsInput;
 }
 
 const VALID_CHAR_STATUSES = new Set<string>(CHARACTER_STATUSES);
@@ -246,9 +273,14 @@ function buildFactions(
   return factions;
 }
 
+function normalizeZero(n: number): number {
+  return Object.is(n, -0) ? 0 : n;
+}
+
 function buildLocations(
   rawLocationsData: unknown,
-  factions: Readonly<Record<string, FactionEntity>>
+  factions: Readonly<Record<string, FactionEntity>>,
+  mapAssetsInput?: NeoTerraMapAssetsInput
 ): Record<string, LocationEntity> {
   const locations: Record<string, LocationEntity> = {};
   const list = Array.isArray(rawLocationsData)
@@ -256,6 +288,36 @@ function buildLocations(
     : isPlainObject(rawLocationsData) && Array.isArray(getOwnValue(rawLocationsData, 'locations'))
       ? (getOwnValue(rawLocationsData, 'locations') as unknown[])
       : [];
+
+  const rawImage = isPlainObject(rawLocationsData)
+    ? getOwnValue(rawLocationsData, 'image')
+    : undefined;
+  const imageObj = isPlainObject(rawImage) ? rawImage : undefined;
+
+  const resolvedMapAssets: LocationMapAssets = {};
+  const imagePath =
+    (imageObj ? getOwnString(imageObj, 'path')?.trim() : undefined) ||
+    mapAssetsInput?.imagePath?.trim();
+  if (imagePath) {
+    resolvedMapAssets.imagePath = imagePath;
+  }
+  const svgPaths = mapAssetsInput?.svgPaths;
+  if (svgPaths && svgPaths.length > 0) {
+    const primarySvg = svgPaths.find((p) => p === 'NeoTerra.svg') ?? svgPaths[0];
+    if (primarySvg) {
+      resolvedMapAssets.svgPath = primarySvg;
+    }
+  }
+  const mapWidth = (imageObj ? getOwnNumber(imageObj, 'width') : undefined) ?? mapAssetsInput?.width;
+  const mapHeight =
+    (imageObj ? getOwnNumber(imageObj, 'height') : undefined) ?? mapAssetsInput?.height;
+  if (mapWidth !== undefined) {
+    resolvedMapAssets.width = normalizeZero(mapWidth);
+  }
+  if (mapHeight !== undefined) {
+    resolvedMapAssets.height = normalizeZero(mapHeight);
+  }
+  const hasMapAssets = Object.keys(resolvedMapAssets).length > 0;
 
   const validLocIds = new Set<string>();
   for (const item of list) {
@@ -293,7 +355,44 @@ function buildLocations(
 
     const isVirtual = getOwnBoolean(item, 'virtual') === true;
 
-    setSafeProperty(locations, id, {
+    const x = getOwnNumber(item, 'x');
+    const y = getOwnNumber(item, 'y');
+    const districtId = getOwnString(item, 'districtId')?.trim();
+    const regionId = getOwnString(item, 'regionId')?.trim();
+    const rawMapRef = getOwnValue(item, 'mapRef');
+    let mapRef: { layer: string; id: string } | undefined;
+    if (isPlainObject(rawMapRef)) {
+      const layer = getOwnString(rawMapRef, 'layer')?.trim();
+      const refId = getOwnString(rawMapRef, 'id')?.trim();
+      if (layer && refId) {
+        mapRef = { layer, id: refId };
+      }
+    }
+
+    let geometry: LocationGeometry | undefined;
+    if (x !== undefined && y !== undefined) {
+      geometry = {
+        x: normalizeZero(x),
+        y: normalizeZero(y),
+        ...(districtId ? { districtId } : {}),
+        ...(regionId ? { regionId } : {}),
+        ...(mapRef ? { mapRef } : {}),
+      };
+    }
+
+    const travelModes = getStringArray(item, 'travel');
+    let connectionsMeta: Record<string, ConnectionMeta> | undefined;
+    if (travelModes.length > 0 && dedupConnections.length > 0) {
+      connectionsMeta = {};
+      for (const connId of dedupConnections) {
+        setSafeProperty(connectionsMeta, connId, {
+          state: 'open',
+          travelModes: [...travelModes],
+        });
+      }
+    }
+
+    const locEntity: LocationEntity = {
       id,
       name: getOwnString(item, 'name')?.trim() || id,
       kind: getOwnString(item, 'kind')?.trim() || 'district',
@@ -303,7 +402,12 @@ function buildLocations(
       discovered: !isVirtual,
       tags,
       notes: getOwnString(item, 'description')?.trim() || '',
-    });
+      ...(geometry ? { geometry } : {}),
+      ...(geometry && hasMapAssets ? { mapAssets: { ...resolvedMapAssets } } : {}),
+      ...(connectionsMeta ? { connectionsMeta } : {}),
+    };
+
+    setSafeProperty(locations, id, locEntity);
   }
 
   // Ensure faction HQ references exist in locations
@@ -442,8 +546,126 @@ function parseCharactersPayload(rawCharacters: unknown): ParsedCharacterData {
   return { entriesById, entryIdByCardPath, profilesById };
 }
 
-function buildProfileSections(profile: Record<string, unknown> | undefined): Record<string, string | string[]> {
+interface ParsedDescriptionBanners {
+  sections: Record<string, string | string[]>;
+  abilities: string[];
+  skills: string[];
+  traits: string[];
+  goals: string[];
+}
+
+const BANNER_LINE_REGEX =
+  /^(Appearance|Attire|Other attire|Abilities|Skills|Traits|Goals|Background|Personality|Speech|Likes|Dislikes)\s*:\s*(.*)$/i;
+
+function splitBannerList(raw: string): string[] {
+  return raw
+    .split(/[.;,\n]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && s.length <= 120);
+}
+
+function parseNeoTerraDescriptionBanners(description: string): ParsedDescriptionBanners {
   const sections: Record<string, string | string[]> = {};
+  const abilities: string[] = [];
+  const skills: string[] = [];
+  const traits: string[] = [];
+  const goals: string[] = [];
+
+  if (description.trim().length === 0) {
+    return { sections, abilities, skills, traits, goals };
+  }
+
+  const lines = description.replace(/\r\n/g, '\n').split('\n');
+  let currentKey: string | null = null;
+  let currentLines: string[] = [];
+
+  const flush = (): void => {
+    if (!currentKey) {
+      return;
+    }
+    let text = currentLines.join('\n').trim();
+    if (text.endsWith(']')) {
+      text = text.slice(0, -1).trim();
+    }
+    if (text.length === 0) {
+      currentKey = null;
+      currentLines = [];
+      return;
+    }
+    switch (currentKey) {
+      case 'appearance':
+        setSafeProperty(sections, 'sec_body', text);
+        break;
+      case 'attire':
+      case 'other attire':
+        setSafeProperty(sections, 'sec_equipment', text);
+        break;
+      case 'abilities':
+        setSafeProperty(sections, 'sec_superpowers', text);
+        abilities.push(...splitBannerList(text).slice(0, 8));
+        break;
+      case 'skills':
+        setSafeProperty(sections, 'sec_skills', text);
+        skills.push(...splitBannerList(text).slice(0, 8));
+        break;
+      case 'traits':
+        setSafeProperty(sections, 'sec_traits', text);
+        traits.push(...splitBannerList(text).slice(0, 12));
+        break;
+      case 'goals':
+        setSafeProperty(sections, 'sec_goals', text);
+        goals.push(...splitBannerList(text).slice(0, 8));
+        break;
+      case 'background':
+        setSafeProperty(sections, 'sec_background', text);
+        break;
+      case 'personality':
+        setSafeProperty(sections, 'sec_personality', text);
+        break;
+      case 'speech':
+        setSafeProperty(sections, 'sec_speech', text);
+        break;
+      case 'likes':
+        setSafeProperty(sections, 'sec_likes', text);
+        break;
+      case 'dislikes':
+        setSafeProperty(sections, 'sec_dislikes', text);
+        break;
+      default:
+        break;
+    }
+    currentKey = null;
+    currentLines = [];
+  };
+
+  for (const line of lines) {
+    const match = BANNER_LINE_REGEX.exec(line.trim());
+    if (match) {
+      flush();
+      currentKey = (match[1] ?? '').toLowerCase();
+      const rest = (match[2] ?? '').trim();
+      if (rest.length > 0) {
+        currentLines.push(rest);
+      }
+    } else if (currentKey !== null) {
+      currentLines.push(line);
+    }
+  }
+  flush();
+
+  return { sections, abilities, skills, traits, goals };
+}
+
+function buildProfileSections(
+  profile: Record<string, unknown> | undefined,
+  banners?: ParsedDescriptionBanners
+): Record<string, string | string[]> {
+  const sections: Record<string, string | string[]> = {};
+  if (banners) {
+    for (const [k, v] of Object.entries(banners.sections)) {
+      setSafeProperty(sections, k, typeof v === 'string' ? v : [...v]);
+    }
+  }
   if (!profile) {
     return sections;
   }
@@ -475,14 +697,84 @@ function buildProfileSections(profile: Record<string, unknown> | undefined): Rec
   return sections;
 }
 
+function parseAvatarsMap(rawAvatars: unknown): Map<string, string> {
+  const result = new Map<string, string>();
+  if (!isPlainObject(rawAvatars)) {
+    return result;
+  }
+  const avatarsObj = isPlainObject(getOwnValue(rawAvatars, 'avatars'))
+    ? (getOwnValue(rawAvatars, 'avatars') as Record<string, unknown>)
+    : rawAvatars;
+  for (const key of Object.keys(avatarsObj)) {
+    if (isUnsafeRecordKey(key)) {
+      continue;
+    }
+    const entry = getOwnValue(avatarsObj, key);
+    if (!isPlainObject(entry)) {
+      continue;
+    }
+    const fileRef = getOwnString(entry, 'file')?.trim();
+    const sourceRef = getOwnString(entry, 'source')?.trim();
+    const ref = fileRef || sourceRef;
+    if (ref) {
+      result.set(key, ref.replace(/\\/g, '/'));
+    }
+  }
+  return result;
+}
+
+function resolveCardSheets(
+  characterCards: Record<string, NeoTerraCharacterCardAsset> | undefined,
+  avatarRefs: ReadonlyMap<string, string>,
+  binaryAssetsOut: Record<string, Uint8Array>
+): Map<string, { sheet: CharacterCardSheet; banners: ParsedDescriptionBanners }> {
+  const resolved = new Map<string, { sheet: CharacterCardSheet; banners: ParsedDescriptionBanners }>();
+  if (!characterCards) {
+    return resolved;
+  }
+  for (const charId of Object.keys(characterCards).sort()) {
+    if (isUnsafeRecordKey(charId)) {
+      continue;
+    }
+    const asset = getOwnValue(characterCards, charId) as NeoTerraCharacterCardAsset | undefined;
+    if (!asset || !isPlainObject(asset.card)) {
+      continue;
+    }
+    const parsed = parseStCardContext(asset.card, charId);
+    if (!parsed.ok) {
+      continue;
+    }
+    const sheet = cloneCharacterCardSheet(parsed.value.cardSheet);
+    if (asset.portraitBytes && asset.portraitPath) {
+      sheet.portraitAssetPath = asset.portraitPath;
+      setSafeProperty(binaryAssetsOut, asset.portraitPath, asset.portraitBytes);
+    } else if (asset.portraitPath) {
+      sheet.portraitAssetPath = asset.portraitPath;
+    } else {
+      const avatarRef = avatarRefs.get(charId);
+      if (avatarRef) {
+        sheet.portraitAssetPath = avatarRef;
+      }
+    }
+    const banners = parseNeoTerraDescriptionBanners(sheet.description);
+    resolved.set(charId, { sheet, banners });
+  }
+  return resolved;
+}
+
 function buildCharactersAndForms(
   season: Record<string, unknown>,
   seasonId: string,
   parsedChars: ParsedCharacterData,
   rawFormGroups: unknown,
   locations: Readonly<Record<string, LocationEntity>>,
-  startLocationId: string | null
-): { characters: Record<string, CharacterEntity>; forms: FormDefinition[] } {
+  startLocationId: string | null,
+  cardSheets: ReadonlyMap<string, { sheet: CharacterCardSheet; banners: ParsedDescriptionBanners }>
+): {
+  characters: Record<string, CharacterEntity>;
+  forms: FormDefinition[];
+  formById: Map<string, FormDefinition>;
+} {
   const characters: Record<string, CharacterEntity> = {};
   const forms: FormDefinition[] = [];
   const formById = new Map<string, FormDefinition>();
@@ -512,6 +804,18 @@ function buildCharactersAndForms(
   const defaultPcId = getOwnString(season, 'defaultPlayerCharacterId')?.trim();
   if (defaultPcId && !isUnsafeRecordKey(defaultPcId)) {
     requiredCharIds.add(defaultPcId);
+  }
+
+  // Include all base-form characters belonging to this season from characters/index.json (e.g. s1.atropos.couple)
+  for (const [entryId, entry] of parsedChars.entriesById.entries()) {
+    if (isUnsafeRecordKey(entryId)) {
+      continue;
+    }
+    const entrySeason = getOwnString(entry, 'seasonId')?.trim();
+    const formRole = getOwnString(entry, 'formRole')?.trim();
+    if (entrySeason === seasonId && (formRole === 'base' || formRole === undefined)) {
+      requiredCharIds.add(entryId);
+    }
   }
 
   // Also scan canonBeats for actorIds, character-status, form-active, and relationship-affinity
@@ -602,20 +906,28 @@ function buildCharactersAndForms(
       }
       const entry = parsedChars.entriesById.get(formId);
       const profile = parsedChars.profilesById.get(formId);
+      const cardData = cardSheets.get(formId);
       const displayName =
         (entry ? getOwnString(entry, 'displayName') ?? getOwnString(entry, 'dataName') : undefined) ??
         (profile ? getOwnString(profile, 'name') : undefined) ??
+        cardData?.sheet.name ??
         formId;
+      const formTraits = profile ? getStringArray(profile, 'traits') : cardData?.banners.traits ?? [];
+      const formAbilities = cardData?.banners.abilities ?? [];
+      const formSections = buildProfileSections(profile, cardData?.banners);
+      const formDescription =
+        (profile ? getOwnString(profile, 'personality') : undefined) ||
+        cardData?.sheet.personality ||
+        undefined;
       const formDef: FormDefinition = {
         id: formId,
         formGroup: groupId,
         characterId: baseEntryId,
         displayName,
-        ...(profile && getOwnString(profile, 'personality')
-          ? { description: getOwnString(profile, 'personality') }
-          : {}),
-        ...(profile ? { traits: getStringArray(profile, 'traits') } : {}),
-        ...(profile ? { sections: buildProfileSections(profile) } : {}),
+        ...(formDescription ? { description: formDescription } : {}),
+        ...(formAbilities.length > 0 ? { abilities: formAbilities } : {}),
+        ...(formTraits.length > 0 ? { traits: formTraits } : {}),
+        ...(Object.keys(formSections).length > 0 ? { sections: formSections } : {}),
       };
       formById.set(formId, formDef);
       forms.push(formDef);
@@ -696,7 +1008,15 @@ function buildCharactersAndForms(
     const allegiance =
       (profile ? getOwnString(profile, 'faction')?.trim() : undefined) || side || 'neutral';
 
-    setSafeProperty(characters, cid, {
+    const cardData = cardSheets.get(cid) ?? (resolvedFormId ? cardSheets.get(resolvedFormId) : undefined);
+    const mergedSections = buildProfileSections(profile, cardData?.banners);
+    const profileTraits = profile ? getStringArray(profile, 'traits') : [];
+    const traits = profileTraits.length > 0 ? profileTraits : (cardData?.banners.traits ?? []);
+    const profileGoals = profile ? getStringArray(profile, 'goals') : [];
+    const goals = profileGoals.length > 0 ? profileGoals : (cardData?.banners.goals ?? []);
+    const abilities = cardData?.banners.abilities ?? [];
+
+    const charEntity: CharacterEntity = {
       id: cid,
       name,
       status,
@@ -704,18 +1024,21 @@ function buildCharactersAndForms(
       locationId,
       formId: resolvedFormId,
       formGroup,
-      sections: buildProfileSections(profile),
+      sections: mergedSections,
       customFields: {},
-      abilities: [],
-      goals: profile ? getStringArray(profile, 'goals') : [],
+      abilities,
+      goals,
       agenda: '',
       allegiance,
       mood: 'neutral',
-      traits: profile ? getStringArray(profile, 'traits') : [],
-    });
+      traits,
+      ...(cardData ? { cardSheet: cloneCharacterCardSheet(cardData.sheet) } : {}),
+    };
+
+    setSafeProperty(characters, cid, charEntity);
   }
 
-  return { characters, forms };
+  return { characters, forms, formById };
 }
 
 function buildAgendaConfig(
@@ -1055,6 +1378,253 @@ function translateBeatList(
   return out;
 }
 
+function slugifyLoreName(raw: string, fallback: string): string {
+  const slug = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (slug.length === 0 || isUnsafeRecordKey(slug)) {
+    return fallback;
+  }
+  return slug;
+}
+
+function buildFormRules(
+  rawFormRules: unknown,
+  formById: ReadonlyMap<string, FormDefinition>
+): FormTransitionRule[] {
+  const rawList = Array.isArray(rawFormRules)
+    ? rawFormRules
+    : isPlainObject(rawFormRules) && Array.isArray(getOwnValue(rawFormRules, 'rules'))
+      ? (getOwnValue(rawFormRules, 'rules') as unknown[])
+      : isPlainObject(rawFormRules) && Array.isArray(getOwnValue(rawFormRules, 'formRules'))
+        ? (getOwnValue(rawFormRules, 'formRules') as unknown[])
+        : [];
+
+  const rules: FormTransitionRule[] = [];
+  const seenIds = new Set<string>();
+
+  for (const item of rawList) {
+    if (!isPlainObject(item)) {
+      continue;
+    }
+    const id = getOwnString(item, 'id')?.trim();
+    if (!id || isUnsafeRecordKey(id) || seenIds.has(id)) {
+      continue;
+    }
+    const fromFormId =
+      getOwnString(item, 'from')?.trim() ?? getOwnString(item, 'fromFormId')?.trim();
+    const toFormId = getOwnString(item, 'to')?.trim() ?? getOwnString(item, 'toFormId')?.trim();
+    if (!fromFormId || !toFormId) {
+      continue;
+    }
+    const toForm = formById.get(toFormId);
+    if (!toForm) {
+      continue;
+    }
+    if (fromFormId !== '*') {
+      const fromForm = formById.get(fromFormId);
+      if (!fromForm || fromForm.formGroup !== toForm.formGroup) {
+        continue;
+      }
+    }
+
+    const triggerTag =
+      getOwnString(item, 'trigger')?.trim() ?? getOwnString(item, 'triggerTag')?.trim();
+    const permanent = getOwnBoolean(item, 'permanent') === true;
+
+    const rawRev = getOwnValue(item, 'reversibleBy');
+    let reversibleBy: string[] | undefined;
+    if (typeof rawRev === 'string' && rawRev.trim().length > 0) {
+      reversibleBy = [rawRev.trim()];
+    } else if (Array.isArray(rawRev)) {
+      const filtered = rawRev
+        .filter((r): r is string => typeof r === 'string' && r.trim().length > 0)
+        .map((r) => r.trim());
+      if (filtered.length > 0) {
+        reversibleBy = filtered;
+      }
+    }
+
+    const rawWhen = getOwnValue(item, 'when');
+    const when: PredicateAst = isPlainObject(rawWhen)
+      ? (rawWhen as PredicateAst)
+      : { flag: sanitizeFlagName(id), value: true };
+
+    const rawPriority = getOwnNumber(item, 'priority');
+    const priority =
+      rawPriority !== undefined
+        ? normalizeZero(rawPriority)
+        : id.endsWith('.reverse')
+          ? 5
+          : permanent
+            ? 20
+            : 10;
+
+    seenIds.add(id);
+    rules.push({
+      id,
+      formGroup: toForm.formGroup,
+      fromFormId,
+      toFormId,
+      when,
+      priority,
+      ...(permanent ? { permanent: true } : {}),
+      ...(reversibleBy ? { reversibleBy } : {}),
+      ...(triggerTag ? { triggerTag } : {}),
+    });
+  }
+
+  rules.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return rules;
+}
+
+function shouldIncludeLorebookForSeason(filename: string, seasonId: string): boolean {
+  const seasonMatch = /season(\d+)/i.exec(filename);
+  if (!seasonMatch) {
+    return true;
+  }
+  const bookNum = seasonMatch[1];
+  const currentNum = /^s(\d+)/i.exec(seasonId)?.[1];
+  if (!currentNum) {
+    return true;
+  }
+  return bookNum === currentNum;
+}
+
+function ingestLorebooks(
+  rawLorebooks: Record<string, unknown> | undefined,
+  seasonId: string,
+  existingBeatIds: Set<string>,
+  loreFilesOut: Record<string, string>,
+  beatsOut: BeatDefinition[]
+): void {
+  if (!rawLorebooks) {
+    return;
+  }
+  const filenames = Object.keys(rawLorebooks).sort();
+  for (const filename of filenames) {
+    if (isUnsafeRecordKey(filename) || !shouldIncludeLorebookForSeason(filename, seasonId)) {
+      continue;
+    }
+    const rawBook = getOwnValue(rawLorebooks, filename);
+    let entries: Record<string, unknown>[] = [];
+    if (Array.isArray(rawBook)) {
+      entries = rawBook.filter((e): e is Record<string, unknown> => isPlainObject(e));
+    } else if (isPlainObject(rawBook)) {
+      const rawEntries = getOwnValue(rawBook, 'entries');
+      if (Array.isArray(rawEntries)) {
+        entries = rawEntries.filter((e): e is Record<string, unknown> => isPlainObject(e));
+      } else if (isPlainObject(rawEntries)) {
+        for (const k of Object.keys(rawEntries).sort()) {
+          const item = getOwnValue(rawEntries, k);
+          if (isPlainObject(item)) {
+            entries.push(item);
+          }
+        }
+      }
+    }
+
+    const bookSlug = slugifyLoreName(filename.replace(/\.json$/i, ''), 'lorebook');
+    for (let i = 0; i < entries.length; i += 1) {
+      const entry = entries[i];
+      if (!entry) {
+        continue;
+      }
+      if (getOwnValue(entry, 'enabled') === false) {
+        continue;
+      }
+      const content = getOwnString(entry, 'content')?.trim() ?? '';
+      if (content.length === 0) {
+        continue;
+      }
+
+      const entryName = getOwnString(entry, 'name')?.trim() || `Entry ${i + 1}`;
+      const entrySlug = slugifyLoreName(entryName, `entry-${i + 1}`);
+      let lorePath = `lore/lorebooks/${bookSlug}/${entrySlug}.md`;
+      if (Object.hasOwn(loreFilesOut, lorePath)) {
+        lorePath = `lore/lorebooks/${bookSlug}/${entrySlug}-${i + 1}.md`;
+      }
+      setSafeProperty(loreFilesOut, lorePath, `# ${entryName}\n\n${content}`);
+
+      const rawKeys = getOwnValue(entry, 'key') ?? getOwnValue(entry, 'keys');
+      const keys = Array.isArray(rawKeys)
+        ? Array.from(
+            new Set(
+              rawKeys
+                .filter((k): k is string => typeof k === 'string' && k.trim().length > 0)
+                .map((k) => k.trim())
+            )
+          )
+        : [];
+      const isConstant = getOwnValue(entry, 'constant') === true;
+
+      if (keys.length === 0 && !isConstant) {
+        continue;
+      }
+
+      let beatId = `lore.${bookSlug}.${entrySlug}`;
+      if (existingBeatIds.has(beatId) || isUnsafeRecordKey(beatId)) {
+        beatId = `lore.${bookSlug}.${entrySlug}-${i + 1}`;
+      }
+      existingBeatIds.add(beatId);
+
+      const rawOrder =
+        getOwnNumber(entry, 'insertion_order') ?? getOwnNumber(entry, 'priority') ?? 10;
+
+      beatsOut.push({
+        id: beatId,
+        class: 'ambient',
+        flexibility: 'optional',
+        priority: Math.max(1, Math.round(rawOrder)),
+        when: keys.length > 0 ? { mentions: keys } : { clock: 'turn', op: '>=', value: 0 },
+        lore: lorePath,
+        once: false,
+      });
+    }
+  }
+}
+
+function buildDistrictsLore(
+  rawDistricts: unknown,
+  mapAssets: NeoTerraMapAssetsInput | undefined,
+  loreFilesOut: Record<string, string>
+): void {
+  const districtList = isPlainObject(rawDistricts)
+    ? (getOwnValue(rawDistricts, 'districts') as unknown)
+    : rawDistricts;
+
+  if (Array.isArray(districtList) && districtList.length > 0) {
+    const lines: string[] = ['# Neo Terra Districts'];
+    for (const d of districtList) {
+      if (!isPlainObject(d)) {
+        continue;
+      }
+      const name = getOwnString(d, 'name')?.trim() || getOwnString(d, 'id')?.trim() || 'District';
+      const desc = getOwnString(d, 'description')?.trim() || '';
+      const regions = getStringArray(d, 'regionLabels');
+      const tags = getStringArray(d, 'tags');
+      lines.push(`## ${name}`);
+      if (desc) lines.push(desc);
+      if (regions.length > 0) lines.push(`- Regions: ${regions.join(', ')}`);
+      if (tags.length > 0) lines.push(`- Tags: ${tags.join(', ')}`);
+    }
+    setSafeProperty(loreFilesOut, 'lore/districts.md', lines.join('\n\n'));
+  }
+
+  if (mapAssets && (mapAssets.imagePath || (mapAssets.svgPaths && mapAssets.svgPaths.length > 0))) {
+    const lines: string[] = ['# Neo Terra Map Layers'];
+    if (mapAssets.imagePath) {
+      lines.push(`- Base Image: ${mapAssets.imagePath}`);
+    }
+    if (mapAssets.svgPaths && mapAssets.svgPaths.length > 0) {
+      lines.push(`- SVG Layers: ${mapAssets.svgPaths.join(', ')}`);
+    }
+    setSafeProperty(loreFilesOut, 'lore/map-layers.md', lines.join('\n'));
+  }
+}
+
 /**
  * Import an assembled set of NeoTerra JSON objects (`season`, `factions`, `locations`,
  * `agendas`, `characters`, `formGroups`) into a validated Tier 2 {@link CartridgeBundle}.
@@ -1086,7 +1656,7 @@ export function importNeoTerraSeasonFromData(
   const anchorDate = anchorDateRaw && parseIsoDate(anchorDateRaw) ? anchorDateRaw : null;
 
   const factions = buildFactions(sanitizedData.factions, getOwnValue(season, 'factions'));
-  const locations = buildLocations(sanitizedData.locations, factions);
+  const locations = buildLocations(sanitizedData.locations, factions, sanitizedData.mapAssets);
   const threats = buildThreats(getOwnValue(season, 'threats'), locations, factions);
 
   const rawStartLoc = getOwnString(season, 'startLocationId')?.trim() ?? null;
@@ -1095,15 +1665,21 @@ export function importNeoTerraSeasonFromData(
       ? rawStartLoc
       : Object.keys(locations)[0] ?? null;
 
+  const binaryAssets: Record<string, Uint8Array> = {};
+  const avatarRefs = parseAvatarsMap(sanitizedData.avatars);
+  const cardSheets = resolveCardSheets(sanitizedData.characterCards, avatarRefs, binaryAssets);
+
   const parsedChars = parseCharactersPayload(sanitizedData.characters);
-  const { characters, forms } = buildCharactersAndForms(
+  const { characters, forms, formById } = buildCharactersAndForms(
     season,
     seasonId,
     parsedChars,
     sanitizedData.formGroups,
     locations,
-    startLocationId
+    startLocationId,
+    cardSheets
   );
+  const formRules = buildFormRules(sanitizedData.formRules, formById);
 
   const defaultPcId = getOwnString(season, 'defaultPlayerCharacterId')?.trim() ?? null;
   const playerCharacterId =
@@ -1291,6 +1867,10 @@ export function importNeoTerraSeasonFromData(
         .join('\n\n')
     );
   }
+  buildDistrictsLore(sanitizedData.districts, sanitizedData.mapAssets, loreFiles);
+
+  const allBeatIds = new Set<string>(allBeats.map((b) => b.id));
+  ingestLorebooks(sanitizedData.lorebooks, seasonId, allBeatIds, loreFiles, allBeats);
 
   const personaName = playerChar ? playerChar.name : title;
   const personaDescription = [premise, toneNotes].filter((s) => s.length > 0).join('\n\n');
@@ -1357,6 +1937,7 @@ export function importNeoTerraSeasonFromData(
       threats,
       locations,
       forms,
+      ...(formRules.length > 0 ? { formRules } : {}),
     },
     agendas,
     beats: allBeats,
@@ -1365,15 +1946,183 @@ export function importNeoTerraSeasonFromData(
     loreFiles,
     endingPromptFiles: {},
     scriptFiles: {},
+    ...(Object.keys(binaryAssets).length > 0 ? { binaryAssets } : {}),
   };
 
   return validateCartridgeStructure(bundle);
 }
 
+function resolveSeasonCharsDirName(seasonId: string): string {
+  switch (seasonId.toLowerCase()) {
+    case 's1':
+      return 'S1';
+    case 's1dark':
+      return 'S1Dark';
+    case 's2':
+      return 'S2';
+    case 's3':
+      return 'S3';
+    case 's4':
+      return 'S4';
+    default:
+      return seasonId;
+  }
+}
+
+async function readCardAssetFromFile(
+  absPath: string,
+  portraitPath: string
+): Promise<NeoTerraCharacterCardAsset | undefined> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(absPath);
+  } catch {
+    return undefined;
+  }
+
+  if (bytes.length >= PNG_SIGNATURE.length && bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    const extracted = extractCharaJsonFromPngBuffer(bytes);
+    if (!extracted.ok) {
+      return undefined;
+    }
+    return {
+      card: extracted.value,
+      portraitBytes: new Uint8Array(bytes),
+      portraitPath,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(bytes.toString('utf8')) as unknown;
+    return { card: parsed };
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadCharacterCardsFromCharsDir(
+  frameworkRoot: string,
+  seasonId: string,
+  charIndex: unknown
+): Promise<Record<string, NeoTerraCharacterCardAsset>> {
+  const result: Record<string, NeoTerraCharacterCardAsset> = {};
+  const charsRoot = path.resolve(frameworkRoot, 'Chars');
+  const charsPrefix = charsRoot.endsWith(path.sep) ? charsRoot : `${charsRoot}${path.sep}`;
+  const seasonDirName = resolveSeasonCharsDirName(seasonId);
+
+  const indexEntries: Array<{ id: string; cardPath: string }> = [];
+  if (isPlainObject(charIndex) && Array.isArray(getOwnValue(charIndex, 'entries'))) {
+    for (const rawEntry of getOwnValue(charIndex, 'entries') as unknown[]) {
+      if (!isPlainObject(rawEntry)) {
+        continue;
+      }
+      const id = getOwnString(rawEntry, 'id')?.trim();
+      const entrySeason = getOwnString(rawEntry, 'seasonId')?.trim();
+      const cardPath =
+        getOwnString(rawEntry, 'cardPath')?.trim() ?? getOwnString(rawEntry, 'file')?.trim();
+      if (!id || !cardPath || isUnsafeRecordKey(id)) {
+        continue;
+      }
+      const isSeasonMatch =
+        entrySeason === seasonId ||
+        cardPath.toLowerCase().startsWith(`chars/${seasonDirName.toLowerCase()}/`) ||
+        cardPath.toLowerCase().startsWith('chars/others/');
+      if (isSeasonMatch) {
+        indexEntries.push({ id, cardPath });
+      }
+    }
+  }
+
+  for (const entry of indexEntries) {
+    const relFromRoot = entry.cardPath.replace(/\\/g, '/').replace(/^\.\//, '');
+    const resolved = path.resolve(frameworkRoot, ...relFromRoot.split('/'));
+    if (!resolved.startsWith(charsPrefix)) {
+      continue;
+    }
+    const portraitRel = `assets/portraits/${slugifyLoreName(entry.id, 'portrait')}.png`;
+    // Prefer sibling .png if it exists alongside .json
+    let asset: NeoTerraCharacterCardAsset | undefined;
+    if (resolved.toLowerCase().endsWith('.json')) {
+      const siblingPng = resolved.slice(0, -5) + '.png';
+      asset = await readCardAssetFromFile(siblingPng, portraitRel);
+    }
+    if (!asset) {
+      asset = await readCardAssetFromFile(resolved, portraitRel);
+    }
+    if (asset) {
+      setSafeProperty(result, entry.id, asset);
+    }
+  }
+
+  return result;
+}
+
+async function loadLorebooksFromCharsDir(frameworkRoot: string): Promise<Record<string, unknown>> {
+  const lorebooks: Record<string, unknown> = {};
+  const loreDir = path.join(frameworkRoot, 'Chars', 'lorebooks');
+  let entries;
+  try {
+    entries = await readdir(loreDir, { withFileTypes: true });
+  } catch {
+    return lorebooks;
+  }
+
+  const sorted = entries
+    .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.json') && !isUnsafeRecordKey(e.name))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+
+  for (const entry of sorted) {
+    try {
+      const raw = await readFile(path.join(loreDir, entry.name), 'utf8');
+      const parsed = JSON.parse(raw) as unknown;
+      setSafeProperty(lorebooks, entry.name, parsed);
+    } catch {
+      // Skip malformed optional lorebooks
+    }
+  }
+
+  return lorebooks;
+}
+
+async function detectMapAssetsInFrameworkRoot(
+  frameworkRoot: string
+): Promise<NeoTerraMapAssetsInput | undefined> {
+  let entries;
+  try {
+    entries = await readdir(frameworkRoot, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+
+  let imagePath: string | undefined;
+  const svgPaths: string[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    if (entry.name === 'NeoTerra.png') {
+      imagePath = entry.name;
+    } else if (/^NeoTerra.*\.svg$/i.test(entry.name) && !/backup/i.test(entry.name)) {
+      svgPaths.push(entry.name);
+    }
+  }
+  svgPaths.sort();
+
+  if (!imagePath && svgPaths.length === 0) {
+    return undefined;
+  }
+  return {
+    ...(imagePath ? { imagePath } : {}),
+    ...(svgPaths.length > 0 ? { svgPaths } : {}),
+  };
+}
+
 /**
  * Load and import a NeoTerra season directory (`seasons/<seasonId>.json`, `factions.json`,
- * `locations.json`, `agendas.json`, `characters/index.json`, `characters/profiles.json`,
- * and `form-groups.json`) into a validated {@link CartridgeBundle}.
+ * `locations.json`, `districts.json`, `agendas.json`, `characters/*`, `form-groups.json`,
+ * `form-rules.json`, and sibling `../Chars/` cards + lorebooks + map layers) into a validated
+ * {@link CartridgeBundle}.
  */
 export async function importNeoTerraSeasonFromDirectory(
   dataRootDir: string,
@@ -1399,21 +2148,55 @@ export async function importNeoTerraSeasonFromDirectory(
 
   const acc = new ErrorAccumulator();
   const safeSeasonFile = `${trimmedSeasonId}.json`;
+  const frameworkRoot = path.resolve(dataRootDir, '..');
 
-  const [season, factions, locations, agendas, charIndex, charProfiles, formGroups] =
-    await Promise.all([
-      readJsonFile(path.join(dataRootDir, 'seasons', safeSeasonFile), true, acc, 'season'),
-      readJsonFile(path.join(dataRootDir, 'factions.json'), false, acc, 'factions'),
-      readJsonFile(path.join(dataRootDir, 'locations.json'), false, acc, 'locations'),
-      readJsonFile(path.join(dataRootDir, 'agendas.json'), false, acc, 'agendas'),
-      readJsonFile(path.join(dataRootDir, 'characters', 'index.json'), false, acc, 'characters.index'),
-      readJsonFile(path.join(dataRootDir, 'characters', 'profiles.json'), false, acc, 'characters.profiles'),
-      readJsonFile(path.join(dataRootDir, 'form-groups.json'), false, acc, 'formGroups'),
-    ]);
+  const [
+    season,
+    factions,
+    locations,
+    districts,
+    agendas,
+    charIndex,
+    charProfiles,
+    avatars,
+    formGroups,
+    formRules,
+    lorebooks,
+    mapAssets,
+  ] = await Promise.all([
+    readJsonFile(path.join(dataRootDir, 'seasons', safeSeasonFile), true, acc, 'season'),
+    readJsonFile(path.join(dataRootDir, 'factions.json'), false, acc, 'factions'),
+    readJsonFile(path.join(dataRootDir, 'locations.json'), false, acc, 'locations'),
+    readJsonFile(path.join(dataRootDir, 'districts.json'), false, acc, 'districts'),
+    readJsonFile(path.join(dataRootDir, 'agendas.json'), false, acc, 'agendas'),
+    readJsonFile(path.join(dataRootDir, 'characters', 'index.json'), false, acc, 'characters.index'),
+    readJsonFile(
+      path.join(dataRootDir, 'characters', 'profiles.json'),
+      false,
+      acc,
+      'characters.profiles'
+    ),
+    readJsonFile(
+      path.join(dataRootDir, 'characters', 'avatars.json'),
+      false,
+      acc,
+      'characters.avatars'
+    ),
+    readJsonFile(path.join(dataRootDir, 'form-groups.json'), false, acc, 'formGroups'),
+    readJsonFile(path.join(dataRootDir, 'form-rules.json'), false, acc, 'formRules'),
+    loadLorebooksFromCharsDir(frameworkRoot),
+    detectMapAssetsInFrameworkRoot(frameworkRoot),
+  ]);
 
   if (acc.hasErrors()) {
     return err([...acc.errors]);
   }
+
+  const characterCards = await loadCharacterCardsFromCharsDir(
+    frameworkRoot,
+    trimmedSeasonId,
+    charIndex
+  );
 
   const charactersCombined: Record<string, unknown> = {};
   if (charIndex !== undefined) {
@@ -1427,8 +2210,14 @@ export async function importNeoTerraSeasonFromDirectory(
     season,
     factions,
     locations,
+    districts,
     agendas,
     characters: charactersCombined,
+    avatars,
     formGroups,
+    formRules,
+    characterCards,
+    lorebooks,
+    mapAssets,
   });
 }
