@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import * as path from 'node:path';
 import {
   type ActiveAmbientEntry,
   type LiveNudgeEntry,
@@ -13,6 +14,10 @@ import {
 import { importMultihogCartridge } from '../cartridge/importers/multihog-importer.js';
 import { importSillyTavernCard } from '../cartridge/importers/st-card-importer.js';
 import { parseAndValidateSystemPack } from '../cartridge/system-pack-schema.js';
+import {
+  computeReachableTilesPreview,
+  previewCombatAction,
+} from '../combat/action-preview.js';
 import type { ProposedCombatAction } from '../combat/action-validator.js';
 import {
   type ControlRoomLayer,
@@ -30,7 +35,11 @@ import {
   type InjectedScriptPrompt,
   compileNarratorPrompt,
 } from '../context/prompt-compiler.js';
-import type { SectionTokenBudgets } from '../context/tokenizer-budget.js';
+import {
+  DEFAULT_TOKEN_BUDGETS,
+  type SectionTokenBudgets,
+  inspectContextBudget,
+} from '../context/tokenizer-budget.js';
 import { RefereeError, type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import { ModelGateway } from '../gateway/model-gateway.js';
@@ -55,14 +64,33 @@ import {
 import { type SystemPack, cloneGameSystemModule } from '../schema/tracker-module.js';
 import { type AuditLogFilter, createAuditLog, queryAuditLog } from '../state/audit-log.js';
 import { PATCH_SOURCES, type PatchSource } from '../state/patch.js';
+import {
+  type SessionLineage,
+  cloneSessionStack,
+  deleteSavedSession,
+  listSavedSessions,
+  loadSessionSave,
+} from '../state/persistence.js';
 import { getLinearTranscript } from '../state/swipe-tree.js';
+import type { CharacterEntity } from '../state/world-state.js';
 import {
   GameSystemWizard,
   type WizardGenerateRequest,
 } from '../wizard/game-system-wizard.js';
+import type {
+  DowntimeActivity,
+  DowntimeOptions,
+  TravelOptions,
+} from '../world/flow-hooks.js';
+import {
+  normalizeRelativeAssetPath,
+  serveBufferAsset,
+  serveSafeBinaryAsset,
+} from './asset-handler.js';
 import { SessionSseHub } from './ws-stream.js';
 
 const MAX_JSON_BODY_BYTES = 1_048_576; // 1 MB
+const MAX_BINARY_BODY_BYTES = 10_485_760; // 10 MB
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 const VALID_PATCH_SOURCES: ReadonlySet<string> = new Set(PATCH_SOURCES);
 const VALID_PAYLOAD_GROUPS: ReadonlySet<string> = new Set([
@@ -206,6 +234,19 @@ interface SessionRecordMeta {
   cartridge: CartridgeBundle | null;
   basePack: SystemPack;
   bridgeGateway?: SessionBridgeGateway;
+  lineage?: SessionLineage | null;
+  updatedAt?: string;
+}
+
+export interface ImportedCardRecord {
+  readonly id: string;
+  readonly name: string;
+  readonly description: string;
+  readonly tags: readonly string[];
+  readonly recommendedSystemPack?: string;
+  readonly portraitPath: string | null;
+  readonly portraitBytes: Uint8Array | null;
+  readonly cartridge: CartridgeBundle;
 }
 
 export interface DaemonRegistryOptions {
@@ -216,12 +257,13 @@ export interface DaemonRegistryOptions {
 
 /**
  * Central in-memory registry for daemon sessions, system packs, cartridges,
- * model gateway, Game System Wizard, SSE hub, and per-session async mutexes.
+ * imported character cards, model gateway, Game System Wizard, SSE hub, and per-session async mutexes.
  */
 export class DaemonRegistry {
   readonly sessions = new Map<string, SessionRuntime>();
   readonly systemPacks = new Map<string, SystemPack>();
   readonly cartridges = new Map<string, CartridgeBundle>();
+  readonly cards = new Map<string, ImportedCardRecord>();
   readonly gateway: ModelGateway;
   readonly wizard: GameSystemWizard;
   readonly sseHub: SessionSseHub;
@@ -262,7 +304,12 @@ export class DaemonRegistry {
    */
   registerSession(
     runtime: SessionRuntime,
-    meta?: { cartridge?: CartridgeBundle | null; basePack?: SystemPack; bridgeGateway?: SessionBridgeGateway }
+    meta?: {
+      cartridge?: CartridgeBundle | null;
+      basePack?: SystemPack;
+      bridgeGateway?: SessionBridgeGateway;
+      lineage?: SessionLineage | null;
+    }
   ): void {
     this.sessions.set(runtime.sessionId, runtime);
     this.sseHub.attachSession(runtime.sessionId, runtime.eventBus);
@@ -276,7 +323,20 @@ export class DaemonRegistry {
       cartridge: meta?.cartridge ?? null,
       basePack: cloneSystemPack(resolvedBasePack),
       ...(meta?.bridgeGateway !== undefined ? { bridgeGateway: meta.bridgeGateway } : {}),
+      ...(meta?.lineage !== undefined ? { lineage: meta.lineage } : {}),
+      updatedAt: new Date().toISOString(),
     });
+  }
+
+  /**
+   * Unregister a session from the in-memory registry and close its SSE streams.
+   */
+  unregisterSession(sessionId: string): boolean {
+    const existed = this.sessions.delete(sessionId);
+    this.sessionMeta.delete(sessionId);
+    this.sessionQueues.delete(sessionId);
+    this.sseHub.detachSession(sessionId);
+    return existed;
   }
 
   /**
@@ -423,6 +483,83 @@ export async function readJsonBody(
   });
 }
 
+type ParsedBinaryResult =
+  | { readonly ok: true; readonly buffer: Buffer }
+  | { readonly ok: false; readonly status: number; readonly errors: ValidationError[] };
+
+/**
+ * Read a raw binary HTTP request body up to `maxBytes` (default 10 MB),
+ * rejecting oversized payloads (`413`).
+ */
+export async function readBinaryBody(
+  req: IncomingMessage,
+  maxBytes = MAX_BINARY_BODY_BYTES
+): Promise<ParsedBinaryResult> {
+  return new Promise<ParsedBinaryResult>((resolve) => {
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    let settled = false;
+
+    const finish = (result: ParsedBinaryResult): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('aborted', onAborted);
+      resolve(result);
+    };
+
+    const onData = (chunk: Buffer | string): void => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      totalBytes += buf.length;
+      if (totalBytes > maxBytes) {
+        req.pause();
+        finish({
+          ok: false,
+          status: 413,
+          errors: [
+            validationError(
+              'body',
+              'PAYLOAD_TOO_LARGE',
+              `Request binary body exceeds ${maxBytes} byte limit`
+            ),
+          ],
+        });
+        return;
+      }
+      chunks.push(buf);
+    };
+
+    const onEnd = (): void => {
+      finish({ ok: true, buffer: Buffer.concat(chunks) });
+    };
+
+    const onError = (error: Error): void => {
+      finish({
+        ok: false,
+        status: 400,
+        errors: [validationError('body', 'STREAM_ERROR', error.message)],
+      });
+    };
+
+    const onAborted = (): void => {
+      finish({
+        ok: false,
+        status: 400,
+        errors: [validationError('body', 'REQUEST_ABORTED', 'Request stream was aborted')],
+      });
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAborted);
+  });
+}
+
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
   if (res.writableEnded || res.destroyed) {
     return;
@@ -432,7 +569,7 @@ function sendJson(res: ServerResponse, status: number, payload: unknown): void {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': String(Buffer.byteLength(body, 'utf8')),
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   });
   res.end(body);
@@ -923,7 +1060,7 @@ async function handleCreateSession(
   }
 
   let cartridge: CartridgeBundle | null = null;
-  const cartridgeIdRaw = getOwn(payload, 'cartridgeId');
+  const cartridgeIdRaw = getOwn(payload, 'cartridgeId') ?? getOwn(payload, 'cardId');
   if (cartridgeIdRaw !== undefined && cartridgeIdRaw !== null) {
     if (typeof cartridgeIdRaw !== 'string' || !isSafeKey(cartridgeIdRaw)) {
       sendErrors(res, 400, [
@@ -931,7 +1068,8 @@ async function handleCreateSession(
       ]);
       return;
     }
-    const found = registry.cartridges.get(cartridgeIdRaw);
+    const found =
+      registry.cartridges.get(cartridgeIdRaw) ?? registry.cards.get(cartridgeIdRaw)?.cartridge;
     if (found === undefined) {
       sendErrors(res, 404, [
         validationError('cartridgeId', 'CARTRIDGE_NOT_FOUND', `Cartridge "${cartridgeIdRaw}" was not found`),
@@ -990,6 +1128,8 @@ async function handleCreateSession(
       ]);
       return;
     }
+  } else if (registry.dataDir !== undefined) {
+    saveDir = path.join(registry.dataDir, 'sessions', sessionId);
   }
 
   const layerRaw = getOwn(payload, 'userControlRoomLayer');
@@ -1792,6 +1932,994 @@ async function handleGetChronicle(
   });
 }
 
+function findPortraitFromCartridge(
+  cartridge: CartridgeBundle
+): { readonly portraitPath: string | null; readonly portraitBytes: Uint8Array | null } {
+  const charsObj = cartridge.initialState?.entities?.characters;
+  const firstCharKey = charsObj ? Object.keys(charsObj).find(isSafeKey) : undefined;
+  const firstChar = firstCharKey
+    ? (getOwn(charsObj as Record<string, unknown>, firstCharKey) as CharacterEntity | undefined)
+    : undefined;
+  const avatarPath = firstChar?.portraitAsset ?? null;
+  if (cartridge.binaryAssets !== undefined) {
+    if (avatarPath !== null && isSafeKey(avatarPath) && Object.hasOwn(cartridge.binaryAssets, avatarPath)) {
+      const bytes = Object.getOwnPropertyDescriptor(cartridge.binaryAssets, avatarPath)?.value as
+        | Uint8Array
+        | undefined;
+      if (bytes !== undefined) {
+        return { portraitPath: avatarPath, portraitBytes: bytes };
+      }
+    }
+    for (const key of Object.keys(cartridge.binaryAssets)) {
+      if (isSafeKey(key) && key.startsWith('assets/portraits/')) {
+        const bytes = Object.getOwnPropertyDescriptor(cartridge.binaryAssets, key)?.value as
+          | Uint8Array
+          | undefined;
+        if (bytes !== undefined) {
+          return { portraitPath: key, portraitBytes: bytes };
+        }
+      }
+    }
+  }
+  return { portraitPath: avatarPath, portraitBytes: null };
+}
+
+function registerCardFromBundle(registry: DaemonRegistry, bundle: CartridgeBundle): ImportedCardRecord {
+  registry.cartridges.set(bundle.card.id, bundle);
+  const { portraitPath, portraitBytes } = findPortraitFromCartridge(bundle);
+  const record: ImportedCardRecord = {
+    id: bundle.card.id,
+    name: bundle.card.persona.name || bundle.card.title,
+    description: bundle.card.description,
+    tags: [],
+    ...(bundle.card.recommendedSystemPack !== undefined
+      ? { recommendedSystemPack: bundle.card.recommendedSystemPack }
+      : {}),
+    portraitPath,
+    portraitBytes,
+    cartridge: bundle,
+  };
+  registry.cards.set(record.id, record);
+  return record;
+}
+
+async function handleListSessions(registry: DaemonRegistry, res: ServerResponse): Promise<void> {
+  const byId = new Map<
+    string,
+    {
+      readonly sessionId: string;
+      readonly title: string;
+      readonly cartridgeId: string;
+      readonly systemPackId: string;
+      readonly turn: number;
+      readonly day: number;
+      readonly portraitPath: string | null;
+      readonly updatedAt: string;
+      readonly active: boolean;
+      readonly lineage: SessionLineage | null;
+    }
+  >();
+
+  if (registry.dataDir !== undefined) {
+    const savedRes = await listSavedSessions(path.join(registry.dataDir, 'sessions'));
+    if (savedRes.ok) {
+      for (const s of savedRes.value) {
+        byId.set(s.sessionId, {
+          ...s,
+          active: registry.sessions.has(s.sessionId),
+        });
+      }
+    }
+  }
+
+  for (const [sessionId, runtime] of registry.sessions.entries()) {
+    const state = runtime.getState();
+    const config = runtime.getConfig();
+    const meta = registry.getSessionMeta(sessionId, runtime);
+    byId.set(sessionId, {
+      sessionId,
+      title: meta.cartridge?.card.title ?? config.packName,
+      cartridgeId: meta.cartridge?.card.id ?? 'freeform',
+      systemPackId: config.packId,
+      turn: state.meta.turn,
+      day: state.clocks.day,
+      portraitPath: state.player.portraitAsset ?? (meta.cartridge ? findPortraitFromCartridge(meta.cartridge).portraitPath : null),
+      updatedAt: meta.updatedAt ?? new Date(0).toISOString(),
+      active: true,
+      lineage: meta.lineage ?? null,
+    });
+  }
+
+  const sessions = Array.from(byId.values()).sort((a, b) =>
+    compareStringsDeterministic(a.sessionId, b.sessionId)
+  );
+  sendJson(res, 200, { ok: true, sessions });
+}
+
+async function handleDeleteSession(
+  registry: DaemonRegistry,
+  sessionId: string,
+  res: ServerResponse
+): Promise<void> {
+  if (!isSafeKey(sessionId) || sessionId.includes('/') || sessionId.includes('\\') || sessionId.includes('..')) {
+    sendErrors(res, 400, [
+      validationError('sessionId', 'INVALID_SESSION_ID', `Invalid sessionId "${sessionId}"`),
+    ]);
+    return;
+  }
+
+  const hadActive = registry.unregisterSession(sessionId);
+  let deletedFromDisk = false;
+  if (registry.dataDir !== undefined) {
+    const delRes = await deleteSavedSession(path.join(registry.dataDir, 'sessions'), sessionId);
+    if (!delRes.ok) {
+      sendErrors(res, 400, delRes.error);
+      return;
+    }
+    deletedFromDisk = delRes.value.deleted;
+  }
+
+  if (!hadActive && !deletedFromDisk) {
+    sendErrors(res, 404, [
+      validationError('sessionId', 'SESSION_NOT_FOUND', `Session "${sessionId}" was not found`),
+    ]);
+    return;
+  }
+
+  sendJson(res, 200, { ok: true, deleted: true, sessionId });
+}
+
+async function handleCloneSession(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (body !== undefined && !isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Clone payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const payload = body ?? {};
+
+  const rawNewId = getOwn(payload, 'sessionId');
+  let newSessionId: string;
+  if (rawNewId !== undefined) {
+    if (typeof rawNewId !== 'string' || !isSafeKey(rawNewId) || rawNewId.trim().length === 0) {
+      sendErrors(res, 400, [
+        validationError('sessionId', 'INVALID_SESSION_ID', 'sessionId must be a safe non-empty string'),
+      ]);
+      return;
+    }
+    newSessionId = rawNewId.trim();
+    if (registry.sessions.has(newSessionId)) {
+      sendErrors(res, 409, [
+        validationError('sessionId', 'SESSION_EXISTS', `Session "${newSessionId}" already exists`),
+      ]);
+      return;
+    }
+  } else {
+    newSessionId = registry.allocateSessionId();
+  }
+
+  const nodeIdRaw = getOwn(payload, 'nodeId');
+  if (nodeIdRaw !== undefined && nodeIdRaw !== null && (typeof nodeIdRaw !== 'string' || !isSafeKey(nodeIdRaw))) {
+    sendErrors(res, 400, [validationError('nodeId', 'INVALID_TYPE', 'nodeId must be a safe string')]);
+    return;
+  }
+  const nodeId = typeof nodeIdRaw === 'string' ? nodeIdRaw : null;
+
+  const labelRaw = getOwn(payload, 'label');
+  if (labelRaw !== undefined && labelRaw !== null && typeof labelRaw !== 'string') {
+    sendErrors(res, 400, [validationError('label', 'INVALID_TYPE', 'label must be a string or null')]);
+    return;
+  }
+  const label = typeof labelRaw === 'string' ? labelRaw : null;
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const meta = registry.getSessionMeta(runtime.sessionId, runtime);
+    const sourceSaveDir = runtime.getSaveDir();
+    let targetSaveDir: string | null = null;
+    let clonedState = runtime.getState();
+    let clonedLedger: Record<string, unknown> | ReturnType<SessionRuntime['getBeatLedger']> =
+      runtime.getBeatLedger();
+    let clonedTree = runtime.getSwipeTree();
+    let lineage: SessionLineage = {
+      parentSessionId: runtime.sessionId,
+      forkedAtNodeId: nodeId ?? clonedTree.activeLeafMessageId,
+      label,
+    };
+
+    if (sourceSaveDir !== null && registry.dataDir !== undefined) {
+      targetSaveDir = path.join(registry.dataDir, 'sessions', newSessionId);
+      const cloneRes = await cloneSessionStack({
+        sourceDir: sourceSaveDir,
+        targetDir: targetSaveDir,
+        newSessionId,
+        nodeId,
+        label,
+      });
+      if (!cloneRes.ok) {
+        sendErrors(res, 400, cloneRes.error);
+        return;
+      }
+      lineage = cloneRes.value.lineage;
+      if (cloneRes.value.swipeTree !== null) {
+        clonedTree = cloneRes.value.swipeTree;
+      }
+      const loadedClone = await loadSessionSave(targetSaveDir);
+      if (loadedClone.ok && loadedClone.value.latestCheckpoint !== null) {
+        clonedState = loadedClone.value.latestCheckpoint.worldState;
+        clonedLedger = loadedClone.value.latestCheckpoint.beatLedger;
+      }
+    } else if (nodeId !== null) {
+      const targetNode = getOwn(clonedTree.nodes as Record<string, unknown>, nodeId) as
+        | { activeSwipeIndex: number; swipes: Array<{ stateCheckpointId: string }> }
+        | undefined;
+      if (!targetNode) {
+        sendErrors(res, 404, [
+          validationError('nodeId', 'NOT_FOUND', `Message node "${nodeId}" not found`),
+        ]);
+        return;
+      }
+      const activeSwipe = targetNode.swipes[targetNode.activeSwipeIndex] ?? targetNode.swipes[0];
+      const cp = activeSwipe
+        ? (getOwn(clonedTree.checkpoints as Record<string, unknown>, activeSwipe.stateCheckpointId) as
+            | { worldState: typeof clonedState; beatLedger: Record<string, unknown> }
+            | undefined)
+        : undefined;
+      if (cp) {
+        clonedState = cp.worldState;
+        clonedLedger = cp.beatLedger;
+      }
+      clonedTree = {
+        ...clonedTree,
+        activeLeafMessageId: nodeId,
+      };
+    }
+
+    const bridgeGateway = new SessionBridgeGateway(registry.gateway);
+    const clonedRuntime = new SessionRuntime({
+      sessionId: newSessionId,
+      cartridge: meta.cartridge,
+      systemPack: cloneSystemPack(meta.basePack),
+      gateway: bridgeGateway,
+      ...(targetSaveDir !== null ? { saveDir: targetSaveDir } : {}),
+    });
+    clonedRuntime.restoreSnapshot({
+      state: clonedState,
+      beatLedger: clonedLedger,
+      swipeTree: clonedTree,
+      combatState: nodeId === null ? runtime.getCombatState() : null,
+    });
+
+    registry.registerSession(clonedRuntime, {
+      cartridge: meta.cartridge,
+      basePack: meta.basePack,
+      bridgeGateway,
+      lineage,
+    });
+
+    sendJson(res, 201, {
+      ok: true,
+      sessionId: newSessionId,
+      lineage,
+      state: clonedRuntime.getState(),
+      swipeTree: clonedRuntime.getSwipeTree(),
+    });
+  });
+}
+
+async function handleGetSwipeTree(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  res: ServerResponse
+): Promise<void> {
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    sendJson(res, 200, {
+      ok: true,
+      sessionId: runtime.sessionId,
+      swipeTree: runtime.getSwipeTree(),
+    });
+  });
+}
+
+async function handleEditMessage(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  nodeId: string,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isSafeKey(nodeId)) {
+    sendErrors(res, 400, [validationError('nodeId', 'UNSAFE_KEY', 'nodeId must be a safe string')]);
+    return;
+  }
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Edit message payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const content = getOwn(body, 'content') ?? getOwn(body, 'newContent');
+  if (typeof content !== 'string') {
+    sendErrors(res, 400, [
+      validationError('content', 'INVALID_TYPE', 'content must be a string'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const editRes = await runtime.editMessage(nodeId, content);
+    if (!editRes.ok) {
+      const notFound = editRes.error.some((e) => e.code === 'NOT_FOUND');
+      sendErrors(res, notFound ? 404 : 400, editRes.error);
+      return;
+    }
+
+    registry.sseHub.emitTypedEvent(runtime.sessionId, {
+      type: 'state_patched',
+      sessionId: runtime.sessionId,
+      turn: editRes.value.state.meta.turn,
+      changedPaths: [`swipeTree.nodes.${nodeId}`],
+      source: 'user',
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      sessionId: runtime.sessionId,
+      ...editRes.value,
+    });
+  });
+}
+
+async function handleContinueSession(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (body !== undefined && !isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Continue payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const payload = body ?? {};
+  const nodeIdRaw = getOwn(payload, 'nodeId');
+  if (nodeIdRaw !== undefined && (typeof nodeIdRaw !== 'string' || !isSafeKey(nodeIdRaw))) {
+    sendErrors(res, 400, [validationError('nodeId', 'INVALID_TYPE', 'nodeId must be a safe string')]);
+    return;
+  }
+  const steeringRaw = getOwn(payload, 'directorSteering');
+  if (steeringRaw !== undefined && !isPlainObject(steeringRaw)) {
+    sendErrors(res, 400, [
+      validationError('directorSteering', 'INVALID_TYPE', 'directorSteering must be an object'),
+    ]);
+    return;
+  }
+  const streamNarrator = getOwn(payload, 'streamNarrator') === true;
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const result = await runtime.continueFromNode({
+      ...(typeof nodeIdRaw === 'string' ? { nodeId: nodeIdRaw } : {}),
+      ...(steeringRaw !== undefined
+        ? { directorSteering: steeringRaw as unknown as DirectorSteeringInput }
+        : {}),
+      streamNarrator,
+    });
+    if (!result.ok) {
+      const notFound = result.error.some((e) => e.code === 'NOT_FOUND');
+      sendErrors(res, notFound ? 404 : 400, result.error);
+      return;
+    }
+    sendJson(res, 200, { ok: true, ...result.value });
+  });
+}
+
+async function handleCardImport(
+  registry: DaemonRegistry,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const contentType = (req.headers['content-type'] ?? '').toLowerCase();
+  if (contentType.includes('image/png') || contentType.includes('application/octet-stream')) {
+    const binRes = await readBinaryBody(req, MAX_BINARY_BODY_BYTES);
+    if (!binRes.ok) {
+      sendErrors(res, binRes.status, binRes.errors);
+      return;
+    }
+    const imported = importSillyTavernCard(binRes.buffer);
+    if (!imported.ok) {
+      sendErrors(res, 400, imported.error);
+      return;
+    }
+    const record = registerCardFromBundle(registry, imported.value);
+    sendJson(res, 201, {
+      ok: true,
+      card: {
+        id: record.id,
+        name: record.name,
+        description: record.description,
+        tags: record.tags,
+        ...(record.recommendedSystemPack !== undefined
+          ? { recommendedSystemPack: record.recommendedSystemPack }
+          : {}),
+        portraitPath: record.portraitPath,
+        portraitUrl: record.portraitBytes !== null ? `/api/cards/${record.id}/portrait` : null,
+      },
+      cartridge: record.cartridge,
+    });
+    return;
+  }
+
+  const parsed = await readJsonBody(req);
+  if (!parsed.ok) {
+    sendErrors(res, parsed.status, parsed.errors);
+    return;
+  }
+  if (!isPlainObject(parsed.value)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Card import payload must be a PNG or JSON object'),
+    ]);
+    return;
+  }
+
+  const pngBase64 = getOwn(parsed.value, 'pngBase64');
+  const cardPayload = getOwn(parsed.value, 'card') ?? parsed.value;
+  let imported;
+  if (typeof pngBase64 === 'string' && pngBase64.trim().length > 0) {
+    const stripped = pngBase64.replace(/^data:[^;]+;base64,/i, '').trim();
+    const pngBuffer = Buffer.from(stripped, 'base64');
+    imported = importSillyTavernCard(pngBuffer);
+  } else {
+    imported = importSillyTavernCard(cardPayload as Record<string, unknown>);
+  }
+  if (!imported.ok) {
+    sendErrors(res, 400, imported.error);
+    return;
+  }
+
+  const record = registerCardFromBundle(registry, imported.value);
+  sendJson(res, 201, {
+    ok: true,
+    card: {
+      id: record.id,
+      name: record.name,
+      description: record.description,
+      tags: record.tags,
+      ...(record.recommendedSystemPack !== undefined
+        ? { recommendedSystemPack: record.recommendedSystemPack }
+        : {}),
+      portraitPath: record.portraitPath,
+      portraitUrl: record.portraitBytes !== null ? `/api/cards/${record.id}/portrait` : null,
+    },
+    cartridge: record.cartridge,
+  });
+}
+
+async function handleListCards(registry: DaemonRegistry, res: ServerResponse): Promise<void> {
+  const cards = Array.from(registry.cards.values())
+    .sort((a, b) => compareStringsDeterministic(a.id, b.id))
+    .map((record) => ({
+      id: record.id,
+      name: record.name,
+      description: record.description,
+      tags: record.tags,
+      ...(record.recommendedSystemPack !== undefined
+        ? { recommendedSystemPack: record.recommendedSystemPack }
+        : {}),
+      portraitPath: record.portraitPath,
+      portraitUrl: record.portraitBytes !== null ? `/api/cards/${record.id}/portrait` : null,
+    }));
+  sendJson(res, 200, { ok: true, cards });
+}
+
+async function handleGetCardPortrait(
+  registry: DaemonRegistry,
+  cardId: string,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  if (!isSafeKey(cardId)) {
+    sendErrors(res, 400, [validationError('cardId', 'UNSAFE_KEY', 'Invalid cardId')]);
+    return;
+  }
+  const card = registry.cards.get(cardId);
+  const portraitBytes =
+    card?.portraitBytes ??
+    (registry.cartridges.has(cardId)
+      ? findPortraitFromCartridge(registry.cartridges.get(cardId) as CartridgeBundle).portraitBytes
+      : null);
+
+  if (portraitBytes === null) {
+    sendErrors(res, 404, [
+      validationError('cardId', 'PORTRAIT_NOT_FOUND', `Portrait for card "${cardId}" was not found`),
+    ]);
+    return;
+  }
+
+  serveBufferAsset(req, res, portraitBytes, 'image/png');
+}
+
+async function handleAttachSessionCharacter(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Character attach payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const cardIdRaw = getOwn(body, 'cardId');
+  const charIdOverride = getOwn(body, 'characterId');
+  const locationIdOverride = getOwn(body, 'locationId');
+  const rawCharacter = getOwn(body, 'character');
+
+  let characterEntity: CharacterEntity | null = null;
+
+  if (typeof cardIdRaw === 'string' && isSafeKey(cardIdRaw)) {
+    const cartridge = registry.cards.get(cardIdRaw)?.cartridge ?? registry.cartridges.get(cardIdRaw);
+    if (!cartridge) {
+      sendErrors(res, 404, [
+        validationError('cardId', 'CARD_NOT_FOUND', `Card "${cardIdRaw}" was not found`),
+      ]);
+      return;
+    }
+    const charsObj = cartridge.initialState?.entities?.characters;
+    const firstKey = charsObj ? Object.keys(charsObj).find(isSafeKey) : undefined;
+    const baseChar = firstKey
+      ? (getOwn(charsObj as Record<string, unknown>, firstKey) as CharacterEntity | undefined)
+      : undefined;
+    const targetId =
+      typeof charIdOverride === 'string' && isSafeKey(charIdOverride)
+        ? charIdOverride
+        : (baseChar?.id ?? cartridge.card.id);
+    const currentState = runtime.getState();
+    const targetLoc =
+      typeof locationIdOverride === 'string'
+        ? locationIdOverride
+        : (baseChar?.locationId ?? currentState.scene.locationId);
+
+    const { portraitPath } = findPortraitFromCartridge(cartridge);
+    characterEntity = baseChar
+      ? {
+          ...baseChar,
+          id: targetId,
+          locationId: targetLoc,
+          ...(portraitPath !== null ? { portraitAsset: portraitPath } : {}),
+        }
+      : {
+          id: targetId,
+          name: cartridge.card.persona.name || cartridge.card.title,
+          status: 'active',
+          presentInScene: targetLoc === null || targetLoc === currentState.scene.locationId,
+          locationId: targetLoc,
+          formId: null,
+          formGroup: null,
+          sections: {
+            identity: cartridge.card.description,
+          },
+          customFields: {},
+          abilities: [],
+          goals: [],
+          agenda: '',
+          allegiance: '',
+          mood: 'neutral',
+          traits: [],
+          ...(portraitPath !== null ? { portraitAsset: portraitPath } : {}),
+        };
+  } else if (isPlainObject(rawCharacter)) {
+    const id = getOwn(rawCharacter, 'id');
+    const name = getOwn(rawCharacter, 'name');
+    if (typeof id !== 'string' || !isSafeKey(id) || typeof name !== 'string') {
+      sendErrors(res, 400, [
+        validationError('character', 'INVALID_CHARACTER', 'character must include safe id and name'),
+      ]);
+      return;
+    }
+    characterEntity = rawCharacter as unknown as CharacterEntity;
+  } else {
+    sendErrors(res, 400, [
+      validationError('body', 'REQUIRED', 'Provide either cardId or character object'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const attachRes = runtime.attachCharacterEntity(characterEntity as CharacterEntity);
+    if (!attachRes.ok) {
+      sendErrors(res, 400, attachRes.error);
+      return;
+    }
+
+    registry.sseHub.emitTypedEvent(runtime.sessionId, {
+      type: 'state_patched',
+      sessionId: runtime.sessionId,
+      turn: attachRes.value.meta.turn,
+      changedPaths: [`entities.characters.${(characterEntity as CharacterEntity).id}`],
+      source: 'user',
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      characterId: (characterEntity as CharacterEntity).id,
+      state: attachRes.value,
+    });
+  });
+}
+
+async function handlePatchPlayer(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Player binding payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const canonCharacterId = getOwn(body, 'canonCharacterId');
+  const cardId = getOwn(body, 'cardId');
+  let name = getOwn(body, 'name');
+  let avatarAssetPath = getOwn(body, 'avatarAssetPath');
+  let sections = getOwn(body, 'sections');
+
+  if (canonCharacterId !== undefined && (typeof canonCharacterId !== 'string' || !isSafeKey(canonCharacterId))) {
+    sendErrors(res, 400, [
+      validationError('canonCharacterId', 'INVALID_TYPE', 'canonCharacterId must be a safe string'),
+    ]);
+    return;
+  }
+
+  if (typeof cardId === 'string' && isSafeKey(cardId)) {
+    const card = registry.cards.get(cardId);
+    const cartridge = card?.cartridge ?? registry.cartridges.get(cardId);
+    if (!cartridge) {
+      sendErrors(res, 404, [
+        validationError('cardId', 'CARD_NOT_FOUND', `Card "${cardId}" was not found`),
+      ]);
+      return;
+    }
+    if (name === undefined) {
+      name = cartridge.card.persona.name || cartridge.card.title;
+    }
+    if (avatarAssetPath === undefined) {
+      avatarAssetPath = card?.portraitPath ?? findPortraitFromCartridge(cartridge).portraitPath ?? `/api/cards/${cardId}/portrait`;
+    }
+    if (sections === undefined && cartridge.card.description.length > 0) {
+      sections = { identity: cartridge.card.description };
+    }
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const bindRes = runtime.updatePlayerBinding({
+      ...(typeof canonCharacterId === 'string' ? { canonCharacterId } : {}),
+      ...(typeof name === 'string' ? { name } : {}),
+      ...(avatarAssetPath === null || typeof avatarAssetPath === 'string'
+        ? { avatarAssetPath }
+        : {}),
+      ...(isPlainObject(sections) ? { sections: sections as Record<string, string> } : {}),
+    });
+    if (!bindRes.ok) {
+      sendErrors(res, 400, bindRes.error);
+      return;
+    }
+
+    registry.sseHub.emitTypedEvent(runtime.sessionId, {
+      type: 'state_patched',
+      sessionId: runtime.sessionId,
+      turn: bindRes.value.meta.turn,
+      changedPaths: ['player'],
+      source: 'user',
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      player: bindRes.value.player,
+      state: bindRes.value,
+    });
+  });
+}
+
+async function handleServeCartridgeAsset(
+  registry: DaemonRegistry,
+  cartridgeId: string,
+  relPath: string,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  if (!isSafeKey(cartridgeId)) {
+    sendErrors(res, 400, [validationError('cartridgeId', 'UNSAFE_KEY', 'Invalid cartridgeId')]);
+    return;
+  }
+  const normRes = normalizeRelativeAssetPath(relPath);
+  if (!normRes.ok) {
+    sendErrors(res, normRes.error.status, normRes.error.errors);
+    return;
+  }
+  const cartridge = registry.cartridges.get(cartridgeId) ?? registry.cards.get(cartridgeId)?.cartridge;
+  if (!cartridge) {
+    sendErrors(res, 404, [
+      validationError('cartridgeId', 'NOT_FOUND', `Cartridge "${cartridgeId}" was not found`),
+    ]);
+    return;
+  }
+
+  const normalizedRel = normRes.value.normalizedRelPath;
+  let inMemoryBuffer: Uint8Array | undefined;
+  if (cartridge.binaryAssets !== undefined) {
+    const candidates = [normalizedRel, `assets/${normalizedRel}`];
+    for (const candidate of candidates) {
+      if (isSafeKey(candidate) && Object.hasOwn(cartridge.binaryAssets, candidate)) {
+        inMemoryBuffer = Object.getOwnPropertyDescriptor(cartridge.binaryAssets, candidate)?.value as
+          | Uint8Array
+          | undefined;
+        if (inMemoryBuffer !== undefined) {
+          break;
+        }
+      }
+    }
+  }
+
+  const rootDir =
+    registry.dataDir !== undefined
+      ? path.join(registry.dataDir, 'cartridges', cartridgeId, 'assets')
+      : undefined;
+
+  const serveRes = await serveSafeBinaryAsset(req, res, {
+    ...(rootDir !== undefined ? { rootDir } : {}),
+    relPath,
+    ...(inMemoryBuffer !== undefined ? { inMemoryBuffer } : {}),
+  });
+  if (!serveRes.ok) {
+    sendErrors(res, serveRes.error.status, serveRes.error.errors);
+  }
+}
+
+async function handleServeSessionAsset(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  relPath: string,
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  const normRes = normalizeRelativeAssetPath(relPath);
+  if (!normRes.ok) {
+    sendErrors(res, normRes.error.status, normRes.error.errors);
+    return;
+  }
+
+  const meta = registry.getSessionMeta(runtime.sessionId, runtime);
+  const normalizedRel = normRes.value.normalizedRelPath;
+  let inMemoryBuffer: Uint8Array | undefined;
+  if (meta.cartridge?.binaryAssets !== undefined) {
+    const candidates = [normalizedRel, `assets/${normalizedRel}`];
+    for (const candidate of candidates) {
+      if (isSafeKey(candidate) && Object.hasOwn(meta.cartridge.binaryAssets, candidate)) {
+        inMemoryBuffer = Object.getOwnPropertyDescriptor(meta.cartridge.binaryAssets, candidate)
+          ?.value as Uint8Array | undefined;
+        if (inMemoryBuffer !== undefined) {
+          break;
+        }
+      }
+    }
+  }
+
+  const saveDir = runtime.getSaveDir();
+  const rootDir = saveDir !== null ? path.join(saveDir, 'assets') : undefined;
+
+  const serveRes = await serveSafeBinaryAsset(req, res, {
+    ...(rootDir !== undefined ? { rootDir } : {}),
+    relPath,
+    ...(inMemoryBuffer !== undefined ? { inMemoryBuffer } : {}),
+  });
+  if (!serveRes.ok) {
+    sendErrors(res, serveRes.error.status, serveRes.error.errors);
+  }
+}
+
+async function handleCombatPreview(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (body !== undefined && !isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Combat preview payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const payload = body ?? {};
+  const actionRaw = getOwn(payload, 'action');
+  const actorIdRaw = getOwn(payload, 'actorId');
+  const includeReachableTiles = getOwn(payload, 'includeReachableTiles') !== false;
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const combatState = runtime.getCombatState();
+    if (combatState === null || !combatState.active) {
+      sendErrors(res, 400, [
+        validationError('combatState', 'NO_ACTIVE_COMBAT', 'Session has no active combat encounter'),
+      ]);
+      return;
+    }
+
+    const action = isPlainObject(actionRaw) ? (actionRaw as unknown as ProposedCombatAction) : undefined;
+    const activeInitiativeId = combatState.initiativeOrder[combatState.turnIndex];
+    const resolvedActorId =
+      typeof actorIdRaw === 'string' && isSafeKey(actorIdRaw)
+        ? actorIdRaw
+        : (activeInitiativeId ?? 'player');
+
+    const actionPreview =
+      action !== undefined
+        ? previewCombatAction(combatState, resolvedActorId, action, runtime.getSkillRegistry())
+        : null;
+
+    const reachableTiles = includeReachableTiles
+      ? computeReachableTilesPreview(combatState, resolvedActorId)
+      : null;
+
+    sendJson(res, 200, {
+      ok: true,
+      actorId: resolvedActorId,
+      actionPreview,
+      reachableTiles,
+    });
+  });
+}
+
+async function handleTravel(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Travel payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const targetLocationId = getOwn(body, 'targetLocationId');
+  if (typeof targetLocationId !== 'string' || !isSafeKey(targetLocationId)) {
+    sendErrors(res, 400, [
+      validationError('targetLocationId', 'REQUIRED', 'targetLocationId must be a safe string'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const travelRes = runtime.travel(targetLocationId, body as unknown as TravelOptions);
+    if (!travelRes.ok) {
+      sendErrors(res, 400, travelRes.error);
+      return;
+    }
+
+    registry.sseHub.emitTypedEvent(runtime.sessionId, {
+      type: 'state_patched',
+      sessionId: runtime.sessionId,
+      turn: travelRes.value.state.meta.turn,
+      changedPaths: ['scene.locationId', 'player.locationId', 'clock'],
+      source: 'engine',
+    });
+
+    sendJson(res, 200, { ok: true, ...travelRes.value });
+  });
+}
+
+async function handleDowntime(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Downtime payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const activity = getOwn(body, 'activity');
+  if (typeof activity !== 'string' || activity.trim().length === 0) {
+    sendErrors(res, 400, [
+      validationError('activity', 'REQUIRED', 'activity must be a non-empty string'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const downtimeRes = runtime.downtime(
+      activity as DowntimeActivity,
+      body as unknown as DowntimeOptions
+    );
+    if (!downtimeRes.ok) {
+      sendErrors(res, 400, downtimeRes.error);
+      return;
+    }
+
+    registry.sseHub.emitTypedEvent(runtime.sessionId, {
+      type: 'state_patched',
+      sessionId: runtime.sessionId,
+      turn: downtimeRes.value.state.meta.turn,
+      changedPaths: ['clock', 'player'],
+      source: 'engine',
+    });
+
+    sendJson(res, 200, { ok: true, ...downtimeRes.value });
+  });
+}
+
+async function handleGetContextBudget(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  res: ServerResponse
+): Promise<void> {
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const meta = registry.getSessionMeta(runtime.sessionId, runtime);
+    const state = runtime.getState();
+    const config = runtime.getConfig();
+    const recentTranscript = getLinearTranscript(runtime.getSwipeTree(), 30).map((m) => ({
+      role: m.role as ChatMessage['role'],
+      content: m.content,
+    }));
+
+    const cardPersona: CardPersonaInput =
+      meta.cartridge !== null
+        ? {
+            name: meta.cartridge.card.persona.name,
+            description: meta.cartridge.card.persona.description,
+            ...(meta.cartridge.card.persona.scenario !== undefined
+              ? { scenario: meta.cartridge.card.persona.scenario }
+              : {}),
+            ...(meta.cartridge.card.persona.systemPrompt !== undefined
+              ? { systemPrompt: meta.cartridge.card.persona.systemPrompt }
+              : {}),
+          }
+        : {
+            name: config.packName,
+            description: meta.basePack.description,
+          };
+
+    const compiledPrompt = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona,
+      loreContents: meta.cartridge?.loreFiles,
+      recentTranscript,
+      latestInput: '',
+      formDefinitions: meta.cartridge?.initialEntities?.forms,
+    });
+
+    const sectionInputs: Record<string, string> = {};
+    for (const [k, v] of Object.entries(compiledPrompt.renderedSections)) {
+      if (isSafeKey(k) && typeof v === 'string') {
+        setOwn(sectionInputs, k, v);
+      }
+    }
+
+    const budgetReport = inspectContextBudget(sectionInputs, {
+      ...DEFAULT_TOKEN_BUDGETS,
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      sessionId: runtime.sessionId,
+      budgetReport,
+      compiledPrompt,
+    });
+  });
+}
+
 /**
  * Create a Node `http.Server` request handler bound to `registry`.
  */
@@ -1804,17 +2932,41 @@ export function createDaemonRequestHandler(
       if (method === 'OPTIONS') {
         res.writeHead(204, {
           'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
           'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         });
         res.end();
         return;
       }
 
+      const rawUrlPath = (req.url ?? '/').split('?')[0] ?? '/';
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       const rawPath = url.pathname;
       const pathname = rawPath.length > 1 && rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
       const segments = pathname.split('/').filter((s) => s.length > 0);
+
+      // Wildcard binary asset routes (matched against rawUrlPath before URL dot-segment normalization)
+      if (method === 'GET') {
+        const cartridgeAssetMatch = /^\/api\/cartridges\/([^/]+)\/assets\/(.*)$/.exec(rawUrlPath);
+        if (cartridgeAssetMatch !== null) {
+          const cartridgeId = decodeURIComponent(cartridgeAssetMatch[1] ?? '');
+          const relPath = cartridgeAssetMatch[2] ?? '';
+          await handleServeCartridgeAsset(registry, cartridgeId, relPath, req, res);
+          return;
+        }
+
+        const sessionAssetMatch = /^\/api\/sessions\/([^/]+)\/assets\/(.*)$/.exec(rawUrlPath);
+        if (sessionAssetMatch !== null) {
+          const rawSessionId = decodeURIComponent(sessionAssetMatch[1] ?? '');
+          const relPath = sessionAssetMatch[2] ?? '';
+          const runtime = getSessionOrNotFound(registry, rawSessionId, res);
+          if (runtime === null) {
+            return;
+          }
+          await handleServeSessionAsset(registry, runtime, relPath, req, res);
+          return;
+        }
+      }
 
       // GET /api/health
       if (method === 'GET' && pathname === '/api/health') {
@@ -1928,6 +3080,37 @@ export function createDaemonRequestHandler(
         return;
       }
 
+      // GET /api/cards
+      if (method === 'GET' && pathname === '/api/cards') {
+        await handleListCards(registry, res);
+        return;
+      }
+
+      // POST /api/cards/import
+      if (method === 'POST' && pathname === '/api/cards/import') {
+        await handleCardImport(registry, req, res);
+        return;
+      }
+
+      // GET /api/cards/:id/portrait
+      if (
+        method === 'GET' &&
+        segments.length === 4 &&
+        segments[0] === 'api' &&
+        segments[1] === 'cards' &&
+        segments[3] === 'portrait'
+      ) {
+        const cardId = segments[2] as string;
+        await handleGetCardPortrait(registry, cardId, req, res);
+        return;
+      }
+
+      // GET /api/sessions
+      if (method === 'GET' && pathname === '/api/sessions') {
+        await handleListSessions(registry, res);
+        return;
+      }
+
       // POST /api/sessions
       if (method === 'POST' && pathname === '/api/sessions') {
         const parsed = await readJsonBody(req);
@@ -1948,6 +3131,43 @@ export function createDaemonRequestHandler(
         }
         await handleWizardGenerate(registry, parsed.value, res);
         return;
+      }
+
+      // DELETE /api/sessions/:id
+      if (method === 'DELETE' && segments.length === 3 && segments[0] === 'api' && segments[1] === 'sessions') {
+        const rawSessionId = segments[2] as string;
+        await handleDeleteSession(registry, rawSessionId, res);
+        return;
+      }
+
+      // Session-scoped nested routes: /api/sessions/:id/messages/:nodeId & /api/sessions/:id/combat/preview
+      if (segments.length === 5 && segments[0] === 'api' && segments[1] === 'sessions') {
+        const rawSessionId = segments[2] as string;
+        const runtime = getSessionOrNotFound(registry, rawSessionId, res);
+        if (runtime === null) {
+          return;
+        }
+
+        if (method === 'PATCH' && segments[3] === 'messages') {
+          const nodeId = segments[4] as string;
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleEditMessage(registry, runtime, nodeId, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && segments[3] === 'combat' && segments[4] === 'preview') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleCombatPreview(registry, runtime, parsed.value, res);
+          return;
+        }
       }
 
       // Session-scoped routes: /api/sessions/:id/:subroute
@@ -2037,6 +3257,76 @@ export function createDaemonRequestHandler(
         if (method === 'GET' && subroute === 'stream') {
           registry.sseHub.attachSession(runtime.sessionId, runtime.eventBus);
           registry.sseHub.addClient(runtime.sessionId, res, req);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'clone') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleCloneSession(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'GET' && subroute === 'swipe-tree') {
+          await handleGetSwipeTree(registry, runtime, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'continue') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleContinueSession(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'characters') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleAttachSessionCharacter(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'PATCH' && subroute === 'player') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handlePatchPlayer(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'travel') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleTravel(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'downtime') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleDowntime(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'GET' && subroute === 'context-budget') {
+          await handleGetContextBudget(registry, runtime, res);
           return;
         }
       }

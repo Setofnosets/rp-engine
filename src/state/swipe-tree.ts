@@ -808,6 +808,162 @@ export function activateSwipeVariant(
 }
 
 /**
+ * Edit the text of `nodeId` by appending a new active swipe variant bound to the node's
+ * checkpoint and rewinding `activeLeafMessageId` to `nodeId` so subsequent turns fork cleanly.
+ */
+export function editMessageNode(
+  tree: SwipeTreeState,
+  nodeId: string,
+  newContent: string
+): Result<
+  { nextTree: SwipeTreeState; restoredCheckpoint: StateCheckpoint; swipeIndex: number },
+  ValidationError[]
+> {
+  if (typeof nodeId !== 'string' || !isSafeKey(nodeId)) {
+    return err([
+      validationError('nodeId', 'UNSAFE_KEY', 'nodeId must be a safe non-empty string'),
+    ]);
+  }
+  if (typeof newContent !== 'string') {
+    return err([validationError('newContent', 'INVALID_TYPE', 'newContent must be a string')]);
+  }
+
+  const node = getOwn(tree.nodes, nodeId);
+  if (!node) {
+    return err([validationError('nodeId', 'NOT_FOUND', `Message node not found: ${nodeId}`)]);
+  }
+
+  const activeSwipe = node.swipes[node.activeSwipeIndex] ?? node.swipes[0];
+  if (!activeSwipe) {
+    return err([
+      validationError('swipes', 'MISSING_SWIPE', `Node "${nodeId}" has no swipe variants`),
+    ]);
+  }
+
+  const checkpoint = getOwn(tree.checkpoints, activeSwipe.stateCheckpointId);
+  if (!checkpoint) {
+    return err([
+      validationError(
+        'stateCheckpointId',
+        'MISSING_CHECKPOINT',
+        `Checkpoint not found for node "${nodeId}": ${activeSwipe.stateCheckpointId}`
+      ),
+    ]);
+  }
+
+  const nextCheckpointsRes = cloneCheckpointsMap(tree.checkpoints);
+  if (!nextCheckpointsRes.ok) {
+    return nextCheckpointsRes;
+  }
+  const clonedCpRes = cloneStateCheckpoint(checkpoint);
+  if (!clonedCpRes.ok) {
+    return clonedCpRes;
+  }
+
+  const nextNodes = cloneNodesMap(tree.nodes);
+  const clonedTarget = getOwn(nextNodes, nodeId) as TranscriptMessageNode;
+  const newSwipeIndex = clonedTarget.swipes.length;
+  const maxSeq = clonedTarget.swipes.reduce((max, s) => Math.max(max, s.createdAtSeq), 0);
+
+  clonedTarget.swipes.push({
+    swipeIndex: newSwipeIndex,
+    content: newContent,
+    stateCheckpointId: activeSwipe.stateCheckpointId,
+    createdAtSeq: maxSeq + 1,
+  });
+  clonedTarget.activeSwipeIndex = newSwipeIndex;
+
+  return ok({
+    nextTree: {
+      nodes: nextNodes,
+      activeLeafMessageId: nodeId,
+      checkpoints: nextCheckpointsRes.value,
+    },
+    restoredCheckpoint: clonedCpRes.value,
+    swipeIndex: newSwipeIndex,
+  });
+}
+
+/**
+ * Resolve and rewind the active leaf to `nodeId` (or the current `activeLeafMessageId`)
+ * so the runtime can continue assistant narration from that exact checkpoint.
+ */
+export function prepareContinueFromNode(
+  tree: SwipeTreeState,
+  nodeId?: string
+): Result<
+  {
+    nextTree: SwipeTreeState;
+    targetNodeId: string;
+    role: TranscriptMessageNode['role'];
+    content: string;
+    restoredCheckpoint: StateCheckpoint;
+  },
+  ValidationError[]
+> {
+  const targetNodeId = nodeId ?? tree.activeLeafMessageId;
+  if (targetNodeId === null || typeof targetNodeId !== 'string' || !isSafeKey(targetNodeId)) {
+    return err([
+      validationError(
+        'nodeId',
+        targetNodeId === null ? 'NO_ACTIVE_LEAF' : 'UNSAFE_KEY',
+        targetNodeId === null
+          ? 'Cannot continue from an empty swipe tree'
+          : 'nodeId must be a safe non-empty string'
+      ),
+    ]);
+  }
+
+  const node = getOwn(tree.nodes, targetNodeId);
+  if (!node) {
+    return err([
+      validationError('nodeId', 'NOT_FOUND', `Message node not found: ${targetNodeId}`),
+    ]);
+  }
+
+  const activeSwipe = node.swipes[node.activeSwipeIndex] ?? node.swipes[0];
+  if (!activeSwipe) {
+    return err([
+      validationError('swipes', 'MISSING_SWIPE', `Node "${targetNodeId}" has no swipe variants`),
+    ]);
+  }
+
+  const checkpoint = getOwn(tree.checkpoints, activeSwipe.stateCheckpointId);
+  if (!checkpoint) {
+    return err([
+      validationError(
+        'stateCheckpointId',
+        'MISSING_CHECKPOINT',
+        `Checkpoint not found for node "${targetNodeId}": ${activeSwipe.stateCheckpointId}`
+      ),
+    ]);
+  }
+
+  const nextCheckpointsRes = cloneCheckpointsMap(tree.checkpoints);
+  if (!nextCheckpointsRes.ok) {
+    return nextCheckpointsRes;
+  }
+  const clonedCpRes = cloneStateCheckpoint(checkpoint);
+  if (!clonedCpRes.ok) {
+    return clonedCpRes;
+  }
+
+  const nextNodes = cloneNodesMap(tree.nodes);
+
+  return ok({
+    nextTree: {
+      nodes: nextNodes,
+      activeLeafMessageId: targetNodeId,
+      checkpoints: nextCheckpointsRes.value,
+    },
+    targetNodeId,
+    role: node.role,
+    content: activeSwipe.content,
+    restoredCheckpoint: clonedCpRes.value,
+  });
+}
+
+/**
  * Walk from root to `activeLeafMessageId` via `parentMessageId` links and return
  * the active linear transcript, optionally truncated to the most recent `limit` messages.
  */

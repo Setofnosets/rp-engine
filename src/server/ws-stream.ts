@@ -2,6 +2,66 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { SessionEventBus, SessionRuntimeEvent } from '../runtime/event-bus.js';
 
 /**
+ * Strongly-typed GUI-ready SSE event frames emitted by {@link SessionSseHub}.
+ */
+export type GuiSseEvent =
+  | {
+      readonly type: 'narrator_chunk';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly text: string;
+      readonly done: boolean;
+    }
+  | {
+      readonly type: 'agent_activity';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly agent: string;
+      readonly status: 'started' | 'completed' | 'skipped';
+      readonly detail?: string;
+    }
+  | {
+      readonly type: 'state_patched';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly changedPaths: readonly string[];
+      readonly source?: string;
+    }
+  | {
+      readonly type: 'combat_updated';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly active: boolean;
+      readonly round?: number;
+    }
+  | {
+      readonly type: 'form_switched';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly characterId: string;
+      readonly formId: string;
+    }
+  | {
+      readonly type: 'digest_published';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly editionId: string;
+      readonly day: number;
+      readonly masthead: string;
+      readonly headlineCount: number;
+    }
+  | {
+      readonly type: 'auditor_notice';
+      readonly sessionId: string;
+      readonly turn: number;
+      readonly findingsCount: number;
+      readonly autoCorrectedCount: number;
+      readonly skippedLlmByCadence: boolean;
+    };
+
+export type GuiSseEventType = GuiSseEvent['type'];
+
+/**
  * Manages Server-Sent Events (`text/event-stream`) connections per session ID,
  * subscribing to each session's {@link SessionEventBus} and broadcasting JSON event frames.
  */
@@ -21,8 +81,71 @@ export class SessionSseHub {
 
     const unsubscribe = eventBus.on((event) => {
       this.broadcast(sessionId, event);
+      this.forwardTypedGuiFrames(sessionId, event);
     });
     this.busUnsubscribers.set(sessionId, unsubscribe);
+  }
+
+  private forwardTypedGuiFrames(sessionId: string, event: SessionRuntimeEvent): void {
+    switch (event.type) {
+      case 'intent_parsed':
+        this.emitTypedEvent(sessionId, {
+          type: 'agent_activity',
+          sessionId,
+          turn: event.turn,
+          agent: 'intent_parser',
+          status: 'completed',
+          detail: event.intentKind,
+        });
+        break;
+      case 'action_resolved':
+        if (event.changedPaths.length > 0) {
+          this.emitTypedEvent(sessionId, {
+            type: 'state_patched',
+            sessionId,
+            turn: event.turn,
+            changedPaths: event.changedPaths,
+            source: 'engine',
+          });
+        }
+        if (event.combatActive) {
+          this.emitTypedEvent(sessionId, {
+            type: 'combat_updated',
+            sessionId,
+            turn: event.turn,
+            active: true,
+          });
+        }
+        break;
+      case 'tracker_completed':
+        this.emitTypedEvent(sessionId, {
+          type: 'agent_activity',
+          sessionId,
+          turn: event.turn,
+          agent: 'dynamic_state_tracker',
+          status: event.skippedByCadence ? 'skipped' : 'completed',
+        });
+        break;
+      case 'auditor_completed':
+        this.emitTypedEvent(sessionId, {
+          type: 'auditor_notice',
+          sessionId,
+          turn: event.turn,
+          findingsCount: event.findingsCount,
+          autoCorrectedCount: event.autoCorrectedCount,
+          skippedLlmByCadence: event.skippedLlmByCadence,
+        });
+        break;
+      default:
+        break;
+    }
+  }
+
+  /**
+   * Emit a strongly-typed {@link GuiSseEvent} frame to all active SSE clients for `sessionId`.
+   */
+  emitTypedEvent(sessionId: string, event: GuiSseEvent): void {
+    this.broadcast(sessionId, event);
   }
 
   /**
@@ -110,10 +233,10 @@ export class SessionSseHub {
   }
 
   /**
-   * Broadcast a {@link SessionRuntimeEvent} as an SSE `event: <type>\ndata: <json>\n\n` frame
-   * to all active clients subscribed to `sessionId`.
+   * Broadcast a {@link SessionRuntimeEvent} or {@link GuiSseEvent} as an SSE
+   * `event: <type>\ndata: <json>\n\n` frame to all active clients subscribed to `sessionId`.
    */
-  broadcast(sessionId: string, event: SessionRuntimeEvent): void {
+  broadcast(sessionId: string, event: SessionRuntimeEvent | GuiSseEvent): void {
     const clients = this.clientsBySession.get(sessionId);
     if (clients === undefined || clients.size === 0) {
       return;

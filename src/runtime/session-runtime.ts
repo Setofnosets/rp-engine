@@ -108,14 +108,18 @@ import {
   appendMessageTurn,
   computeStateHash,
   createSwipeTree,
+  editMessageNode,
   getLinearTranscript,
+  prepareContinueFromNode,
   recordSwipeVariant,
   rollbackForSwipe,
   validateSwipeTreeState,
 } from '../state/swipe-tree.js';
 import {
+  type CharacterEntity,
   type CreateWorldStateOptions,
   type WorldState,
+  bindPlayerToCanonCharacter,
   cloneWorldState,
   createWorldState,
 } from '../state/world-state.js';
@@ -741,6 +745,95 @@ export class SessionRuntime {
 
   getAuditLog(): readonly AuditEntry[] {
     return [...this.auditLog];
+  }
+
+  getSaveDir(): string | null {
+    return this.saveDir;
+  }
+
+  getSkillRegistry(): SkillRegistry {
+    return this.skillRegistry;
+  }
+
+  /**
+   * Restore internal runtime snapshots (used when hydrating a cloned or loaded session).
+   */
+  restoreSnapshot(snapshot: {
+    readonly state: WorldState;
+    readonly beatLedger?: Record<string, unknown> | BeatLedgerState;
+    readonly swipeTree?: SwipeTreeState | null;
+    readonly combatState?: CombatState | null;
+  }): void {
+    this.state = cloneWorldState(snapshot.state);
+    if (snapshot.beatLedger !== undefined) {
+      this.beatLedger = deserializeBeatLedger(snapshot.beatLedger as Record<string, unknown>, this.beats);
+    }
+    if (snapshot.swipeTree !== undefined && snapshot.swipeTree !== null) {
+      const validated = validateSwipeTreeState(snapshot.swipeTree);
+      if (validated.ok) {
+        this.swipeTree = validated.value;
+      }
+    }
+    if (snapshot.combatState !== undefined) {
+      this.combatState = snapshot.combatState ? cloneCombatStateSnapshot(snapshot.combatState) : null;
+    }
+  }
+
+  /**
+   * Attach or update a character entity in the active session's world state and
+   * add it to `scene.presentCharacterIds` if located in the current scene.
+   */
+  attachCharacterEntity(character: CharacterEntity): Result<WorldState, ValidationError[]> {
+    if (!isSafeKey(character.id)) {
+      return err([
+        validationError('character.id', 'UNSAFE_KEY', `Unsafe character id "${character.id}"`),
+      ]);
+    }
+    const nextState = cloneWorldState(this.state);
+    setOwn(nextState.entities.characters, character.id, character);
+    if (
+      (character.locationId === null || character.locationId === nextState.scene.locationId) &&
+      !nextState.scene.presentCharacterIds.includes(character.id)
+    ) {
+      nextState.scene.presentCharacterIds.push(character.id);
+    }
+    this.state = nextState;
+    return ok(cloneWorldState(this.state));
+  }
+
+  /**
+   * Bind the player to a canon character or custom persona overlay.
+   */
+  updatePlayerBinding(options: {
+    readonly canonCharacterId?: string;
+    readonly name?: string;
+    readonly avatarAssetPath?: string | null;
+    readonly sections?: Record<string, string>;
+  }): Result<WorldState, ValidationError[]> {
+    let nextState = cloneWorldState(this.state);
+    if (options.canonCharacterId !== undefined) {
+      try {
+        nextState = bindPlayerToCanonCharacter(nextState, options.canonCharacterId, this.formIndex);
+      } catch (caught) {
+        const msg = caught instanceof Error ? caught.message : String(caught);
+        return err([validationError('canonCharacterId', 'BIND_FAILED', msg)]);
+      }
+    }
+    if (options.name !== undefined && options.name.trim().length > 0) {
+      nextState.player.name = options.name.trim();
+    }
+    if (options.avatarAssetPath !== undefined) {
+      nextState.player.portraitAsset = options.avatarAssetPath;
+    }
+    if (options.sections !== undefined) {
+      for (const [k, v] of Object.entries(options.sections)) {
+        if (isSafeKey(k) && typeof v === 'string') {
+          setOwn(nextState.player.sections, k, v);
+        }
+      }
+    }
+    this.state = nextState;
+    return ok(cloneWorldState(this.state));
   }
 
   /**
@@ -1851,6 +1944,217 @@ export class SessionRuntime {
   }
 
   /**
+   * Edit a message node's content, recording a new swipe variant at `nodeId` and rewinding
+   * the active leaf to `nodeId` while restoring its checkpointed state.
+   */
+  async editMessage(
+    nodeId: string,
+    newContent: string
+  ): Promise<
+    Result<
+      {
+        readonly nodeId: string;
+        readonly swipeIndex: number;
+        readonly content: string;
+        readonly state: WorldState;
+        readonly swipeTree: SwipeTreeState;
+      },
+      ValidationError[]
+    >
+  > {
+    const editRes = editMessageNode(this.swipeTree, nodeId, newContent);
+    if (!editRes.ok) {
+      return err(editRes.error);
+    }
+
+    const { nextTree, restoredCheckpoint, swipeIndex } = editRes.value;
+    const restoredState = cloneWorldState(restoredCheckpoint.worldState);
+    restoredState.meta.rngState = cloneRngState(restoredCheckpoint.rngState);
+    const restoredLedger = deserializeBeatLedger(restoredCheckpoint.beatLedger, this.beats);
+
+    if (this.saveDir !== null) {
+      const saveRes = await saveSwipeTreeAtomic(this.saveDir, nextTree);
+      if (!saveRes.ok) {
+        return err(saveRes.error);
+      }
+    }
+
+    this.state = restoredState;
+    this.beatLedger = restoredLedger;
+    this.swipeTree = nextTree;
+
+    this.eventBus.emit({
+      type: 'swipe_switched',
+      assistantMessageId: nodeId,
+      swipeIndex,
+      restoredTurn: restoredState.meta.turn,
+    });
+
+    return ok({
+      nodeId,
+      swipeIndex,
+      content: newContent,
+      state: cloneWorldState(this.state),
+      swipeTree: this.getSwipeTree(),
+    });
+  }
+
+  /**
+   * Continue assistant narration from `options.nodeId` (or the current `activeLeafMessageId`),
+   * restoring that node's checkpoint and appending a new assistant message node.
+   */
+  async continueFromNode(
+    options: RegenerateTurnOptions & { readonly nodeId?: string } = {}
+  ): Promise<Result<TurnExecutionResult, ValidationError[]>> {
+    const prepRes = prepareContinueFromNode(this.swipeTree, options.nodeId);
+    if (!prepRes.ok) {
+      return err(prepRes.error);
+    }
+
+    const { nextTree: rewoundTree, targetNodeId, role, content, restoredCheckpoint } = prepRes.value;
+    let workingState = cloneWorldState(restoredCheckpoint.worldState);
+    workingState.meta.rngState = cloneRngState(restoredCheckpoint.rngState);
+    let workingLedger = deserializeBeatLedger(restoredCheckpoint.beatLedger, this.beats);
+    let workingAuditSeq = this.auditSeq;
+
+    const turnAuditEntries: AuditEntry[] = [];
+    const turnChangedPaths = new Set<string>();
+    const turnWarnings: ValidationError[] = [];
+    const turnEventRecords: EventLogRecord[] = [];
+    const turnPendingConfirmations: PatchOperation[] = [];
+
+    if (options.directorSteering !== undefined) {
+      const steerRes = applyDirectorSteering({
+        state: workingState,
+        ledger: workingLedger,
+        steering: options.directorSteering,
+        beats: this.beats,
+        reducerOptions: {
+          compiledSchema: this.fullCompiledSchema,
+          formIndex: this.formIndex,
+          auditSeqStart: workingAuditSeq,
+        },
+      });
+      if (!steerRes.ok) {
+        return err(steerRes.error);
+      }
+      workingState = steerRes.value.nextState;
+      workingLedger = steerRes.value.nextLedger;
+      turnAuditEntries.push(...steerRes.value.auditEntries);
+      workingAuditSeq += steerRes.value.auditEntries.length;
+      for (const p of steerRes.value.changedPaths) {
+        turnChangedPaths.add(p);
+      }
+    }
+
+    const assistantMessageId = this.allocateMessageId(workingState.meta.turn, 'assistant');
+    const recentTranscript = resolveTranscriptEndingAt(rewoundTree, targetNodeId, 30);
+    const latestInput = role === 'user' ? content : '';
+
+    const turnMeta: TurnMetaSnapshot = {
+      liveNudges: [],
+      activeAmbient: [],
+      injectedPrompts: [],
+      triggeredEnding: null,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+    };
+
+    const narrationPhaseRes = await this.runNarrationAndPostTurnAgents({
+      workingState,
+      workingLedger,
+      workingAuditSeq,
+      latestInput,
+      recentTranscript,
+      assistantMessageId,
+      swipeIndex: 0,
+      turnMeta,
+      streamNarrator: options.streamNarrator === true,
+      signal: options.signal,
+      turnAuditEntries,
+      turnChangedPaths,
+      turnWarnings,
+      turnEventRecords,
+      turnPendingConfirmations,
+    });
+
+    if (!narrationPhaseRes.ok) {
+      return narrationPhaseRes;
+    }
+
+    workingState = narrationPhaseRes.value.workingState;
+    workingLedger = narrationPhaseRes.value.workingLedger;
+    workingAuditSeq = narrationPhaseRes.value.workingAuditSeq;
+    const narratorText = narrationPhaseRes.value.narratorText;
+    const compiledPrompt = narrationPhaseRes.value.compiledPrompt;
+    const trackerSkippedByCadence = narrationPhaseRes.value.trackerSkippedByCadence;
+
+    const postSerializedLedger = serializeBeatLedger(workingLedger);
+    const assistantCheckpoint: StateCheckpoint = {
+      checkpointId: this.allocateCheckpointId(workingState.meta.turn, 'continue'),
+      turn: workingState.meta.turn,
+      worldState: cloneWorldState(workingState),
+      beatLedger: postSerializedLedger,
+      rngState: cloneRngState(workingState.meta.rngState),
+      stateHash: computeStateHash(workingState, postSerializedLedger),
+    };
+
+    const appendedRes = appendMessageTurn(rewoundTree, {
+      messageId: assistantMessageId,
+      parentMessageId: targetNodeId,
+      role: 'assistant',
+      content: narratorText,
+      checkpoint: assistantCheckpoint,
+      createdAtSeq: workingAuditSeq,
+    });
+    if (!appendedRes.ok) {
+      return err(appendedRes.error);
+    }
+
+    const nextTree = appendedRes.value;
+
+    if (this.saveDir !== null) {
+      const persistRes = await this.persistTurnToDisk({
+        turn: workingState.meta.turn,
+        worldState: workingState,
+        beatLedger: workingLedger,
+        swipeTree: nextTree,
+        eventRecords: turnEventRecords,
+        auditEntries: turnAuditEntries,
+      });
+      if (!persistRes.ok) {
+        return persistRes;
+      }
+    }
+
+    this.state = workingState;
+    this.beatLedger = workingLedger;
+    this.swipeTree = nextTree;
+    this.auditSeq = workingAuditSeq;
+    this.auditLog.push(...turnAuditEntries);
+    if (turnPendingConfirmations.length > 0) {
+      this.pendingConfirmations.push(...turnPendingConfirmations);
+    }
+
+    return ok({
+      turn: workingState.meta.turn,
+      userMessageId: role === 'user' ? targetNodeId : '',
+      assistantMessageId,
+      swipeIndex: 0,
+      narratorText,
+      state: cloneWorldState(this.state),
+      beatLedger: cloneBeatLedger(this.beatLedger),
+      combatState: this.combatState ? cloneCombatStateSnapshot(this.combatState) : null,
+      compiledPrompt,
+      auditEntries: turnAuditEntries,
+      pendingConfirmations: turnPendingConfirmations.map(cloneOperation),
+      triggeredEnding: null,
+      trackerSkippedByCadence,
+      warnings: turnWarnings,
+    });
+  }
+
+  /**
    * Activate an existing swipe variant on `assistantMessageId` and restore `WorldState`,
    * `BeatLedgerState`, and `rngState` from its coupled checkpoint.
    */
@@ -2164,13 +2468,23 @@ export class SessionRuntime {
   }
 
   private allocateMessageId(turn: number, role: 'user' | 'assistant'): string {
-    this.msgSeq += 1;
-    return `msg-t${turn}-${role}-${this.msgSeq}`;
+    while (true) {
+      this.msgSeq += 1;
+      const candidate = `msg-t${turn}-${role}-${this.msgSeq}`;
+      if (!Object.hasOwn(this.swipeTree.nodes, candidate)) {
+        return candidate;
+      }
+    }
   }
 
   private allocateCheckpointId(turn: number, tag: string): string {
-    this.checkpointSeq += 1;
-    return `cp-t${turn}-${tag}-${this.checkpointSeq}`;
+    while (true) {
+      this.checkpointSeq += 1;
+      const candidate = `cp-t${turn}-${tag}-${this.checkpointSeq}`;
+      if (!Object.hasOwn(this.swipeTree.checkpoints, candidate)) {
+        return candidate;
+      }
+    }
   }
 
   private async resolveDeterministicAction(params: {
