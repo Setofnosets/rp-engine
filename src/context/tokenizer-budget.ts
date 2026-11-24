@@ -1,3 +1,4 @@
+import { getEncoding, type Tiktoken } from 'js-tiktoken';
 import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 
@@ -37,24 +38,95 @@ function normalizeNonNegativeBudget(maxTokens: number): number {
 }
 
 /**
- * Deterministic token approximation (`Math.ceil(normalized.length / 4)`) with
- * whitespace normalization so repeated spacing never inflates counts.
+ * Supported BPE encodings for exact token counting.
  */
-export function estimateTokens(text: string): number {
-  if (typeof text !== 'string' || text.length === 0) {
-    return 0;
+export type TokenizerEncoding = 'o200k_base' | 'cl100k_base';
+
+/**
+ * Token counting mode: exact BPE (`'bpe'`) or character-length heuristic (`'heuristic'`).
+ */
+export type TokenizerMode = 'bpe' | 'heuristic';
+
+/**
+ * Options controlling token estimation.
+ */
+export interface EstimateTokensOptions {
+  mode?: TokenizerMode;
+  encoding?: TokenizerEncoding;
+}
+
+const LRU_CACHE_MAX_ENTRIES = 2048;
+const tokenCountCache = new Map<string, number>();
+const encoderCache = new Map<TokenizerEncoding, Tiktoken>();
+
+function getBpeEncoder(encoding: TokenizerEncoding): Tiktoken {
+  const cached = encoderCache.get(encoding);
+  if (cached !== undefined) {
+    return cached;
   }
-  const normalized = normalizeWhitespaceForTokens(text);
-  if (normalized.length === 0) {
-    return 0;
+  const encoder = getEncoding(encoding);
+  encoderCache.set(encoding, encoder);
+  return encoder;
+}
+
+function getCachedTokenCount(key: string): number | undefined {
+  const value = tokenCountCache.get(key);
+  if (value === undefined) {
+    return undefined;
   }
-  return Math.ceil(normalized.length / 4);
+  // Refresh LRU position
+  tokenCountCache.delete(key);
+  tokenCountCache.set(key, value);
+  return value;
+}
+
+function setCachedTokenCount(key: string, count: number): void {
+  if (tokenCountCache.has(key)) {
+    tokenCountCache.delete(key);
+  } else if (tokenCountCache.size >= LRU_CACHE_MAX_ENTRIES) {
+    const oldestKey = tokenCountCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      tokenCountCache.delete(oldestKey);
+    }
+  }
+  tokenCountCache.set(key, count);
 }
 
 /**
- * Clip `text` cleanly at a word or line boundary so `estimateTokens(result) <= maxTokens`.
+ * Deterministic token counter: defaults to exact BPE counting (`o200k_base`)
+ * with a bounded 2048-entry LRU cache, or `'heuristic'` (`Math.ceil(normalized.length / 4)`).
  */
-export function clipTextToTokenBudget(text: string, maxTokens: number): string {
+export function estimateTokens(text: string, options?: EstimateTokensOptions): number {
+  if (typeof text !== 'string' || text.length === 0 || text.trim().length === 0) {
+    return 0;
+  }
+
+  if (options?.mode === 'heuristic') {
+    const normalized = normalizeWhitespaceForTokens(text);
+    return Math.ceil(normalized.length / 4);
+  }
+
+  const encoding: TokenizerEncoding =
+    options?.encoding === 'cl100k_base' ? 'cl100k_base' : 'o200k_base';
+  const cacheKey = `${encoding}\0${text}`;
+  const cached = getCachedTokenCount(cacheKey);
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const count = getBpeEncoder(encoding).encode(text).length;
+  setCachedTokenCount(cacheKey, count);
+  return count;
+}
+
+/**
+ * Clip `text` cleanly at a word or line boundary so `estimateTokens(result, options) <= maxTokens`.
+ */
+export function clipTextToTokenBudget(
+  text: string,
+  maxTokens: number,
+  options?: EstimateTokensOptions
+): string {
   if (typeof text !== 'string' || text.length === 0) {
     return '';
   }
@@ -64,7 +136,7 @@ export function clipTextToTokenBudget(text: string, maxTokens: number): string {
     return '';
   }
 
-  if (estimateTokens(text) <= budget) {
+  if (estimateTokens(text, options) <= budget) {
     return text;
   }
 
@@ -74,7 +146,8 @@ export function clipTextToTokenBudget(text: string, maxTokens: number): string {
   const usableChars = Math.max(0, maxChars - ellipsis.length);
 
   if (usableChars === 0) {
-    return trimmed.slice(0, maxChars).trimEnd();
+    const single = trimmed.slice(0, maxChars).trimEnd();
+    return estimateTokens(single, options) <= budget ? single : '';
   }
 
   // Collapse excessive whitespace if raw text spans far past maxChars due to formatting runs.
@@ -89,16 +162,36 @@ export function clipTextToTokenBudget(text: string, maxTokens: number): string {
   }
 
   let candidate = `${cut.trimEnd()}${ellipsis}`;
-  // Guarantee invariant even when raw newlines/spaces shrink unevenly under normalization.
-  while (candidate.length > ellipsis.length && estimateTokens(candidate) > budget) {
-    const body = candidate.slice(0, candidate.length - ellipsis.length - 1).trimEnd();
-    if (body.length === 0) {
-      return '';
-    }
-    candidate = `${body}${ellipsis}`;
+  if (estimateTokens(candidate, options) <= budget) {
+    return candidate;
   }
 
-  return estimateTokens(candidate) <= budget ? candidate : '';
+  // Binary search the longest prefix of `cut` that fits within `budget` with `ellipsis`.
+  let low = 0;
+  let high = cut.length;
+  let best = '';
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const prefix = cut.slice(0, mid).trimEnd();
+    if (prefix.length === 0) {
+      low = mid + 1;
+      continue;
+    }
+    const probe = `${prefix}${ellipsis}`;
+    if (estimateTokens(probe, options) <= budget) {
+      best = probe;
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  if (best.length > 0) {
+    return best;
+  }
+
+  candidate = cut.slice(0, 1).trimEnd();
+  return candidate.length > 0 && estimateTokens(candidate, options) <= budget ? candidate : '';
 }
 
 /**
@@ -108,7 +201,8 @@ export function clipTextToTokenBudget(text: string, maxTokens: number): string {
  */
 export function fitItemsToBudget<T extends { text: string }>(
   items: readonly T[],
-  maxTokens: number
+  maxTokens: number,
+  options?: EstimateTokensOptions
 ): { included: T[]; droppedCount: number; usedTokens: number } {
   const budget = normalizeNonNegativeBudget(maxTokens);
   const included: T[] = [];
@@ -122,12 +216,12 @@ export function fitItemsToBudget<T extends { text: string }>(
       continue;
     }
 
-    const cost = estimateTokens(item.text);
+    const cost = estimateTokens(item.text, options);
 
     if (included.length === 0 && usedTokens === 0 && cost > budget) {
       if (budget > 0) {
-        const clippedText = clipTextToTokenBudget(item.text, budget);
-        const clippedCost = estimateTokens(clippedText);
+        const clippedText = clipTextToTokenBudget(item.text, budget, options);
+        const clippedCost = estimateTokens(clippedText, options);
         if (clippedText.length > 0 && clippedCost <= budget) {
           included.push({ ...item, text: clippedText });
           usedTokens += clippedCost;
@@ -216,4 +310,98 @@ export function validateTokenBudgets(
   });
 
   return acc.toResult(resolved);
+}
+
+/**
+ * Per-section token usage and budget utilization entry.
+ */
+export interface SectionBudgetReportEntry {
+  section: string;
+  tokens: number;
+  budget: number;
+  utilizationPct: number;
+  truncated: boolean;
+  droppedItems: number;
+}
+
+/**
+ * Aggregate context-budget inspection report across all sections.
+ */
+export interface ContextBudgetReport {
+  totalTokens: number;
+  totalBudget: number;
+  overBudget: boolean;
+  sections: SectionBudgetReportEntry[];
+}
+
+/**
+ * Input value for a single section passed to {@link inspectContextBudget}.
+ */
+export type ContextBudgetSectionInput =
+  | string
+  | {
+      text: string;
+      truncated?: boolean;
+      droppedItems?: number;
+    };
+
+/**
+ * Inspect per-section token counts, budget utilization, and overall budget compliance.
+ */
+export function inspectContextBudget(
+  sections: Readonly<Record<string, ContextBudgetSectionInput | undefined>>,
+  budgets: Partial<SectionTokenBudgets> & Readonly<Record<string, number | undefined>> = {},
+  options?: EstimateTokensOptions
+): ContextBudgetReport {
+  const entries: SectionBudgetReportEntry[] = [];
+  let totalTokens = 0;
+
+  for (const [section, rawInput] of Object.entries(sections)) {
+    if (rawInput === undefined) {
+      continue;
+    }
+
+    const text = typeof rawInput === 'string' ? rawInput : rawInput.text;
+    const tokens = estimateTokens(text, options);
+    const rawBudget = Object.prototype.hasOwnProperty.call(budgets, section)
+      ? budgets[section]
+      : undefined;
+    const budget = normalizeNonNegativeBudget(rawBudget ?? 0);
+
+    let utilizationPct = 0;
+    if (budget > 0) {
+      const pct = Math.round(((tokens / budget) * 100) * 100) / 100;
+      utilizationPct = pct === 0 ? 0 : pct;
+    } else if (tokens > 0) {
+      utilizationPct = 100;
+    }
+
+    const truncated =
+      typeof rawInput === 'string' ? budget > 0 && tokens > budget : Boolean(rawInput.truncated);
+    const rawDropped = typeof rawInput === 'string' ? 0 : (rawInput.droppedItems ?? 0);
+    const droppedItems = normalizeNonNegativeBudget(rawDropped);
+
+    totalTokens += tokens;
+    entries.push({
+      section,
+      tokens,
+      budget,
+      utilizationPct,
+      truncated,
+      droppedItems,
+    });
+  }
+
+  const totalBudget = normalizeNonNegativeBudget(
+    budgets.totalMaxTokens ?? DEFAULT_TOKEN_BUDGETS.totalMaxTokens
+  );
+  const overBudget =
+    totalTokens > totalBudget || entries.some((entry) => entry.budget > 0 && entry.tokens > entry.budget);
+
+  return {
+    totalTokens,
+    totalBudget,
+    overBudget,
+    sections: entries,
+  };
 }
