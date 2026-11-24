@@ -1012,6 +1012,24 @@ export class TuiController {
       case '/connections':
         return this.handleListConnectionsCommand();
 
+      case '/preview':
+        return this.handlePreviewCommand(arg);
+
+      case '/travel-to':
+        return this.handleTravelCommand(arg);
+
+      case '/downtime':
+        return this.handleDowntimeCommand(arg);
+
+      case '/news':
+        return this.handleNewsCommand();
+
+      case '/clone':
+        return this.handleCloneCommand(arg);
+
+      case '/takeover':
+        return this.handleTakeoverCommand(arg);
+
       case '/save-connections':
         return this.handleSaveConnectionsCommand(arg);
 
@@ -1043,6 +1061,176 @@ export class TuiController {
         this.lastStatusMessage = `Unknown command "${command}". Type /help for commands.`;
         return { outputLines: [this.lastStatusMessage], shouldExit: false };
     }
+  }
+
+  private async handlePreviewCommand(arg: string): Promise<TuiHandleInputResult> {
+    const tokens = arg.split(/\s+/).filter((t) => t.length > 0);
+    const skillId = tokens[0];
+    if (skillId === undefined) {
+      this.lastStatusMessage = 'Usage: /preview <skillId> [targetId]';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const targetId = tokens[1];
+    if (this.daemonUrl !== null && this.sessionId !== null) {
+      try {
+        const res = await this.daemonFetch<{ ok?: boolean; preview?: Record<string, unknown> }>(
+          `/api/sessions/${encodeURIComponent(this.sessionId)}/combat/preview`,
+          'POST',
+          { skillId, ...(targetId !== undefined ? { targetId } : {}) }
+        );
+        const summary = JSON.stringify(res.preview ?? res);
+        this.lastStatusMessage = `Preview [${skillId}]: ${summary}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.lastStatusMessage = `Preview failed: ${msg}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+    }
+    const snap = this.getSnapshot();
+    const combat = snap.combatState;
+    if (combat === null || !combat.active) {
+      this.lastStatusMessage = `Preview [${skillId}]: No active combat.`;
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const targetLabel = targetId ?? 'auto';
+    this.lastStatusMessage = `Preview [${skillId} -> ${targetLabel}]: Round ${combat.round}, Mode ${combat.mode}`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private async handleTravelCommand(arg: string): Promise<TuiHandleInputResult> {
+    const locationId = arg.trim();
+    if (locationId.length === 0) {
+      this.lastStatusMessage = 'Usage: /travel-to <locationId>';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    if (this.daemonUrl !== null && this.sessionId !== null) {
+      try {
+        await this.daemonFetch(
+          `/api/sessions/${encodeURIComponent(this.sessionId)}/travel`,
+          'POST',
+          { targetLocationId: locationId }
+        );
+        await this.refreshFromDaemon();
+        this.lastStatusMessage = `Traveled to "${locationId}".`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.lastStatusMessage = `Travel failed: ${msg}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+    }
+    this.lastStatusMessage = `Travel queued for "${locationId}" (local runtime).`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private async handleDowntimeCommand(arg: string): Promise<TuiHandleInputResult> {
+    const activity = arg.trim();
+    if (activity.length === 0) {
+      this.lastStatusMessage = 'Usage: /downtime <activity>';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    if (this.daemonUrl !== null && this.sessionId !== null) {
+      try {
+        await this.daemonFetch(
+          `/api/sessions/${encodeURIComponent(this.sessionId)}/downtime`,
+          'POST',
+          { activity }
+        );
+        await this.refreshFromDaemon();
+        this.lastStatusMessage = `Downtime "${activity}" completed.`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.lastStatusMessage = `Downtime failed: ${msg}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+    }
+    this.lastStatusMessage = `Downtime "${activity}" queued (local runtime).`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private handleNewsCommand(): TuiHandleInputResult {
+    const snap = this.getSnapshot();
+    const editions = snap.state.chronicle.digestEditions;
+    if (editions === undefined || editions.length === 0) {
+      this.lastStatusMessage = 'No digest news editions available yet.';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const latest = editions[editions.length - 1];
+    if (latest === undefined) {
+      this.lastStatusMessage = 'No digest news editions available yet.';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    const lines = [
+      `=== ${latest.masthead} (Day ${latest.day}) ===`,
+      ...latest.headlines.map((h) => `- ${h}`),
+    ];
+    this.lastStatusMessage = `Displayed ${latest.masthead} (Day ${latest.day}).`;
+    return { outputLines: lines, shouldExit: false };
+  }
+
+  private async handleCloneCommand(arg: string): Promise<TuiHandleInputResult> {
+    const label = arg.trim();
+    if (this.daemonUrl !== null && this.sessionId !== null) {
+      try {
+        const res = await this.daemonFetch<{ sessionId?: string }>(
+          `/api/sessions/${encodeURIComponent(this.sessionId)}/clone`,
+          'POST',
+          label.length > 0 ? { label } : {}
+        );
+        const clonedId = res.sessionId ?? 'unknown';
+        this.lastStatusMessage = `Cloned session -> ${clonedId}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.lastStatusMessage = `Clone failed: ${msg}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+    }
+    this.lastStatusMessage = `Cloned session "${this.sessionId}"${label.length > 0 ? ` (${label})` : ''}.`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
+  }
+
+  private async handleTakeoverCommand(arg: string): Promise<TuiHandleInputResult> {
+    const target = arg.trim();
+    if (target.length === 0) {
+      this.lastStatusMessage = 'Usage: /takeover <characterId|persona.png>';
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    if (target.toLowerCase().endsWith('.png')) {
+      if (this.daemonUrl !== null) {
+        try {
+          await this.daemonFetch('/api/cards/import', 'POST', { path: target });
+          this.lastStatusMessage = `Imported persona card "${target}".`;
+          return { outputLines: [this.lastStatusMessage], shouldExit: false };
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          this.lastStatusMessage = `Card import failed: ${msg}`;
+          return { outputLines: [this.lastStatusMessage], shouldExit: false };
+        }
+      }
+      this.lastStatusMessage = `Persona card "${target}" staged for takeover.`;
+      return { outputLines: [this.lastStatusMessage], shouldExit: false };
+    }
+    if (this.daemonUrl !== null && this.sessionId !== null) {
+      try {
+        await this.daemonFetch(
+          `/api/sessions/${encodeURIComponent(this.sessionId)}/player/bind`,
+          'POST',
+          { canonCharacterId: target }
+        );
+        await this.refreshFromDaemon();
+        this.lastStatusMessage = `Bound player POV to "${target}".`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        this.lastStatusMessage = `Takeover failed: ${msg}`;
+        return { outputLines: [this.lastStatusMessage], shouldExit: false };
+      }
+    }
+    this.lastStatusMessage = `Player POV set to "${target}" (local runtime).`;
+    return { outputLines: [this.lastStatusMessage], shouldExit: false };
   }
 
   private async handleConnectCommand(arg: string): Promise<TuiHandleInputResult> {

@@ -32,6 +32,12 @@ import { type WorldState, validateWorldState } from './world-state.js';
 
 export type { EventLogRecord } from './replay.js';
 
+export interface SessionLineage {
+  readonly parentSessionId: string;
+  readonly forkedAtNodeId: string | null;
+  readonly label: string | null;
+}
+
 export interface SaveManifest {
   sessionId: string;
   cartridgeId: string;
@@ -41,6 +47,7 @@ export interface SaveManifest {
   parentSaveId: string | null;
   branchAtTurn: number | null;
   checkpointInterval: number;
+  lineage?: SessionLineage | null;
 }
 
 export interface InitSaveManifestInput {
@@ -52,6 +59,7 @@ export interface InitSaveManifestInput {
   parentSaveId?: string | null;
   branchAtTurn?: number | null;
   checkpointInterval?: number;
+  lineage?: SessionLineage | null;
 }
 
 export interface InitSaveOptions {
@@ -770,6 +778,54 @@ function validateManifestObject(raw: unknown): Result<SaveManifest, ValidationEr
     ]);
   }
 
+  const rawLineage = getOwn(raw, 'lineage');
+  let lineage: SessionLineage | null | undefined;
+  if (rawLineage !== undefined) {
+    if (rawLineage === null) {
+      lineage = null;
+    } else if (isPlainObject(rawLineage)) {
+      const parentSessionId = getOwn(rawLineage, 'parentSessionId');
+      const forkedAtNodeId = getOwn(rawLineage, 'forkedAtNodeId');
+      const label = getOwn(rawLineage, 'label');
+      if (typeof parentSessionId !== 'string' || parentSessionId.trim().length === 0) {
+        return err([
+          validationError(
+            'manifest.lineage.parentSessionId',
+            'REQUIRED',
+            'lineage.parentSessionId must be a non-empty string'
+          ),
+        ]);
+      }
+      if (forkedAtNodeId !== null && forkedAtNodeId !== undefined && typeof forkedAtNodeId !== 'string') {
+        return err([
+          validationError(
+            'manifest.lineage.forkedAtNodeId',
+            'INVALID_TYPE',
+            'lineage.forkedAtNodeId must be a string or null'
+          ),
+        ]);
+      }
+      if (label !== null && label !== undefined && typeof label !== 'string') {
+        return err([
+          validationError(
+            'manifest.lineage.label',
+            'INVALID_TYPE',
+            'lineage.label must be a string or null'
+          ),
+        ]);
+      }
+      lineage = {
+        parentSessionId,
+        forkedAtNodeId: forkedAtNodeId ?? null,
+        label: label ?? null,
+      };
+    } else {
+      return err([
+        validationError('manifest.lineage', 'INVALID_TYPE', 'lineage must be an object or null'),
+      ]);
+    }
+  }
+
   return ok({
     sessionId,
     cartridgeId,
@@ -779,6 +835,7 @@ function validateManifestObject(raw: unknown): Result<SaveManifest, ValidationEr
     parentSaveId,
     branchAtTurn,
     checkpointInterval,
+    ...(lineage !== undefined ? { lineage } : {}),
   });
 }
 
@@ -1016,6 +1073,7 @@ export async function initSaveDirectory(
     parentSaveId: manifestInput.parentSaveId ?? null,
     branchAtTurn: manifestInput.branchAtTurn ?? null,
     checkpointInterval: manifestInput.checkpointInterval ?? DEFAULT_CHECKPOINT_INTERVAL,
+    ...(manifestInput.lineage !== undefined ? { lineage: manifestInput.lineage } : {}),
   };
 
   const manifestValidation = validateManifestObject(candidateManifest);
@@ -1749,4 +1807,326 @@ export async function branchSave(
   }
 
   return ok(initRes.value);
+}
+
+export interface SavedSessionSummary {
+  readonly sessionId: string;
+  readonly title: string;
+  readonly cartridgeId: string;
+  readonly systemPackId: string;
+  readonly turn: number;
+  readonly day: number;
+  readonly portraitPath: string | null;
+  readonly updatedAt: string;
+  readonly lineage: SessionLineage | null;
+}
+
+export interface CloneSessionStackOptions {
+  readonly sourceDir: string;
+  readonly targetDir: string;
+  readonly newSessionId: string;
+  readonly nodeId?: string | null;
+  readonly label?: string | null;
+}
+
+export interface CloneSessionStackResult {
+  readonly manifest: SaveManifest;
+  readonly lineage: SessionLineage;
+  readonly swipeTree: SwipeTreeState | null;
+  readonly targetDir: string;
+}
+
+function resolveContainedSessionDir(saveRootDir: string, sessionId: string): string | null {
+  if (
+    typeof sessionId !== 'string' ||
+    sessionId.trim().length === 0 ||
+    !isSafeKey(sessionId) ||
+    sessionId.includes('/') ||
+    sessionId.includes('\\') ||
+    sessionId.includes('..')
+  ) {
+    return null;
+  }
+  const resolvedRoot = path.resolve(saveRootDir);
+  const resolvedTarget = path.resolve(resolvedRoot, sessionId);
+  const rel = path.relative(resolvedRoot, resolvedTarget);
+  if (rel.length === 0 || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return null;
+  }
+  return resolvedTarget;
+}
+
+function pruneSwipeTreeForNodeFork(tree: SwipeTreeState, nodeId: string): SwipeTreeState {
+  const keptNodeIds = new Set<string>();
+  let currId: string | null = nodeId;
+  while (currId !== null && isSafeKey(currId) && !keptNodeIds.has(currId)) {
+    const node = getOwn(tree.nodes as Record<string, unknown>, currId) as
+      | TranscriptMessageNode
+      | undefined;
+    if (!node) {
+      break;
+    }
+    keptNodeIds.add(currId);
+    currId = node.parentMessageId;
+  }
+
+  const nextNodes: Record<string, TranscriptMessageNode> = {};
+  const usedCheckpointIds = new Set<string>();
+  for (const id of keptNodeIds) {
+    const node = getOwn(tree.nodes as Record<string, unknown>, id) as
+      | TranscriptMessageNode
+      | undefined;
+    if (!node) {
+      continue;
+    }
+    for (const swipe of node.swipes) {
+      usedCheckpointIds.add(swipe.stateCheckpointId);
+    }
+    setOwn(nextNodes, id, {
+      messageId: node.messageId,
+      parentMessageId: node.parentMessageId,
+      role: node.role,
+      swipes: node.swipes.map((s) => ({ ...s })),
+      activeSwipeIndex: node.activeSwipeIndex,
+    });
+  }
+
+  const nextCheckpoints: Record<string, StateCheckpoint> = {};
+  for (const cpId of usedCheckpointIds) {
+    const cp = getOwn(tree.checkpoints as Record<string, unknown>, cpId) as
+      | StateCheckpoint
+      | undefined;
+    if (cp) {
+      setOwn(nextCheckpoints, cpId, cp);
+    }
+  }
+
+  return {
+    nodes: nextNodes,
+    activeLeafMessageId: Object.hasOwn(nextNodes, nodeId) ? nodeId : null,
+    checkpoints: nextCheckpoints,
+  };
+}
+
+/**
+ * List all saved sessions stored under `saveRootDir` with deterministic ordering.
+ */
+export async function listSavedSessions(
+  saveRootDir: string
+): Promise<Result<SavedSessionSummary[], ValidationError[]>> {
+  if (typeof saveRootDir !== 'string' || saveRootDir.trim().length === 0) {
+    return err([validationError('saveRootDir', 'REQUIRED', 'saveRootDir must be a non-empty string')]);
+  }
+  if (!(await fileExists(saveRootDir))) {
+    return ok([]);
+  }
+
+  const entries = await fs.readdir(saveRootDir, { withFileTypes: true });
+  const summaries: SavedSessionSummary[] = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !isSafeKey(entry.name)) {
+      continue;
+    }
+    const sessionDir = resolveContainedSessionDir(saveRootDir, entry.name);
+    if (sessionDir === null) {
+      continue;
+    }
+    const manifestPath = path.join(sessionDir, 'manifest.json');
+    if (!(await fileExists(manifestPath))) {
+      continue;
+    }
+    const loadedRes = await loadSessionSave(sessionDir);
+    if (!loadedRes.ok) {
+      continue;
+    }
+    const loaded = loadedRes.value;
+    const stat = await fs.stat(manifestPath);
+    const ws = loaded.latestCheckpoint?.worldState;
+    const title = loaded.manifest.cartridgeId;
+    const day = ws?.clocks.day ?? 1;
+    const portraitPath = ws?.player.portraitAsset ?? null;
+
+    summaries.push({
+      sessionId: loaded.manifest.sessionId,
+      title,
+      cartridgeId: loaded.manifest.cartridgeId,
+      systemPackId: loaded.manifest.systemPackId,
+      turn: loaded.manifest.currentTurn,
+      day,
+      portraitPath,
+      updatedAt: stat.mtime.toISOString(),
+      lineage: loaded.manifest.lineage ?? null,
+    });
+  }
+
+  summaries.sort((a, b) => (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0));
+  return ok(summaries);
+}
+
+/**
+ * Delete a saved session directory under `saveRootDir` cleanly.
+ */
+export async function deleteSavedSession(
+  saveRootDir: string,
+  sessionId: string
+): Promise<Result<{ deleted: boolean; sessionDir: string }, ValidationError[]>> {
+  if (typeof saveRootDir !== 'string' || saveRootDir.trim().length === 0) {
+    return err([validationError('saveRootDir', 'REQUIRED', 'saveRootDir must be a non-empty string')]);
+  }
+  const sessionDir = resolveContainedSessionDir(saveRootDir, sessionId);
+  if (sessionDir === null) {
+    return err([
+      validationError('sessionId', 'INVALID_SESSION_ID', `Unsafe or invalid sessionId "${sessionId}"`),
+    ]);
+  }
+  if (!(await fileExists(sessionDir))) {
+    return ok({ deleted: false, sessionDir });
+  }
+  await fs.rm(sessionDir, { recursive: true, force: true });
+  return ok({ deleted: true, sessionDir });
+}
+
+/**
+ * Clone an entire session stack (checkpoints, events, audit log, swipe tree, and assets)
+ * into `targetDir` under `newSessionId`, optionally forking at a specific `nodeId`.
+ */
+export async function cloneSessionStack(
+  options: CloneSessionStackOptions
+): Promise<Result<CloneSessionStackResult, ValidationError[]>> {
+  const { sourceDir, targetDir, newSessionId, nodeId = null, label = null } = options;
+
+  if (typeof sourceDir !== 'string' || sourceDir.trim().length === 0) {
+    return err([validationError('sourceDir', 'REQUIRED', 'sourceDir must be a non-empty string')]);
+  }
+  if (typeof targetDir !== 'string' || targetDir.trim().length === 0) {
+    return err([validationError('targetDir', 'REQUIRED', 'targetDir must be a non-empty string')]);
+  }
+  if (path.resolve(sourceDir) === path.resolve(targetDir)) {
+    return err([
+      validationError('targetDir', 'SAME_DIRECTORY', 'targetDir must differ from sourceDir'),
+    ]);
+  }
+  if (typeof newSessionId !== 'string' || newSessionId.trim().length === 0 || !isSafeKey(newSessionId)) {
+    return err([
+      validationError('newSessionId', 'REQUIRED', 'newSessionId must be a safe non-empty string'),
+    ]);
+  }
+
+  const loadedRes = await loadSessionSave(sourceDir);
+  if (!loadedRes.ok) {
+    return err(loadedRes.error);
+  }
+  const loaded = loadedRes.value;
+
+  let forkTurn = loaded.manifest.currentTurn;
+  let forkedAtNodeId: string | null = loaded.swipeTree?.activeLeafMessageId ?? null;
+  let clonedTree: SwipeTreeState | null = loaded.swipeTree;
+
+  if (nodeId !== null) {
+    if (typeof nodeId !== 'string' || !isSafeKey(nodeId)) {
+      return err([validationError('nodeId', 'UNSAFE_KEY', 'nodeId must be a safe string')]);
+    }
+    if (loaded.swipeTree === null) {
+      return err([
+        validationError('nodeId', 'MISSING_SWIPE_TREE', 'Source save has no swipe-tree.json'),
+      ]);
+    }
+    const targetNode = getOwn(loaded.swipeTree.nodes as Record<string, unknown>, nodeId) as
+      | TranscriptMessageNode
+      | undefined;
+    if (!targetNode) {
+      return err([validationError('nodeId', 'NOT_FOUND', `Message node not found: ${nodeId}`)]);
+    }
+    const activeSwipe = targetNode.swipes[targetNode.activeSwipeIndex] ?? targetNode.swipes[0];
+    if (!activeSwipe) {
+      return err([
+        validationError('nodeId', 'MISSING_SWIPE', `Node "${nodeId}" has no swipe variants`),
+      ]);
+    }
+    const cp = getOwn(
+      loaded.swipeTree.checkpoints as Record<string, unknown>,
+      activeSwipe.stateCheckpointId
+    ) as StateCheckpoint | undefined;
+    if (!cp) {
+      return err([
+        validationError(
+          'nodeId',
+          'MISSING_CHECKPOINT',
+          `Checkpoint not found for node "${nodeId}": ${activeSwipe.stateCheckpointId}`
+        ),
+      ]);
+    }
+    forkTurn = cp.turn;
+    forkedAtNodeId = nodeId;
+    clonedTree = pruneSwipeTreeForNodeFork(loaded.swipeTree, nodeId);
+  }
+
+  const lineage: SessionLineage = {
+    parentSessionId: loaded.manifest.sessionId,
+    forkedAtNodeId,
+    label,
+  };
+
+  const initRes = await initSaveDirectory(targetDir, {
+    sessionId: newSessionId,
+    cartridgeId: loaded.manifest.cartridgeId,
+    systemPackId: loaded.manifest.systemPackId,
+    schemaVersion: CURRENT_STATE_SCHEMA_VERSION,
+    currentTurn: forkTurn,
+    parentSaveId: loaded.manifest.sessionId,
+    branchAtTurn: forkTurn,
+    checkpointInterval: loaded.manifest.checkpointInterval,
+    lineage,
+  });
+  if (!initRes.ok) {
+    return err(initRes.error);
+  }
+
+  const checkpointsUpToTurn = loaded.checkpoints.filter((cp) => cp.turn <= forkTurn);
+  for (const cp of checkpointsUpToTurn) {
+    const cpSaveRes = await saveCheckpointAtomic(
+      targetDir,
+      cp.turn,
+      cp.worldState,
+      cp.beatLedger
+    );
+    if (!cpSaveRes.ok) {
+      return err(cpSaveRes.error);
+    }
+  }
+
+  const eventsUpToTurn = loaded.events.filter((ev) => ev.turn <= forkTurn);
+  const eventsText =
+    eventsUpToTurn.length > 0
+      ? `${eventsUpToTurn.map((e) => JSON.stringify(e)).join('\n')}\n`
+      : '';
+  await atomicWriteText(path.join(targetDir, 'events.jsonl'), eventsText);
+
+  const auditUpToTurn = loaded.auditEntries.filter((entry) => entry.turn <= forkTurn);
+  const auditText =
+    auditUpToTurn.length > 0
+      ? `${auditUpToTurn.map((a) => JSON.stringify(a)).join('\n')}\n`
+      : '';
+  await atomicWriteText(path.join(targetDir, 'audit.jsonl'), auditText);
+
+  if (clonedTree !== null) {
+    const treeRes = await saveSwipeTreeAtomic(targetDir, clonedTree);
+    if (!treeRes.ok) {
+      return err(treeRes.error);
+    }
+  }
+
+  // Copy session-local binary assets directory if present
+  const sourceAssetsDir = path.join(sourceDir, 'assets');
+  if (await fileExists(sourceAssetsDir)) {
+    await fs.cp(sourceAssetsDir, path.join(targetDir, 'assets'), { recursive: true });
+  }
+
+  return ok({
+    manifest: initRes.value,
+    lineage,
+    swipeTree: clonedTree,
+    targetDir,
+  });
 }

@@ -79,9 +79,13 @@ export function renderCombatGridPane(combatState: CombatState, width: number): s
   const lines: string[] = [];
 
   const statusTag = combatState.active ? 'ACTIVE' : 'ENDED';
+  const turnStylePart =
+    combatState.mode === 'traditional' && combatState.turnStyle !== undefined
+      ? ` | TurnStyle: ${combatState.turnStyle}`
+      : '';
   lines.push(
     truncateLine(
-      `COMBAT [${statusTag}] | Round ${combatState.round} | Mode: ${combatState.mode}`,
+      `COMBAT [${statusTag}] | Round ${combatState.round} | Mode: ${combatState.mode}${turnStylePart}`,
       safeWidth
     )
   );
@@ -138,8 +142,39 @@ export function renderCombatGridPane(combatState: CombatState, width: number): s
     lines.push(
       truncateLine('Legend: @=Ally E=Enemy #=Wall +=Cover ~=Hazard .=Open', safeWidth)
     );
+
+    const hazardParts: string[] = [];
+    const coverParts: string[] = [];
+    for (let y = 0; y < grid.height; y += 1) {
+      for (let x = 0; x < grid.width; x += 1) {
+        const tile = getTileAt(grid, { x, y });
+        if (tile === null || tile === undefined) {
+          continue;
+        }
+        if (tile.hazard !== 'none') {
+          hazardParts.push(`(${x},${y})=${tile.hazard}`);
+        }
+        if (tile.cover !== 'none') {
+          const maybeCoverHp = (tile as { coverHp?: unknown }).coverHp;
+          if (typeof maybeCoverHp === 'number' && Number.isFinite(maybeCoverHp)) {
+            coverParts.push(`(${x},${y})=${tile.cover}(${maybeCoverHp}HP)`);
+          }
+        }
+      }
+    }
+    if (hazardParts.length > 0) {
+      for (const wrapped of wrapText(`Hazards: ${hazardParts.join(', ')}`, safeWidth)) {
+        lines.push(wrapped);
+      }
+    }
+    if (coverParts.length > 0) {
+      for (const wrapped of wrapText(`Cover HP: ${coverParts.join(', ')}`, safeWidth)) {
+        lines.push(wrapped);
+      }
+    }
   } else {
-    lines.push(truncateLine('Theater of the Mind (Traditional Mode)', safeWidth));
+    const styleLabel = combatState.turnStyle ?? 'phased';
+    lines.push(truncateLine(`Theater of the Mind (Traditional Mode | ${styleLabel})`, safeWidth));
   }
 
   const combatants = buildCombatantListOrdered(combatState);
@@ -148,9 +183,20 @@ export function renderCombatGridPane(combatState: CombatState, width: number): s
     const activeId = combatState.initiativeOrder[combatState.turnIndex];
     const marker = c.id === activeId ? '*' : ' ';
     const stateLabel = c.alive ? '' : ' [KO]';
+    const rowTag =
+      combatState.mode === 'traditional' || c.formationRow !== undefined
+        ? ` [${(c.formationRow ?? 'front').toUpperCase()}]`
+        : '';
+    const summonTag = c.isSummon === true ? ' [SUMMON]' : '';
+    const transformTag =
+      c.activeTransform !== undefined
+        ? ` [FORM:${c.activeTransform.loadoutId}${
+            c.activeTransform.tempHp > 0 ? ` +${c.activeTransform.tempHp}THP` : ''
+          }]`
+        : '';
     const wpLabel = `WP ${c.willpower}/${c.maxWillpower}`;
     const header = truncateLine(
-      `${marker}${glyph} ${c.name} (${c.team})${stateLabel} | AC ${c.ac} | ${wpLabel}`,
+      `${marker}${glyph} ${c.name} (${c.team})${rowTag}${summonTag}${transformTag}${stateLabel} | AC ${c.ac} | ${wpLabel}`,
       safeWidth
     );
     lines.push(header);

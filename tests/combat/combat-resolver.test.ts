@@ -660,3 +660,343 @@ describe('PR-3.3: Action Validator, Partial-Prefix Salvage, Fallback AI & Tradit
     );
   });
 });
+
+describe('PR-8.5: Unified Combat Resolver Integration (Theater, Terrain, Summons, Transforms, Crits, Willpower)', () => {
+  it('handles natural-20 crit dice doubling, natural-1 auto-miss, @variable scaling, and willpower break', () => {
+    const registry = createDefaultSkillCatalog();
+    registry.register({
+      id: 'swarm_bolt',
+      name: 'Swarm Bolt',
+      category: 'spell',
+      actionCost: 'action',
+      resourceCosts: {},
+      targeting: { shape: 'single_enemy', minRange: 1, maxRange: 6, requiresLos: false },
+      hitResolution: { kind: 'attack_roll', stat: 'int' },
+      effects: [{ type: 'damage', dice: '1d6+@enemies', scalingStat: 'int' }],
+    });
+
+    const world = makeTestWorld();
+    const grid = makeOpenGrid(6, 6);
+    const hero = makeCombatant({
+      id: 'hero',
+      team: 'ally',
+      coord: { x: 0, y: 0 },
+      stats: { int: 2 },
+      abilities: ['swarm_bolt'],
+    });
+    const enemy = makeCombatant({
+      id: 'enemy',
+      team: 'enemy',
+      coord: { x: 2, y: 0 },
+      hp: 40,
+      maxHp: 40,
+      ac: 30, // Unhittable normally, only natural 20 hits
+      willpower: 2,
+      maxWillpower: 10,
+      willpowerOutcome: 'flee',
+    });
+
+    const state: CombatState = {
+      active: true,
+      mode: 'tactical_grid',
+      round: 1,
+      turnIndex: 0,
+      initiativeOrder: ['hero', 'enemy'],
+      grid,
+      combatants: { hero, enemy },
+      triggerCountsThisTurn: {},
+    };
+
+    // Natural 1 auto-miss (even if AC were low)
+    const fumbleRes = resolveCombatTurn({
+      combatState: state,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'swarm_bolt', targetId: 'enemy' }],
+      registry,
+      rng: createQueuedRng([0.0]), // d20 = 1
+    });
+    expect(fumbleRes.outcomeSummary.damageDealt).toEqual({});
+    expect(fumbleRes.nextCombatState.combatants['enemy']?.hp).toBe(40);
+
+    // Natural 20 crit: rolls 1d6+1 twice + int(2), dealing >7 damage and triggering willpower break flee
+    const critRes = resolveCombatTurn({
+      combatState: state,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'swarm_bolt', targetId: 'enemy' }],
+      registry,
+      rng: createQueuedRng([0.99, 0.5, 0.5]), // d20 = 20, two rolls of 1d6+1
+    });
+    expect(critRes.nextCombatState.combatants['enemy']?.hp).toBeLessThan(33);
+    expect(critRes.outcomeSummary.encounterEnded).toBe(true);
+    expect(critRes.outcomeSummary.winnerTeam).toBe('ally');
+  });
+
+  it('integrates terrain modification, step-entry hazard damage, and knockback collision', () => {
+    const registry = createDefaultSkillCatalog();
+    registry.register({
+      id: 'flame_patch',
+      name: 'Flame Patch',
+      category: 'spell',
+      actionCost: 'action',
+      resourceCosts: {},
+      targeting: { shape: 'single_tile', minRange: 1, maxRange: 5, requiresLos: false },
+      hitResolution: { kind: 'auto' },
+      effects: [
+        {
+          type: 'modify_terrain',
+          terrainSpec: { shape: 'single_tile', hazard: 'fire', hazardDurationRounds: 2, hazardDamageDice: '1d4' },
+        },
+      ],
+    });
+    registry.register({
+      id: 'ram',
+      name: 'Ram',
+      category: 'skill',
+      actionCost: 'action',
+      resourceCosts: {},
+      targeting: { shape: 'single_enemy', minRange: 1, maxRange: 1, requiresLos: true },
+      hitResolution: { kind: 'auto' },
+      effects: [{ type: 'knockback', distance: 2 }],
+    });
+
+    const world = makeTestWorld();
+    const grid = makeOpenGrid(5, 5);
+    // Wall/impassable at (3,0)
+    grid.tiles[0 * 5 + 3]!.passable = false;
+
+    const hero = makeCombatant({
+      id: 'hero',
+      team: 'ally',
+      coord: { x: 1, y: 0 },
+      abilities: ['flame_patch', 'ram'],
+    });
+    const enemy = makeCombatant({
+      id: 'enemy',
+      team: 'enemy',
+      coord: { x: 2, y: 0 },
+      hp: 20,
+      maxHp: 20,
+    });
+
+    const state: CombatState = {
+      active: true,
+      mode: 'tactical_grid',
+      round: 1,
+      turnIndex: 0,
+      initiativeOrder: ['hero', 'enemy'],
+      grid,
+      combatants: { hero, enemy },
+      triggerCountsThisTurn: {},
+    };
+
+    // Apply fire hazard at (0,0)
+    const patchTurn = resolveCombatTurn({
+      combatState: state,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'flame_patch', targetCoord: { x: 0, y: 0 } }],
+      registry,
+      rng: createSeededRng('terrain-1'),
+    });
+    expect(patchTurn.nextCombatState.grid?.tiles[0]?.hazard).toBe('fire');
+
+    // Step onto (0,0) and verify step-entry fire damage
+    const stepTurn = resolveCombatTurn({
+      combatState: patchTurn.nextCombatState,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'move', to: { x: 0, y: 0 } }],
+      registry,
+      rng: createQueuedRng([0.5]), // 1d4 = 3
+    });
+    expect(stepTurn.nextCombatState.combatants['hero']?.hp).toBe(27);
+
+    // Knockback enemy from (2,0) east into wall at (3,0) -> 1d6 collision damage
+    const kbTurn = resolveCombatTurn({
+      combatState: state,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'ram', targetId: 'enemy' }],
+      registry,
+      rng: createQueuedRng([0.5]), // 1d6 = 4
+    });
+    expect(kbTurn.nextCombatState.combatants['enemy']?.hp).toBe(16);
+  });
+
+  it('integrates combat summons, transformation tempHp/revert, and encounter-end cleanup', () => {
+    const registry = createDefaultSkillCatalog();
+    registry.register({
+      id: 'call_wolf',
+      name: 'Call Wolf',
+      category: 'spell',
+      actionCost: 'action',
+      resourceCosts: {},
+      targeting: { shape: 'self', minRange: 0, maxRange: 0, requiresLos: false },
+      hitResolution: { kind: 'auto' },
+      effects: [{ type: 'summon', summonId: 'wolf' }],
+    });
+    registry.register({
+      id: 'bear_form',
+      name: 'Bear Form',
+      category: 'spell',
+      actionCost: 'bonus',
+      resourceCosts: {},
+      targeting: { shape: 'self', minRange: 0, maxRange: 0, requiresLos: false },
+      hitResolution: { kind: 'auto' },
+      effects: [{ type: 'transform', formLoadoutId: 'bear' }],
+    });
+
+    const summons = {
+      wolf: {
+        id: 'wolf',
+        name: 'Spirit Wolf',
+        maxHp: 12,
+        ac: 13,
+        speed: 4,
+        stats: { str: 3 },
+        abilities: ['basic_strike'],
+        durationTurns: 3,
+        maxActivePerCaster: 1,
+        despawnOnSummonerDefeat: true,
+        initiativePolicy: 'after_summoner' as const,
+      },
+    };
+    const formLoadouts = {
+      bear: {
+        id: 'bear',
+        displayName: 'Dire Bear',
+        acOverride: 16,
+        tempHpPool: 10,
+        abilities: ['basic_strike'],
+        replaceAbilities: false,
+        durationTurns: 3,
+        revertOnZeroTempHp: true,
+      },
+    };
+
+    const world = makeTestWorld();
+    const grid = makeOpenGrid(6, 6);
+    const hero = makeCombatant({
+      id: 'hero',
+      team: 'ally',
+      coord: { x: 1, y: 1 },
+      abilities: ['call_wolf', 'bear_form', 'basic_strike'],
+    });
+    const enemy = makeCombatant({
+      id: 'enemy',
+      team: 'enemy',
+      coord: { x: 4, y: 4 },
+      hp: 5,
+      maxHp: 5,
+    });
+
+    const state: CombatState = {
+      active: true,
+      mode: 'tactical_grid',
+      round: 1,
+      turnIndex: 0,
+      initiativeOrder: ['hero', 'enemy'],
+      grid,
+      combatants: { hero, enemy },
+      triggerCountsThisTurn: {},
+    };
+
+    const turn1 = resolveCombatTurn({
+      combatState: state,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [
+        { type: 'skill', skillId: 'call_wolf' },
+        { type: 'skill', skillId: 'bear_form' },
+      ],
+      registry,
+      rng: createSeededRng('sum-tf'),
+      summons,
+      formLoadouts,
+    });
+
+    const summonIds = Object.keys(turn1.nextCombatState.combatants).filter(
+      (id) => turn1.nextCombatState.combatants[id]?.isSummon
+    );
+    expect(summonIds.length).toBe(1);
+    expect(turn1.nextCombatState.combatants['hero']?.activeTransform?.loadoutId).toBe('bear');
+    expect(turn1.nextCombatState.combatants['hero']?.ac).toBe(16);
+
+    // Fallback AI can control the spawned summon
+    const wolfId = summonIds[0]!;
+    const wolfFallback = computeFallbackActions(turn1.nextCombatState, wolfId, registry);
+    expect(wolfFallback.length).toBeGreaterThan(0);
+
+    // Defeating the last enemy purges summons and reverts transformations
+    const heroMoved = {
+      ...turn1.nextCombatState,
+      combatants: {
+        ...turn1.nextCombatState.combatants,
+        hero: {
+          ...turn1.nextCombatState.combatants['hero']!,
+          coord: { x: 3, y: 4 },
+        },
+      },
+    };
+    const winTurn = resolveCombatTurn({
+      combatState: heroMoved,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'basic_strike', targetId: 'enemy' }],
+      registry,
+      rng: createQueuedRng([0.9, 0.9]),
+      summons,
+      formLoadouts,
+    });
+    expect(winTurn.outcomeSummary.encounterEnded).toBe(true);
+    expect(winTurn.nextCombatState.combatants[wolfId]).toBeUndefined();
+    expect(winTurn.nextCombatState.combatants['hero']?.activeTransform).toBeUndefined();
+    expect(winTurn.nextCombatState.combatants['hero']?.ac).toBe(12);
+  });
+
+  it('enforces traditional formationRow front-row guard and bounded splash via unified resolver', () => {
+    const registry = createDefaultSkillCatalog();
+    const world = makeTestWorld();
+    const hero = makeCombatant({
+      id: 'hero',
+      team: 'ally',
+      formationRow: 'front',
+      abilities: ['basic_strike'],
+    });
+    const guard = makeCombatant({
+      id: 'guard',
+      team: 'enemy',
+      formationRow: 'front',
+    });
+    const mage = makeCombatant({
+      id: 'mage',
+      team: 'enemy',
+      formationRow: 'back',
+    });
+
+    const started = startCombatEncounter({
+      worldState: world,
+      participants: [hero, guard, mage],
+      mode: 'traditional',
+      turnStyle: 'phased',
+      rng: createSeededRng('trad-form'),
+    });
+
+    expect(started.combatState.turnStyle).toBe('phased');
+
+    // Melee strike against back-row mage is intercepted by front-row guard
+    const turn = resolveCombatTurn({
+      combatState: started.combatState,
+      worldState: world,
+      actorId: 'hero',
+      proposedActions: [{ type: 'skill', skillId: 'basic_strike', targetId: 'mage' }],
+      registry,
+      rng: createQueuedRng([0.9, 0.5]),
+    });
+    expect(turn.usedFallback).toBe(false);
+    expect(turn.outcomeSummary.damageDealt['guard']).toBeGreaterThan(0);
+    expect(turn.outcomeSummary.damageDealt['mage']).toBeUndefined();
+  });
+});

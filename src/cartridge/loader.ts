@@ -7,6 +7,7 @@ import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import { getStockSystemPack } from '../schema/stock-system-packs.js';
 import type { SystemPack } from '../schema/tracker-module.js';
+import type { FormTransitionRule } from '../state/forms.js';
 import type { WorldState } from '../state/world-state.js';
 import type { AgendaConfig } from '../world/agendas.js';
 import {
@@ -207,6 +208,62 @@ async function collectFilesWithExtension(
   return result;
 }
 
+async function collectBinaryAssets(
+  rootDir: string,
+  acc: ErrorAccumulator
+): Promise<Record<string, Uint8Array>> {
+  const result: Record<string, Uint8Array> = {};
+  const startDir = path.join(rootDir, 'assets');
+
+  const walk = async (currentAbsDir: string, currentRelDir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(currentAbsDir, { withFileTypes: true });
+    } catch (error) {
+      if (isEnoentError(error)) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : 'Unable to read directory';
+      acc.add('binaryAssets', 'DIRECTORY_READ_ERROR', `Failed to read "${currentAbsDir}": ${message}`);
+      return;
+    }
+
+    const sortedEntries = [...entries].sort((a, b) =>
+      compareStringsDeterministic(a.name, b.name)
+    );
+
+    for (const entry of sortedEntries) {
+      if (isUnsafeRecordKey(entry.name)) {
+        acc.add(
+          `binaryAssets.${entry.name}`,
+          'UNSAFE_PROPERTY_KEY',
+          `Forbidden filename "${entry.name}"`
+        );
+        continue;
+      }
+      const absPath = path.join(currentAbsDir, entry.name);
+      const relPath = `${currentRelDir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await walk(absPath, relPath);
+      } else if (entry.isFile()) {
+        if (currentRelDir === 'assets/endings' && entry.name.endsWith('.md')) {
+          continue;
+        }
+        try {
+          const bytes = await readFile(absPath);
+          setSafeProperty(result, relPath, new Uint8Array(bytes));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unable to read file';
+          acc.add(relPath, 'FILE_READ_ERROR', `Failed to read "${absPath}": ${message}`);
+        }
+      }
+    }
+  };
+
+  await walk(startDir, 'assets');
+  return result;
+}
+
 async function tryLoadExplicitRelativeMarkdown(
   rootDir: string,
   refPath: string,
@@ -297,6 +354,7 @@ export async function loadCartridgeFromDirectory(
     overridesRes,
     stateRes,
     entitiesRes,
+    formRulesRes,
     agendasRes,
     combatRes,
     beatsRes,
@@ -306,6 +364,7 @@ export async function loadCartridgeFromDirectory(
     readOptionalJsonFile(path.join(dirPath, 'system-overrides.json'), 'systemOverrides', acc),
     readOptionalJsonFile(path.join(dirPath, 'state.json'), 'initialState', acc),
     readOptionalJsonFile(path.join(dirPath, 'entities.json'), 'initialEntities', acc),
+    readOptionalJsonFile(path.join(dirPath, 'form-rules.json'), 'initialEntities.formRules', acc),
     readOptionalJsonFile(path.join(dirPath, 'agendas.json'), 'agendas', acc),
     readOptionalJsonFile(path.join(dirPath, 'combat.json'), 'combat', acc),
     readOptionalJsonFile(path.join(dirPath, 'beats.json'), 'beats', acc),
@@ -313,11 +372,12 @@ export async function loadCartridgeFromDirectory(
     readOptionalJsonFile(path.join(dirPath, 'endings.json'), 'endings', acc),
   ]);
 
-  // 3. Asset directories (lore/*.md, scripts/*.js, assets/endings/*.md)
-  const [loreFiles, scriptFiles, endingPromptFiles] = await Promise.all([
+  // 3. Asset directories (lore/*.md, scripts/*.js, assets/endings/*.md, assets/** binary files)
+  const [loreFiles, scriptFiles, endingPromptFiles, binaryAssets] = await Promise.all([
     collectFilesWithExtension(dirPath, 'lore', '.md', acc, 'loreFiles'),
     collectFilesWithExtension(dirPath, 'scripts', '.js', acc, 'scriptFiles'),
     collectFilesWithExtension(dirPath, 'assets/endings', '.md', acc, 'endingPromptFiles'),
+    collectBinaryAssets(dirPath, acc),
   ]);
 
   if (acc.hasErrors()) {
@@ -383,14 +443,46 @@ export async function loadCartridgeFromDirectory(
     }
   }
 
+  let initialEntities: CartridgeInitialEntities | undefined = entitiesRes.found
+    ? (entitiesRes.value as CartridgeInitialEntities)
+    : undefined;
+
+  if (formRulesRes.found) {
+    let loadedFormRules: FormTransitionRule[] | undefined;
+    if (Array.isArray(formRulesRes.value)) {
+      loadedFormRules = formRulesRes.value as FormTransitionRule[];
+    } else if (isPlainObject(formRulesRes.value) && Array.isArray(formRulesRes.value['formRules'])) {
+      loadedFormRules = formRulesRes.value['formRules'] as FormTransitionRule[];
+    } else {
+      acc.add(
+        'initialEntities.formRules',
+        'INVALID_TYPE',
+        'form-rules.json must be an array or { formRules: [...] }'
+      );
+    }
+
+    if (loadedFormRules !== undefined) {
+      if (initialEntities !== undefined && initialEntities.formRules !== undefined) {
+        acc.add(
+          'initialEntities.formRules',
+          'DUPLICATE_FORM_RULES_SOURCE',
+          'formRules cannot be defined in both entities.json and form-rules.json'
+        );
+      } else {
+        initialEntities = {
+          ...(initialEntities ?? {}),
+          formRules: loadedFormRules,
+        };
+      }
+    }
+  }
+
   const bundle: CartridgeBundle = {
     rootDir: dirPath,
     card: cardRes.value as CartridgeCardSpec,
     ...(overridesRes.found ? { systemOverrides: overridesRes.value as ControlRoomLayer } : {}),
     ...(stateRes.found ? { initialState: stateRes.value as Partial<WorldState> } : {}),
-    ...(entitiesRes.found
-      ? { initialEntities: entitiesRes.value as CartridgeInitialEntities }
-      : {}),
+    ...(initialEntities !== undefined ? { initialEntities } : {}),
     ...(agendasRes.found ? { agendas: agendasRes.value as AgendaConfig } : {}),
     ...(combatRes.found ? { combat: combatRes.value as CartridgeCombatConfig } : {}),
     beats,
@@ -399,6 +491,7 @@ export async function loadCartridgeFromDirectory(
     loreFiles,
     endingPromptFiles,
     scriptFiles,
+    ...(Object.keys(binaryAssets).length > 0 ? { binaryAssets } : {}),
   };
 
   const structRes = validateCartridgeStructure(bundle);

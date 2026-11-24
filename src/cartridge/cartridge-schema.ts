@@ -8,9 +8,18 @@ import {
   validateRoutesAndEndings,
 } from '../beats/routes-and-endings.js';
 import {
+  type EffectTemplate,
+  validateEffectTemplate,
+} from '../combat/effect-templates.js';
+import {
   type SkillDefinition,
   validateSkillCatalog,
 } from '../combat/skill-registry.js';
+import {
+  type CombatFormLoadout,
+  type SummonTemplate,
+} from '../combat/summons-and-transforms.js';
+import { type TraditionalTurnStyle } from '../combat/traditional-theater.js';
 import {
   type BeatPressure,
   type ControlRoomLayer,
@@ -40,7 +49,14 @@ import {
   validateGameSystemModule,
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
-import { type FormDefinition } from '../state/forms.js';
+import { validateCharacterCardSheet } from '../state/character-card-sheet.js';
+import {
+  type FormDefinition,
+  type FormIndex,
+  type FormTransitionRule,
+  buildFormIndex,
+  validateFormTransitionRules,
+} from '../state/forms.js';
 import { type LocationEntity } from '../state/spatial-topology.js';
 import {
   CHARACTER_STATUSES,
@@ -85,10 +101,15 @@ export interface CartridgeInitialEntities {
   threats?: Record<string, ThreatEntity>;
   locations?: Record<string, LocationEntity>;
   forms?: readonly FormDefinition[];
+  formRules?: readonly FormTransitionRule[];
 }
 
 export interface CartridgeCombatConfig {
   skills?: readonly SkillDefinition[];
+  turnStyle?: TraditionalTurnStyle;
+  summons?: Record<string, SummonTemplate>;
+  formLoadouts?: Record<string, CombatFormLoadout>;
+  effectTemplates?: Record<string, EffectTemplate>;
 }
 
 export interface CartridgeBundle {
@@ -105,6 +126,7 @@ export interface CartridgeBundle {
   loreFiles: Record<string, string>;
   endingPromptFiles: Record<string, string>;
   scriptFiles: Record<string, string>;
+  binaryAssets?: Record<string, Uint8Array>;
 }
 
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
@@ -213,6 +235,59 @@ export function getSafeProperty<T>(
     return undefined;
   }
   return Object.getOwnPropertyDescriptor(record, key)?.value as T | undefined;
+}
+
+export function isSafeAssetPath(assetPath: string): boolean {
+  if (typeof assetPath !== 'string' || assetPath.length === 0) {
+    return false;
+  }
+  if (assetPath.includes('\\') || assetPath.startsWith('/') || /^[a-zA-Z]:/.test(assetPath)) {
+    return false;
+  }
+  if (!assetPath.startsWith('assets/')) {
+    return false;
+  }
+  const segments = assetPath.split('/');
+  if (segments.length < 2) {
+    return false;
+  }
+  for (const seg of segments) {
+    if (seg.length === 0 || seg === '.' || seg === '..' || isUnsafeRecordKey(seg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateBinaryAssetsField(
+  rawAssets: unknown,
+  acc: ErrorAccumulator
+): void {
+  if (rawAssets === undefined) {
+    return;
+  }
+  if (!isPlainObject(rawAssets)) {
+    acc.add('', 'INVALID_TYPE', 'binaryAssets must be a plain object');
+    return;
+  }
+  for (const key of Object.getOwnPropertyNames(rawAssets)) {
+    if (isUnsafeRecordKey(key)) {
+      acc.add(key, 'UNSAFE_PROPERTY_KEY', `Forbidden key "${key}" in binaryAssets`);
+      continue;
+    }
+    if (!isSafeAssetPath(key)) {
+      acc.add(
+        key,
+        'UNSAFE_ASSET_PATH',
+        `Binary asset path "${key}" must be a safe relative path under "assets/"`
+      );
+      continue;
+    }
+    const val = Object.getOwnPropertyDescriptor(rawAssets, key)?.value;
+    if (!(val instanceof Uint8Array)) {
+      acc.add(key, 'INVALID_TYPE', `binaryAssets["${key}"] must be a Uint8Array`);
+    }
+  }
 }
 
 export function scanObjectForUnsafeKeys(
@@ -958,6 +1033,15 @@ function validateInitialEntitiesSection(
             validateStringArray(rawChar[arrField], entryAcc.scope(arrField), arrField);
           }
         }
+        if (rawChar['cardSheet'] !== undefined) {
+          const sheetRes = validateCharacterCardSheet(rawChar['cardSheet']);
+          if (!sheetRes.ok) {
+            entryAcc.scope('cardSheet').addAll(sheetRes.error);
+          }
+        }
+        if (rawChar['portraitAsset'] !== undefined && typeof rawChar['portraitAsset'] !== 'string') {
+          entryAcc.add('portraitAsset', 'INVALID_TYPE', 'portraitAsset must be a string');
+        }
         for (const strField of ['agenda', 'allegiance', 'mood'] as const) {
           if (rawChar[strField] !== undefined && typeof rawChar[strField] !== 'string') {
             entryAcc.add(strField, 'INVALID_TYPE', `${strField} must be a string`);
@@ -1133,9 +1217,11 @@ function validateInitialEntitiesSection(
     }
   }
 
+  let validFormIndex: FormIndex | undefined;
   if (rawEntities['forms'] !== undefined) {
     const forms = rawEntities['forms'];
     const formAcc = acc.scope('forms');
+    const prevErrCount = acc.errors.length;
     if (!Array.isArray(forms)) {
       formAcc.add('', 'INVALID_TYPE', 'forms must be an array');
     } else {
@@ -1172,6 +1258,20 @@ function validateInitialEntitiesSection(
           );
         }
       }
+      if (acc.errors.length === prevErrCount) {
+        validFormIndex = buildFormIndex(forms as readonly FormDefinition[]);
+      }
+    }
+  }
+
+  if (rawEntities['formRules'] !== undefined) {
+    const formRulesRes = validateFormTransitionRules(
+      rawEntities['formRules'] as readonly FormTransitionRule[],
+      validFormIndex,
+      'formRules'
+    );
+    if (!formRulesRes.ok) {
+      acc.addAll(formRulesRes.error);
     }
   }
 }
@@ -1610,6 +1710,218 @@ function validateBeatExtras(beats: readonly BeatDefinition[], acc: ErrorAccumula
   }
 }
 
+function validateCombatNumberRecordField(
+  raw: unknown,
+  acc: ErrorAccumulator,
+  fieldName: string
+): void {
+  if (!isPlainObject(raw)) {
+    acc.add(fieldName, 'INVALID_TYPE', `${fieldName} must be a plain object`);
+    return;
+  }
+  for (const key of Object.keys(raw)) {
+    if (isUnsafeRecordKey(key)) {
+      acc.add(`${fieldName}.${key}`, 'UNSAFE_KEY', `Unsafe key "${key}"`);
+      continue;
+    }
+    const val = Object.getOwnPropertyDescriptor(raw, key)?.value;
+    if (typeof val !== 'number' || !Number.isFinite(val)) {
+      acc.add(`${fieldName}.${key}`, 'INVALID_NUMBER', `${fieldName}.${key} must be a finite number`);
+    }
+  }
+}
+
+function validateCombatStringArrayField(
+  raw: unknown,
+  acc: ErrorAccumulator,
+  fieldName: string
+): void {
+  if (!Array.isArray(raw)) {
+    acc.add(fieldName, 'INVALID_TYPE', `${fieldName} must be an array of strings`);
+    return;
+  }
+  for (let i = 0; i < raw.length; i += 1) {
+    if (typeof raw[i] !== 'string' || raw[i].trim().length === 0) {
+      acc.add(`${fieldName}[${i}]`, 'INVALID_TYPE', `${fieldName}[${i}] must be a non-empty string`);
+    }
+  }
+}
+
+function validateSummonTemplateField(raw: unknown, acc: ErrorAccumulator): void {
+  if (!isPlainObject(raw)) {
+    acc.add('', 'INVALID_TYPE', 'SummonTemplate must be a plain object');
+    return;
+  }
+  const id = Object.getOwnPropertyDescriptor(raw, 'id')?.value;
+  if (typeof id !== 'string' || id.trim().length === 0 || isUnsafeRecordKey(id)) {
+    acc.add('id', 'INVALID_ID', 'SummonTemplate.id must be a safe non-empty string');
+  }
+  const name = Object.getOwnPropertyDescriptor(raw, 'name')?.value;
+  if (typeof name !== 'string' || name.trim().length === 0) {
+    acc.add('name', 'INVALID_NAME', 'SummonTemplate.name must be a non-empty string');
+  }
+  const maxHp = Object.getOwnPropertyDescriptor(raw, 'maxHp')?.value;
+  if (typeof maxHp !== 'number' || !Number.isFinite(maxHp) || maxHp <= 0) {
+    acc.add('maxHp', 'INVALID_NUMBER', 'SummonTemplate.maxHp must be a positive finite number');
+  }
+  const ac = Object.getOwnPropertyDescriptor(raw, 'ac')?.value;
+  if (typeof ac !== 'number' || !Number.isFinite(ac) || ac < 0) {
+    acc.add('ac', 'INVALID_NUMBER', 'SummonTemplate.ac must be a non-negative finite number');
+  }
+  const speed = Object.getOwnPropertyDescriptor(raw, 'speed')?.value;
+  if (typeof speed !== 'number' || !Number.isFinite(speed) || speed < 0) {
+    acc.add('speed', 'INVALID_NUMBER', 'SummonTemplate.speed must be a non-negative finite number');
+  }
+  validateCombatNumberRecordField(Object.getOwnPropertyDescriptor(raw, 'stats')?.value, acc, 'stats');
+  validateCombatStringArrayField(Object.getOwnPropertyDescriptor(raw, 'abilities')?.value, acc, 'abilities');
+
+  const durationTurns = Object.getOwnPropertyDescriptor(raw, 'durationTurns')?.value;
+  if (
+    durationTurns !== null &&
+    (typeof durationTurns !== 'number' || !Number.isFinite(durationTurns) || durationTurns < 1)
+  ) {
+    acc.add('durationTurns', 'INVALID_DURATION', 'SummonTemplate.durationTurns must be null or >= 1');
+  }
+  const maxActive = Object.getOwnPropertyDescriptor(raw, 'maxActivePerCaster')?.value;
+  if (typeof maxActive !== 'number' || !Number.isSafeInteger(maxActive) || maxActive < 1) {
+    acc.add('maxActivePerCaster', 'INVALID_NUMBER', 'SummonTemplate.maxActivePerCaster must be an integer >= 1');
+  }
+  const capPolicy = Object.getOwnPropertyDescriptor(raw, 'capPolicy')?.value;
+  if (capPolicy !== undefined && capPolicy !== 'evict_oldest' && capPolicy !== 'reject') {
+    acc.add('capPolicy', 'INVALID_ENUM', 'SummonTemplate.capPolicy must be "evict_oldest" or "reject"');
+  }
+  const despawn = Object.getOwnPropertyDescriptor(raw, 'despawnOnSummonerDefeat')?.value;
+  if (typeof despawn !== 'boolean') {
+    acc.add('despawnOnSummonerDefeat', 'INVALID_TYPE', 'SummonTemplate.despawnOnSummonerDefeat must be a boolean');
+  }
+  const initPolicy = Object.getOwnPropertyDescriptor(raw, 'initiativePolicy')?.value;
+  if (initPolicy !== 'after_summoner' && initPolicy !== 'roll') {
+    acc.add('initiativePolicy', 'INVALID_ENUM', 'SummonTemplate.initiativePolicy must be "after_summoner" or "roll"');
+  }
+}
+
+function validateFormLoadoutField(raw: unknown, acc: ErrorAccumulator): void {
+  if (!isPlainObject(raw)) {
+    acc.add('', 'INVALID_TYPE', 'CombatFormLoadout must be a plain object');
+    return;
+  }
+  const id = Object.getOwnPropertyDescriptor(raw, 'id')?.value;
+  if (typeof id !== 'string' || id.trim().length === 0 || isUnsafeRecordKey(id)) {
+    acc.add('id', 'INVALID_ID', 'CombatFormLoadout.id must be a safe non-empty string');
+  }
+  const displayName = Object.getOwnPropertyDescriptor(raw, 'displayName')?.value;
+  if (typeof displayName !== 'string' || displayName.trim().length === 0) {
+    acc.add('displayName', 'INVALID_NAME', 'CombatFormLoadout.displayName must be a non-empty string');
+  }
+  validateCombatStringArrayField(Object.getOwnPropertyDescriptor(raw, 'abilities')?.value, acc, 'abilities');
+
+  const replaceAbilities = Object.getOwnPropertyDescriptor(raw, 'replaceAbilities')?.value;
+  if (typeof replaceAbilities !== 'boolean') {
+    acc.add('replaceAbilities', 'INVALID_TYPE', 'CombatFormLoadout.replaceAbilities must be a boolean');
+  }
+  const durationTurns = Object.getOwnPropertyDescriptor(raw, 'durationTurns')?.value;
+  if (
+    durationTurns !== null &&
+    (typeof durationTurns !== 'number' || !Number.isFinite(durationTurns) || durationTurns < 1)
+  ) {
+    acc.add('durationTurns', 'INVALID_DURATION', 'CombatFormLoadout.durationTurns must be null or >= 1');
+  }
+
+  const statOverrides = Object.getOwnPropertyDescriptor(raw, 'statOverrides')?.value;
+  if (statOverrides !== undefined) {
+    validateCombatNumberRecordField(statOverrides, acc, 'statOverrides');
+  }
+  const statBonuses = Object.getOwnPropertyDescriptor(raw, 'statBonuses')?.value;
+  if (statBonuses !== undefined) {
+    validateCombatNumberRecordField(statBonuses, acc, 'statBonuses');
+  }
+  for (const numField of ['acOverride', 'speedOverride', 'tempHpPool'] as const) {
+    const val = Object.getOwnPropertyDescriptor(raw, numField)?.value;
+    if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val) || val < 0)) {
+      acc.add(numField, 'INVALID_NUMBER', `CombatFormLoadout.${numField} must be a non-negative finite number`);
+    }
+  }
+  const revertOnZero = Object.getOwnPropertyDescriptor(raw, 'revertOnZeroTempHp')?.value;
+  if (revertOnZero !== undefined && typeof revertOnZero !== 'boolean') {
+    acc.add('revertOnZeroTempHp', 'INVALID_TYPE', 'CombatFormLoadout.revertOnZeroTempHp must be a boolean');
+  }
+  const persistFormId = Object.getOwnPropertyDescriptor(raw, 'persistFormIdToWorld')?.value;
+  if (persistFormId !== undefined && (typeof persistFormId !== 'string' || persistFormId.trim().length === 0)) {
+    acc.add('persistFormIdToWorld', 'INVALID_TYPE', 'CombatFormLoadout.persistFormIdToWorld must be a non-empty string');
+  }
+}
+
+function validateCartridgeCombatConfig(combat: unknown, acc: ErrorAccumulator): void {
+  if (!isPlainObject(combat)) {
+    acc.add('', 'INVALID_TYPE', 'combat must be a plain object');
+    return;
+  }
+
+  const skills = Object.getOwnPropertyDescriptor(combat, 'skills')?.value;
+  if (skills !== undefined) {
+    const skillsRes = validateSkillCatalog(skills as readonly SkillDefinition[]);
+    if (!skillsRes.ok) {
+      acc.scope('skills').addAll(skillsRes.error);
+    }
+  }
+
+  const turnStyle = Object.getOwnPropertyDescriptor(combat, 'turnStyle')?.value;
+  if (turnStyle !== undefined && turnStyle !== 'initiative' && turnStyle !== 'phased') {
+    acc.add('turnStyle', 'INVALID_TURN_STYLE', 'combat.turnStyle must be "initiative" or "phased"');
+  }
+
+  const summons = Object.getOwnPropertyDescriptor(combat, 'summons')?.value;
+  if (summons !== undefined) {
+    if (!isPlainObject(summons)) {
+      acc.add('summons', 'INVALID_TYPE', 'combat.summons must be a plain object');
+    } else {
+      for (const key of Object.keys(summons)) {
+        if (isUnsafeRecordKey(key)) {
+          acc.add(`summons.${key}`, 'UNSAFE_KEY', `Unsafe key "${key}" in combat.summons`);
+          continue;
+        }
+        const tpl = Object.getOwnPropertyDescriptor(summons, key)?.value;
+        validateSummonTemplateField(tpl, acc.scope(`summons.${key}`));
+      }
+    }
+  }
+
+  const formLoadouts = Object.getOwnPropertyDescriptor(combat, 'formLoadouts')?.value;
+  if (formLoadouts !== undefined) {
+    if (!isPlainObject(formLoadouts)) {
+      acc.add('formLoadouts', 'INVALID_TYPE', 'combat.formLoadouts must be a plain object');
+    } else {
+      for (const key of Object.keys(formLoadouts)) {
+        if (isUnsafeRecordKey(key)) {
+          acc.add(`formLoadouts.${key}`, 'UNSAFE_KEY', `Unsafe key "${key}" in combat.formLoadouts`);
+          continue;
+        }
+        const loadout = Object.getOwnPropertyDescriptor(formLoadouts, key)?.value;
+        validateFormLoadoutField(loadout, acc.scope(`formLoadouts.${key}`));
+      }
+    }
+  }
+
+  const effectTemplates = Object.getOwnPropertyDescriptor(combat, 'effectTemplates')?.value;
+  if (effectTemplates !== undefined) {
+    if (!isPlainObject(effectTemplates)) {
+      acc.add('effectTemplates', 'INVALID_TYPE', 'combat.effectTemplates must be a plain object');
+    } else {
+      for (const key of Object.keys(effectTemplates)) {
+        if (isUnsafeRecordKey(key)) {
+          acc.add(`effectTemplates.${key}`, 'UNSAFE_KEY', `Unsafe key "${key}" in combat.effectTemplates`);
+          continue;
+        }
+        const tpl = Object.getOwnPropertyDescriptor(effectTemplates, key)?.value;
+        const tplRes = validateEffectTemplate(tpl);
+        if (!tplRes.ok) {
+          acc.scope(`effectTemplates.${key}`).addAll(tplRes.error);
+        }
+      }
+    }
+  }
+}
+
 /**
  * Validate structural integrity of a {@link CartridgeBundle}, supporting both
  * minimal Tier 0 cartridges (`card` + optional `loreFiles` with empty beats/routes/endings/entities)
@@ -1653,14 +1965,7 @@ export function validateCartridgeStructure(
   }
 
   if (bundle.combat !== undefined) {
-    if (!isPlainObject(bundle.combat)) {
-      acc.add('combat', 'INVALID_TYPE', 'combat must be a plain object');
-    } else if (bundle.combat.skills !== undefined) {
-      const skillsRes = validateSkillCatalog(bundle.combat.skills);
-      if (!skillsRes.ok) {
-        acc.scope('combat.skills').addAll(skillsRes.error);
-      }
-    }
+    validateCartridgeCombatConfig(bundle.combat, acc.scope('combat'));
   }
 
   const beatsRes = validateBeatDefinitions(bundle.beats, 'beats');
@@ -1682,6 +1987,7 @@ export function validateCartridgeStructure(
     'endingPromptFiles'
   );
   validateStringRecordField(bundle.scriptFiles, acc.scope('scriptFiles'), 'scriptFiles');
+  validateBinaryAssetsField(bundle.binaryAssets, acc.scope('binaryAssets'));
 
   return acc.toResult(bundle);
 }

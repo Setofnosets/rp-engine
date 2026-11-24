@@ -1,9 +1,14 @@
-import { inflateSync } from 'node:zlib';
 import type { BeatDefinition } from '../../beats/beat-ledger.js';
 import type { PredicateAst } from '../../beats/predicate-ast.js';
 import { type ValidationError, validationError } from '../../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../../core/result.js';
-import type { CharacterEntity } from '../../state/world-state.js';
+import {
+  type CharacterCardLoreEntry,
+  type CharacterCardSheet,
+  type CharacterCardSourceSpec,
+  cloneCharacterCardSheet,
+} from '../../state/character-card-sheet.js';
+import type { CharacterEntity, CharacterStatus } from '../../state/world-state.js';
 import {
   type CartridgeBundle,
   isPlainObject,
@@ -12,8 +17,10 @@ import {
   setSafeProperty,
   validateCartridgeStructure,
 } from '../cartridge-schema.js';
-
-const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+import {
+  PNG_SIGNATURE,
+  extractCharaJsonFromPngBuffer,
+} from '../png-card-codec.js';
 const DEFAULT_RECOMMENDED_SYSTEM_PACK = 'stock-slice-of-life';
 const MAX_SEEDED_BACKGROUND_CHARS = 1200;
 
@@ -129,152 +136,12 @@ function decodeBase64OrJsonString(rawText: string): Result<unknown, ValidationEr
   ]);
 }
 
-function parsePngTextChunk(data: Buffer): { keyword: string; text: string } | null {
-  const nullIdx = data.indexOf(0x00);
-  if (nullIdx <= 0) {
-    return null;
-  }
-  const keyword = data.subarray(0, nullIdx).toString('latin1');
-  const text = data.subarray(nullIdx + 1).toString('utf8');
-  return { keyword, text };
-}
-
-function parsePngItxtChunk(data: Buffer): Result<{ keyword: string; text: string } | null, ValidationError[]> {
-  const keywordEnd = data.indexOf(0x00);
-  if (keywordEnd <= 0 || keywordEnd + 2 >= data.length) {
-    return ok(null);
-  }
-  const keyword = data.subarray(0, keywordEnd).toString('latin1');
-  const compressionFlag = data.readUInt8(keywordEnd + 1);
-  const compressionMethod = data.readUInt8(keywordEnd + 2);
-
-  let pos = keywordEnd + 3;
-  const langEnd = data.indexOf(0x00, pos);
-  if (langEnd === -1) {
-    return ok(null);
-  }
-  pos = langEnd + 1;
-
-  const transEnd = data.indexOf(0x00, pos);
-  if (transEnd === -1) {
-    return ok(null);
-  }
-  pos = transEnd + 1;
-
-  const textBytes = data.subarray(pos);
-  if (compressionFlag === 1) {
-    if (compressionMethod !== 0) {
-      return err([
-        validationError(
-          '',
-          'UNSUPPORTED_COMPRESSION',
-          `Unsupported iTXt compression method ${compressionMethod}`
-        ),
-      ]);
-    }
-    try {
-      const inflated = inflateSync(textBytes);
-      return ok({ keyword, text: inflated.toString('utf8') });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'zlib inflate failed';
-      return err([
-        validationError('', 'DECOMPRESSION_FAILED', `Failed to decompress PNG iTXt chunk: ${message}`),
-      ]);
-    }
-  }
-
-  return ok({ keyword, text: textBytes.toString('utf8') });
-}
-
 /**
  * Pure Node `Buffer` PNG chunk reader that locates SillyTavern `ccv3` (preferred V3)
- * or `chara` (V2) `tEXt`/`iTXt` chunks and decodes the embedded UTF-8 JSON payload.
+ * or `chara` (V2) `tEXt`/`zTXt`/`iTXt` chunks and decodes the embedded UTF-8 JSON payload.
  */
 export function extractCharaJsonFromPng(pngBuffer: Buffer): Result<unknown, ValidationError[]> {
-  if (!Buffer.isBuffer(pngBuffer)) {
-    return err([validationError('', 'INVALID_TYPE', 'PNG input must be a Node Buffer')]);
-  }
-  if (pngBuffer.length < PNG_SIGNATURE.length || !pngBuffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
-    return err([validationError('', 'INVALID_PNG_SIGNATURE', 'Buffer does not start with a valid PNG signature')]);
-  }
-
-  let offset = 8;
-  let ccv3Text: string | undefined;
-  let charaText: string | undefined;
-  let sawIend = false;
-
-  while (offset + 12 <= pngBuffer.length) {
-    const length = pngBuffer.readUInt32BE(offset);
-    const chunkType = pngBuffer.toString('ascii', offset + 4, offset + 8);
-    const dataStart = offset + 8;
-    const dataEnd = dataStart + length;
-    const crcEnd = dataEnd + 4;
-
-    if (crcEnd > pngBuffer.length) {
-      return err([
-        validationError('', 'TRUNCATED_PNG_CHUNK', `PNG chunk "${chunkType}" at offset ${offset} exceeds buffer length`),
-      ]);
-    }
-
-    const data = pngBuffer.subarray(dataStart, dataEnd);
-    if (chunkType === 'tEXt') {
-      const parsed = parsePngTextChunk(data);
-      if (parsed) {
-        if (parsed.keyword === 'ccv3' && ccv3Text === undefined) {
-          ccv3Text = parsed.text;
-        } else if (parsed.keyword === 'chara' && charaText === undefined) {
-          charaText = parsed.text;
-        }
-      }
-    } else if (chunkType === 'iTXt') {
-      const itxtRes = parsePngItxtChunk(data);
-      if (!itxtRes.ok) {
-        return itxtRes;
-      }
-      if (itxtRes.value) {
-        if (itxtRes.value.keyword === 'ccv3' && ccv3Text === undefined) {
-          ccv3Text = itxtRes.value.text;
-        } else if (itxtRes.value.keyword === 'chara' && charaText === undefined) {
-          charaText = itxtRes.value.text;
-        }
-      }
-    } else if (chunkType === 'IEND') {
-      sawIend = true;
-      break;
-    }
-
-    offset = crcEnd;
-  }
-
-  if (!sawIend && offset < pngBuffer.length) {
-    return err([
-      validationError('', 'TRUNCATED_PNG_CHUNK', `Truncated PNG chunk header at offset ${offset}`),
-    ]);
-  }
-
-  const chosen = ccv3Text ?? charaText;
-  if (chosen === undefined) {
-    return err([
-      validationError(
-        '',
-        'MISSING_CHARA_CHUNK',
-        'PNG image does not contain a "ccv3" or "chara" metadata chunk'
-      ),
-    ]);
-  }
-
-  const decoded = decodeBase64OrJsonString(chosen);
-  if (!decoded.ok) {
-    return decoded;
-  }
-
-  const acc = new ErrorAccumulator();
-  scanObjectForUnsafeKeys(decoded.value, acc);
-  if (acc.hasErrors()) {
-    return err([...acc.errors]);
-  }
-
-  return ok(sanitizeJsonValue(decoded.value));
+  return extractCharaJsonFromPngBuffer(pngBuffer);
 }
 
 function extractRawEntriesList(bookObj: Record<string, unknown>): Record<string, unknown>[] {
@@ -401,24 +268,93 @@ function mapCharacterBookToBeatsAndLore(
   }
 }
 
-/**
- * Import a SillyTavern V1, V2 (`chara_card_v2`), or V3 (`chara_card_v3`) character card
- * from a PNG `Buffer`, JSON string, base64 string, or parsed object into a validated
- * Tier 0 {@link CartridgeBundle}.
- */
-export function importSillyTavernCard(
+function extractStringList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+function extractEmbeddedLoreEntries(bookRaw: unknown): CharacterCardLoreEntry[] {
+  let entries: Record<string, unknown>[] = [];
+  if (isPlainObject(bookRaw)) {
+    entries = extractRawEntriesList(bookRaw);
+  } else if (Array.isArray(bookRaw)) {
+    entries = bookRaw.filter((e): e is Record<string, unknown> => isPlainObject(e));
+  }
+
+  const out: CharacterCardLoreEntry[] = [];
+  for (const entry of entries) {
+    const rawSecondary = getOwnValue(entry, 'secondary_keys') ?? getOwnValue(entry, 'secondaryKeys');
+    const secondaryKeys = Array.isArray(rawSecondary)
+      ? rawSecondary.filter((s): s is string => typeof s === 'string' && s.trim().length > 0).map((s) => s.trim())
+      : [];
+    const content = getOwnString(entry, 'content') ?? '';
+    const constant = getOwnValue(entry, 'constant') === true;
+    const enabled = getOwnValue(entry, 'enabled') !== false;
+    const rawName = getOwnString(entry, 'name') ?? getOwnString(entry, 'comment');
+    const rawId = getOwnValue(entry, 'id');
+    const item: CharacterCardLoreEntry = {
+      keys: extractKeysArray(entry),
+      secondaryKeys,
+      content,
+      constant,
+      insertionOrder: resolveInsertionOrder(entry),
+      enabled,
+    };
+    if (rawName !== undefined && rawName.length > 0) {
+      item.name = rawName;
+    }
+    if (typeof rawId === 'string' || (typeof rawId === 'number' && Number.isFinite(rawId))) {
+      item.id = rawId;
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+export interface ParsedStCardContext {
+  sourceSpec: CharacterCardSourceSpec;
+  cardId: string;
+  name: string;
+  rawDescription: string;
+  personality: string;
+  scenario: string;
+  firstMessage: string;
+  alternateGreetings: string[];
+  mesExample: string;
+  creatorNotes: string;
+  systemPrompt: string;
+  postHistory: string;
+  tags: string[];
+  creator?: string;
+  characterVersion: string;
+  cardSheet: CharacterCardSheet;
+  portraitBytes?: Uint8Array;
+  portraitAssetPath: string;
+}
+
+export function parseStCardContext(
   input: Buffer | string | Record<string, unknown>,
-  options: { recommendedSystemPack?: string } = {}
-): Result<CartridgeBundle, ValidationError[]> {
+  overrideId?: string
+): Result<ParsedStCardContext, ValidationError[]> {
   let rawObject: unknown;
+  let portraitBytes: Uint8Array | undefined;
 
   if (Buffer.isBuffer(input)) {
     if (input.length >= PNG_SIGNATURE.length && input.subarray(0, 8).equals(PNG_SIGNATURE)) {
-      const pngRes = extractCharaJsonFromPng(input);
+      const pngRes = extractCharaJsonFromPngBuffer(input);
       if (!pngRes.ok) {
         return pngRes;
       }
       rawObject = pngRes.value;
+      portraitBytes = new Uint8Array(input);
     } else {
       const strRes = decodeBase64OrJsonString(input.toString('utf8'));
       if (!strRes.ok) {
@@ -476,6 +412,10 @@ export function importSillyTavernCard(
     return err([validationError('name', 'REQUIRED', 'SillyTavern card must have a non-empty name')]);
   }
 
+  const cardId = overrideId ? slugifyId(overrideId, 'imported-st-card') : slugifyId(name, 'imported-st-card');
+  const portraitAssetPath = portraitBytes !== undefined ? `assets/portraits/${cardId}.png` : '';
+  const sourceSpec: CharacterCardSourceSpec = spec === 'chara_card_v3' ? 'v3' : 'v2';
+
   const rawDescription = getOwnString(cardData, 'description') ?? '';
   const personality = getOwnString(cardData, 'personality')?.trim() ?? '';
   const scenario = getOwnString(cardData, 'scenario') ?? '';
@@ -486,41 +426,8 @@ export function importSillyTavernCard(
   const characterVersion = getOwnString(cardData, 'character_version')?.trim() || '1.0.0';
   const mesExample = getOwnString(cardData, 'mes_example')?.trim() ?? '';
   const creatorNotes = getOwnString(cardData, 'creator_notes')?.trim() ?? '';
-
-  const personaDescriptionParts: string[] = [];
-  if (rawDescription.trim().length > 0) {
-    personaDescriptionParts.push(rawDescription.trim());
-  }
-  if (personality.length > 0) {
-    personaDescriptionParts.push(`Personality: ${personality}`);
-  }
-  const personaDescription = personaDescriptionParts.join('\n\n');
-
-  const combinedSystemPrompt = [systemPrompt.trim(), postHistory].filter((p) => p.length > 0).join('\n\n');
-
-  const loreFiles: Record<string, string> = {};
-  const beats: BeatDefinition[] = [];
-
-  if (mesExample.length > 0) {
-    setSafeProperty(loreFiles, 'lore/example-dialogue.md', mesExample);
-  }
-  if (creatorNotes.length > 0) {
-    setSafeProperty(loreFiles, 'lore/creator-notes.md', creatorNotes);
-  }
-
-  const altGreetings = getOwnValue(cardData, 'alternate_greetings');
-  if (Array.isArray(altGreetings)) {
-    const validGreetings = altGreetings.filter(
-      (g): g is string => typeof g === 'string' && g.trim().length > 0
-    );
-    if (validGreetings.length > 0) {
-      setSafeProperty(
-        loreFiles,
-        'lore/alternate-greetings.md',
-        validGreetings.map((g, idx) => `## Alternate Greeting ${idx + 1}\n\n${g}`).join('\n\n')
-      );
-    }
-  }
+  const alternateGreetings = extractStringList(getOwnValue(cardData, 'alternate_greetings'));
+  const tags = extractStringList(getOwnValue(cardData, 'tags'));
 
   const bookRaw =
     getOwnValue(cardData, 'character_book') ??
@@ -528,26 +435,117 @@ export function importSillyTavernCard(
     getOwnValue(sanitizedRoot, 'character_book') ??
     getOwnValue(sanitizedRoot, 'lorebook');
 
-  if (bookRaw !== undefined && bookRaw !== null) {
-    mapCharacterBookToBeatsAndLore(bookRaw, beats, loreFiles);
+  const embeddedLoreEntries =
+    bookRaw !== undefined && bookRaw !== null ? extractEmbeddedLoreEntries(bookRaw) : [];
+
+  const cardSheet: CharacterCardSheet = {
+    sourceSpec,
+    name,
+    description: rawDescription,
+    personality,
+    scenario,
+    firstMes: firstMessage,
+    alternateGreetings,
+    mesExample,
+    creatorNotes,
+    systemPrompt,
+    postHistoryInstructions: postHistory,
+    tags,
+    portraitAssetPath,
+    embeddedLoreEntries,
+  };
+
+  return ok({
+    sourceSpec,
+    cardId,
+    name,
+    rawDescription,
+    personality,
+    scenario,
+    firstMessage,
+    alternateGreetings,
+    mesExample,
+    creatorNotes,
+    systemPrompt,
+    postHistory,
+    tags,
+    ...(creator !== undefined ? { creator } : {}),
+    characterVersion,
+    cardSheet,
+    ...(portraitBytes !== undefined ? { portraitBytes } : {}),
+    portraitAssetPath,
+  });
+}
+
+function buildBundleFromParsedContext(
+  ctx: ParsedStCardContext,
+  options: { recommendedSystemPack?: string; includeCardEntity?: boolean } = {}
+): Result<CartridgeBundle, ValidationError[]> {
+  const personaDescriptionParts: string[] = [];
+  if (ctx.rawDescription.trim().length > 0) {
+    personaDescriptionParts.push(ctx.rawDescription.trim());
+  }
+  if (ctx.personality.length > 0) {
+    personaDescriptionParts.push(`Personality: ${ctx.personality}`);
+  }
+  const personaDescription = personaDescriptionParts.join('\n\n');
+
+  const combinedSystemPrompt = [ctx.systemPrompt.trim(), ctx.postHistory]
+    .filter((p) => p.length > 0)
+    .join('\n\n');
+
+  const loreFiles: Record<string, string> = {};
+  const beats: BeatDefinition[] = [];
+
+  if (ctx.mesExample.length > 0) {
+    setSafeProperty(loreFiles, 'lore/example-dialogue.md', ctx.mesExample);
+  }
+  if (ctx.creatorNotes.length > 0) {
+    setSafeProperty(loreFiles, 'lore/creator-notes.md', ctx.creatorNotes);
+  }
+
+  const validGreetings = ctx.alternateGreetings.filter((g) => g.trim().length > 0);
+  if (validGreetings.length > 0) {
+    setSafeProperty(
+      loreFiles,
+      'lore/alternate-greetings.md',
+      validGreetings.map((g, idx) => `## Alternate Greeting ${idx + 1}\n\n${g}`).join('\n\n')
+    );
+  }
+
+  if (ctx.cardSheet.embeddedLoreEntries.length > 0) {
+    const rawEntries = ctx.cardSheet.embeddedLoreEntries.map((entry) => ({
+      keys: entry.keys,
+      secondary_keys: entry.secondaryKeys,
+      content: entry.content,
+      constant: entry.constant,
+      insertion_order: entry.insertionOrder,
+      enabled: entry.enabled,
+      ...(entry.name !== undefined ? { name: entry.name } : {}),
+      ...(entry.id !== undefined ? { id: entry.id } : {}),
+    }));
+    mapCharacterBookToBeatsAndLore(rawEntries, beats, loreFiles);
   }
 
   const recommendedSystemPack = options.recommendedSystemPack ?? DEFAULT_RECOMMENDED_SYSTEM_PACK;
-  const cardId = slugifyId(name, 'imported-st-card');
-  const charId = slugifyCharacterId(name, cardId);
-
-  const seededSections: Record<string, string | string[]> = {};
-  if (personality.length > 0) {
-    setSafeProperty(seededSections, 'sec_personality', personality);
+  const binaryAssets: Record<string, Uint8Array> = {};
+  if (ctx.portraitBytes !== undefined && ctx.portraitAssetPath.length > 0) {
+    setSafeProperty(binaryAssets, ctx.portraitAssetPath, ctx.portraitBytes);
   }
-  const trimmedDescription = rawDescription.trim();
+
+  const trimmedDescription = ctx.rawDescription.trim();
+  const charId = slugifyCharacterId(ctx.name, ctx.cardId);
+  const seededSections: Record<string, string | string[]> = {};
+  if (ctx.personality.length > 0) {
+    setSafeProperty(seededSections, 'sec_personality', ctx.personality);
+  }
   if (trimmedDescription.length > 0) {
     setSafeProperty(seededSections, 'sec_background', buildBackgroundSummary(trimmedDescription));
   }
 
   const seededCharacter: CharacterEntity = {
     id: charId,
-    name,
+    name: ctx.name,
     status: 'active',
     presentInScene: true,
     locationId: null,
@@ -562,29 +560,52 @@ export function importSillyTavernCard(
     mood: 'neutral',
     traits: [],
   };
-  const initialCharacters: Record<string, CharacterEntity> = {};
-  setSafeProperty(initialCharacters, charId, seededCharacter);
+  const seededCharacters: Record<string, CharacterEntity> = {};
+  setSafeProperty(seededCharacters, charId, seededCharacter);
+
+  const cardEntityCharacters: Record<string, CharacterEntity> = {};
+  setSafeProperty(cardEntityCharacters, ctx.cardId, {
+    id: ctx.cardId,
+    name: ctx.name,
+    status: 'active',
+    presentInScene: true,
+    locationId: null,
+    formId: null,
+    formGroup: null,
+    sections: seededSections,
+    customFields: {},
+    abilities: [],
+    goals: [],
+    agenda: '',
+    allegiance: '',
+    mood: 'neutral',
+    traits: [...ctx.tags],
+    cardSheet: cloneCharacterCardSheet(ctx.cardSheet),
+    ...(ctx.portraitAssetPath.length > 0
+      ? { portraitAsset: ctx.portraitAssetPath }
+      : {}),
+  });
 
   const bundle: CartridgeBundle = {
     rootDir: null,
     card: {
       spec: 'cartridge/0.1',
-      id: cardId,
-      version: characterVersion,
-      title: name,
-      ...(creator !== undefined && creator.length > 0 ? { author: creator } : {}),
-      description: trimmedDescription || `${name} (imported SillyTavern card)`,
+      id: ctx.cardId,
+      version: ctx.characterVersion,
+      title: ctx.name,
+      ...(ctx.creator !== undefined && ctx.creator.length > 0 ? { author: ctx.creator } : {}),
+      description: trimmedDescription || `${ctx.name} (imported SillyTavern card)`,
       recommendedSystemPack,
       persona: {
-        name,
+        name: ctx.name,
         description: personaDescription,
-        ...(scenario.trim().length > 0 ? { scenario } : {}),
-        ...(firstMessage.trim().length > 0 ? { firstMessage } : {}),
+        ...(ctx.scenario.trim().length > 0 ? { scenario: ctx.scenario } : {}),
+        ...(ctx.firstMessage.trim().length > 0 ? { firstMessage: ctx.firstMessage } : {}),
         ...(combinedSystemPrompt.length > 0 ? { systemPrompt: combinedSystemPrompt } : {}),
       },
     },
     initialEntities: {
-      characters: initialCharacters,
+      characters: options.includeCardEntity ? cardEntityCharacters : seededCharacters,
     },
     beats,
     routes: [],
@@ -592,7 +613,150 @@ export function importSillyTavernCard(
     loreFiles,
     endingPromptFiles: {},
     scriptFiles: {},
+    ...(Object.keys(binaryAssets).length > 0 ? { binaryAssets } : {}),
   };
 
   return validateCartridgeStructure(bundle);
+}
+
+/**
+ * Import a SillyTavern V1, V2 (`chara_card_v2`), or V3 (`chara_card_v3`) character card
+ * from a PNG `Buffer`, JSON string, base64 string, or parsed object into a validated
+ * Tier 0 {@link CartridgeBundle}.
+ */
+export function importSillyTavernCard(
+  input: Buffer | string | Record<string, unknown>,
+  options: { recommendedSystemPack?: string } = {}
+): Result<CartridgeBundle, ValidationError[]> {
+  const ctxRes = parseStCardContext(input);
+  if (!ctxRes.ok) {
+    return ctxRes;
+  }
+  return buildBundleFromParsedContext(ctxRes.value, options);
+}
+
+/**
+ * Import a `.png` character card into a 1-on-1 playable {@link CartridgeBundle},
+ * retaining the raw portrait PNG bytes under `binaryAssets['assets/portraits/<id>.png']`
+ * and a card-backed {@link CharacterEntity} in `initialEntities.characters`.
+ */
+export function importPngAsCartridge(
+  pngBuffer: Buffer,
+  options: { recommendedSystemPack?: string } = {}
+): Result<CartridgeBundle, ValidationError[]> {
+  if (!Buffer.isBuffer(pngBuffer)) {
+    return err([validationError('', 'INVALID_TYPE', 'PNG input must be a Node Buffer')]);
+  }
+  if (pngBuffer.length < PNG_SIGNATURE.length || !pngBuffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return err([
+      validationError('', 'INVALID_PNG_SIGNATURE', 'Buffer does not start with a valid PNG signature'),
+    ]);
+  }
+  const ctxRes = parseStCardContext(pngBuffer);
+  if (!ctxRes.ok) {
+    return ctxRes;
+  }
+  return buildBundleFromParsedContext(ctxRes.value, {
+    ...options,
+    includeCardEntity: true,
+  });
+}
+
+export interface ImportedPngCharacterResult {
+  entity: CharacterEntity;
+  portraitAssetPath: string;
+  portraitBytes: Uint8Array;
+}
+
+/**
+ * Import a `.png` character card as a drop-in roster {@link CharacterEntity}
+ * with `cardSheet` and `portraitAsset`, keeping binary bytes separate from `WorldState`.
+ */
+export function importPngAsCharacterEntity(
+  pngBuffer: Buffer,
+  options: {
+    id?: string;
+    locationId?: string | null;
+    presentInScene?: boolean;
+    status?: CharacterStatus;
+  } = {}
+): Result<ImportedPngCharacterResult, ValidationError[]> {
+  if (!Buffer.isBuffer(pngBuffer)) {
+    return err([validationError('', 'INVALID_TYPE', 'PNG input must be a Node Buffer')]);
+  }
+  if (pngBuffer.length < PNG_SIGNATURE.length || !pngBuffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return err([
+      validationError('', 'INVALID_PNG_SIGNATURE', 'Buffer does not start with a valid PNG signature'),
+    ]);
+  }
+
+  const ctxRes = parseStCardContext(pngBuffer, options.id);
+  if (!ctxRes.ok) {
+    return ctxRes;
+  }
+
+  const ctx = ctxRes.value;
+  const portraitBytes = ctx.portraitBytes ?? new Uint8Array(pngBuffer);
+  const entity: CharacterEntity = {
+    id: ctx.cardId,
+    name: ctx.name,
+    status: options.status ?? 'active',
+    presentInScene: options.presentInScene ?? true,
+    locationId: options.locationId ?? null,
+    formId: null,
+    formGroup: null,
+    sections: {},
+    customFields: {},
+    abilities: [],
+    goals: [],
+    agenda: '',
+    allegiance: '',
+    mood: 'neutral',
+    traits: [...ctx.tags],
+    cardSheet: cloneCharacterCardSheet(ctx.cardSheet),
+    portraitAsset: ctx.portraitAssetPath,
+  };
+
+  return ok({
+    entity,
+    portraitAssetPath: ctx.portraitAssetPath,
+    portraitBytes,
+  });
+}
+
+export interface ImportedPngPlayerPersonaResult {
+  name: string;
+  personaCard: CharacterCardSheet;
+  portraitAssetPath: string;
+  portraitBytes: Uint8Array;
+}
+
+/**
+ * Import a `.png` character card as a player persona (`WorldState.player.personaCard`
+ * + `portraitAsset`), keeping raw PNG bytes separate from `WorldState`.
+ */
+export function importPngAsPlayerPersona(
+  pngBuffer: Buffer
+): Result<ImportedPngPlayerPersonaResult, ValidationError[]> {
+  if (!Buffer.isBuffer(pngBuffer)) {
+    return err([validationError('', 'INVALID_TYPE', 'PNG input must be a Node Buffer')]);
+  }
+  if (pngBuffer.length < PNG_SIGNATURE.length || !pngBuffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return err([
+      validationError('', 'INVALID_PNG_SIGNATURE', 'Buffer does not start with a valid PNG signature'),
+    ]);
+  }
+
+  const ctxRes = parseStCardContext(pngBuffer);
+  if (!ctxRes.ok) {
+    return ctxRes;
+  }
+
+  const ctx = ctxRes.value;
+  return ok({
+    name: ctx.name,
+    personaCard: cloneCharacterCardSheet(ctx.cardSheet),
+    portraitAssetPath: ctx.portraitAssetPath,
+    portraitBytes: ctx.portraitBytes ?? new Uint8Array(pngBuffer),
+  });
 }

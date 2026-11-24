@@ -15,7 +15,25 @@ import {
   cloneSystemCapabilities,
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
-import type { LocationEntity } from './spatial-topology.js';
+import {
+  type CharacterCardSheet,
+  cloneCharacterCardSheet,
+  validateCharacterCardSheet,
+} from './character-card-sheet.js';
+import { type FormIndex, applyFormProfileOverlay } from './forms.js';
+import {
+  type AssetKnowledgeTier,
+  type ConnectionMeta,
+  type ConnectionStateKind,
+  type DiscoveryState,
+  type HiddenAssetCanonStatus,
+  type HiddenAssetKind,
+  type HiddenSiteAsset,
+  type LocationEntity,
+  type LocationGeometry,
+  type LocationMapAssets,
+  cloneLocationEntity,
+} from './spatial-topology.js';
 
 export const WORLD_STATE_SCHEMA_VERSION = 2 as const;
 
@@ -65,12 +83,15 @@ export interface CharacterEntity {
   progression?: CharacterProgression;
   resources?: Record<string, ResourcePool>;
   corruption?: CorruptionState;
+  lockedForms?: Record<string, boolean>;
   abilities: string[];
   goals: string[];
   agenda: string;
   allegiance: string;
   mood: string;
   traits: string[];
+  cardSheet?: CharacterCardSheet;
+  portraitAsset?: string;
 }
 
 export const FACTION_SIDES = Object.freeze([
@@ -139,6 +160,18 @@ export interface ChronicleEntry {
   keywords: string[];
 }
 
+/**
+ * Published in-world newsroom digest edition synthesized from chronicle events and agendas.
+ */
+export interface DigestEdition {
+  id: string;
+  day: number;
+  inGameDate: string | null;
+  masthead: string;
+  headlines: string[];
+  locationIds: string[];
+}
+
 export interface RelationEntry {
   affinity: number;
   maxAffinity: number;
@@ -172,6 +205,7 @@ export interface WorldState {
     id: string;
     name: string;
     characterId: string | null;
+    canonCharacterId?: string | null;
     locationId: string | null;
     progression?: CharacterProgression;
     resources?: Record<string, ResourcePool>;
@@ -181,6 +215,8 @@ export interface WorldState {
     };
     customFields: Record<string, unknown>;
     sections: Record<string, string | string[]>;
+    personaCard?: CharacterCardSheet | null;
+    portraitAsset?: string | null;
   };
   scene: {
     location: string;
@@ -204,6 +240,7 @@ export interface WorldState {
   };
   chronicle: {
     events: ChronicleEntry[];
+    digestEditions?: DigestEdition[];
   };
   turnEvents: {
     combatOutcomes: string[];
@@ -234,6 +271,7 @@ export interface CreateWorldStateOptions {
   locations?: Record<string, LocationEntity> | readonly LocationEntity[];
   entities?: Partial<WorldState['entities']>;
   chronicleEvents?: readonly ChronicleEntry[];
+  digestEditions?: readonly DigestEdition[];
   turnEvents?: Partial<WorldState['turnEvents']>;
 }
 
@@ -263,6 +301,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   }
   const proto = Object.getPrototypeOf(value) as object | null;
   return proto === Object.prototype || proto === null;
+}
+
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isUnsafeKey(key: string): boolean {
+  return key.length === 0 || FORBIDDEN_KEYS.has(key);
 }
 
 function setRecordEntry<T>(record: Record<string, T>, key: string, value: T): void {
@@ -398,6 +442,15 @@ function cloneCharacterEntity(character: CharacterEntity): CharacterEntity {
   if (character.corruption !== undefined) {
     cloned.corruption = { ...character.corruption };
   }
+  if (character.cardSheet !== undefined) {
+    cloned.cardSheet = cloneCharacterCardSheet(character.cardSheet);
+  }
+  if (character.portraitAsset !== undefined) {
+    cloned.portraitAsset = character.portraitAsset;
+  }
+  if (character.lockedForms !== undefined) {
+    cloned.lockedForms = clonePrimitiveRecord(character.lockedForms);
+  }
   return cloned;
 }
 
@@ -427,20 +480,6 @@ function cloneThreatEntity(threat: ThreatEntity): ThreatEntity {
   };
 }
 
-function cloneLocationEntity(location: LocationEntity): LocationEntity {
-  return {
-    id: location.id,
-    name: location.name,
-    kind: location.kind,
-    status: location.status,
-    controllingFactionId: location.controllingFactionId,
-    connectedLocations: [...location.connectedLocations],
-    discovered: location.discovered,
-    tags: [...location.tags],
-    notes: location.notes,
-  };
-}
-
 function cloneChronicleEntry(entry: ChronicleEntry): ChronicleEntry {
   return {
     id: entry.id,
@@ -453,6 +492,17 @@ function cloneChronicleEntry(entry: ChronicleEntry): ChronicleEntry {
     locationId: entry.locationId,
     involvedEntityIds: [...entry.involvedEntityIds],
     keywords: [...entry.keywords],
+  };
+}
+
+function cloneDigestEdition(edition: DigestEdition): DigestEdition {
+  return {
+    id: edition.id,
+    day: edition.day,
+    inGameDate: edition.inGameDate,
+    masthead: edition.masthead,
+    headlines: [...edition.headlines],
+    locationIds: [...edition.locationIds],
   };
 }
 
@@ -511,11 +561,23 @@ export function cloneWorldState(state: WorldState): WorldState {
     customFields: clonePlainRecord(state.player.customFields),
     sections: cloneSections(state.player.sections),
   };
+  if (state.player.canonCharacterId !== undefined) {
+    player.canonCharacterId = state.player.canonCharacterId;
+  }
   if (state.player.progression !== undefined) {
     player.progression = cloneProgression(state.player.progression);
   }
   if (state.player.resources !== undefined) {
     player.resources = cloneResources(state.player.resources);
+  }
+  if (state.player.personaCard !== undefined) {
+    player.personaCard =
+      state.player.personaCard === null
+        ? null
+        : cloneCharacterCardSheet(state.player.personaCard);
+  }
+  if (state.player.portraitAsset !== undefined) {
+    player.portraitAsset = state.player.portraitAsset;
   }
 
   const characters: Record<string, CharacterEntity> = {};
@@ -569,6 +631,9 @@ export function cloneWorldState(state: WorldState): WorldState {
     },
     chronicle: {
       events: state.chronicle.events.map(cloneChronicleEntry),
+      ...(state.chronicle.digestEditions !== undefined
+        ? { digestEditions: state.chronicle.digestEditions.map(cloneDigestEdition) }
+        : {}),
     },
     turnEvents: {
       combatOutcomes: [...state.turnEvents.combatOutcomes],
@@ -661,6 +726,9 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
       : {},
     sections: options.player?.sections ? cloneSections(options.player.sections) : {},
   };
+  if (options.player?.canonCharacterId !== undefined) {
+    player.canonCharacterId = options.player.canonCharacterId;
+  }
 
   if (options.player?.progression !== undefined) {
     player.progression = cloneProgression(options.player.progression);
@@ -676,6 +744,15 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
       willpower: { current: 10, max: 10 },
       stamina: { current: 100, max: 100 },
     };
+  }
+  if (options.player?.personaCard !== undefined) {
+    player.personaCard =
+      options.player.personaCard === null
+        ? null
+        : cloneCharacterCardSheet(options.player.personaCard);
+  }
+  if (options.player?.portraitAsset !== undefined) {
+    player.portraitAsset = options.player.portraitAsset;
   }
 
   const defaultArc: WorldArc =
@@ -717,6 +794,9 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
     },
     chronicle: {
       events: options.chronicleEvents ? options.chronicleEvents.map(cloneChronicleEntry) : [],
+      ...(options.digestEditions !== undefined
+        ? { digestEditions: options.digestEditions.map(cloneDigestEdition) }
+        : {}),
     },
     turnEvents: {
       combatOutcomes: options.turnEvents?.combatOutcomes
@@ -1360,7 +1440,7 @@ export function validateWorldState(
         const tags = validateStringArrayField(rawLoc.tags, `${locPath}.tags`, errors, warnings);
         const notes = validateStringWithDefault(rawLoc.notes, '', `${locPath}.notes`, errors, warnings);
 
-        setRecordEntry(locations, key, {
+        const locEntity: LocationEntity = {
           id,
           name,
           kind,
@@ -1370,7 +1450,9 @@ export function validateWorldState(
           discovered,
           tags,
           notes,
-        });
+        };
+        attachValidatedLocationV2Fields(rawLoc, locEntity, locPath, errors);
+        setRecordEntry(locations, key, locEntity);
       }
     }
 
@@ -1529,6 +1611,52 @@ export function validateWorldState(
         }
         if (corruption !== undefined) {
           entity.corruption = corruption;
+        }
+        if (rawChar.cardSheet !== undefined) {
+          const sheetRes = validateCharacterCardSheet(rawChar.cardSheet, `${charPath}.cardSheet`);
+          if (!sheetRes.ok) {
+            errors.addAll(sheetRes.error);
+          } else {
+            entity.cardSheet = sheetRes.value;
+          }
+        }
+        if (rawChar.portraitAsset !== undefined) {
+          if (typeof rawChar.portraitAsset !== 'string') {
+            errors.add(
+              `${charPath}.portraitAsset`,
+              'INVALID_TYPE',
+              `${charPath}.portraitAsset must be a string`
+            );
+          } else {
+            entity.portraitAsset = rawChar.portraitAsset;
+          }
+        }
+        if (rawChar.lockedForms !== undefined) {
+          if (!isPlainObject(rawChar.lockedForms)) {
+            errors.add(`${charPath}.lockedForms`, 'INVALID_TYPE', 'lockedForms must be an object');
+          } else {
+            const lockedForms: Record<string, boolean> = {};
+            for (const [formKey, lockedVal] of Object.entries(rawChar.lockedForms)) {
+              if (isUnsafeKey(formKey)) {
+                errors.add(
+                  `${charPath}.lockedForms.${formKey}`,
+                  'UNSAFE_PROPERTY_KEY',
+                  `Unsafe lockedForms key "${formKey}"`
+                );
+                continue;
+              }
+              if (typeof lockedVal !== 'boolean') {
+                errors.add(
+                  `${charPath}.lockedForms.${formKey}`,
+                  'INVALID_TYPE',
+                  'lockedForms values must be boolean'
+                );
+                continue;
+              }
+              setRecordEntry(lockedForms, formKey, lockedVal);
+            }
+            entity.lockedForms = lockedForms;
+          }
         }
         setRecordEntry(characters, key, entity);
       }
@@ -1766,6 +1894,22 @@ export function validateWorldState(
         `player.characterId "${player.characterId}" does not resolve in entities.characters`
       );
     }
+    if (rawPlayer.canonCharacterId !== undefined) {
+      const canonCharacterId = validateNullableString(
+        rawPlayer.canonCharacterId,
+        'player.canonCharacterId',
+        errors,
+        warnings
+      );
+      player.canonCharacterId = canonCharacterId;
+      if (canonCharacterId !== null && !Object.hasOwn(characters, canonCharacterId)) {
+        errors.add(
+          'player.canonCharacterId',
+          'UNRESOLVED_CHARACTER',
+          `player.canonCharacterId "${canonCharacterId}" does not resolve in entities.characters`
+        );
+      }
+    }
     player.locationId = validateNullableString(
       rawPlayer.locationId,
       'player.locationId',
@@ -1810,6 +1954,32 @@ export function validateWorldState(
       warnings
     );
     player.sections = validateSectionsField(rawPlayer.sections, 'player.sections', errors, warnings);
+    if (rawPlayer.personaCard !== undefined) {
+      if (rawPlayer.personaCard === null) {
+        player.personaCard = null;
+      } else {
+        const personaRes = validateCharacterCardSheet(
+          rawPlayer.personaCard,
+          'player.personaCard'
+        );
+        if (!personaRes.ok) {
+          errors.addAll(personaRes.error);
+        } else {
+          player.personaCard = personaRes.value;
+        }
+      }
+    }
+    if (rawPlayer.portraitAsset !== undefined) {
+      if (rawPlayer.portraitAsset !== null && typeof rawPlayer.portraitAsset !== 'string') {
+        errors.add(
+          'player.portraitAsset',
+          'INVALID_TYPE',
+          'player.portraitAsset must be a string or null'
+        );
+      } else {
+        player.portraitAsset = rawPlayer.portraitAsset;
+      }
+    }
   }
 
   // scene
@@ -1952,15 +2122,17 @@ export function validateWorldState(
 
   // chronicle
   const chronicleEvents: ChronicleEntry[] = [];
+  let digestEditions: DigestEdition[] | undefined;
   if (state.chronicle === undefined) {
     warnMissing(warnings, 'chronicle', 'chronicle');
   } else if (!isPlainObject(state.chronicle)) {
     errors.add('chronicle', 'INVALID_TYPE', 'chronicle must be an object');
-  } else if (state.chronicle.events === undefined) {
-    warnMissing(warnings, 'chronicle.events', 'chronicle.events');
-  } else if (!Array.isArray(state.chronicle.events)) {
-    errors.add('chronicle.events', 'INVALID_TYPE', 'chronicle.events must be an array');
   } else {
+    if (state.chronicle.events === undefined) {
+      warnMissing(warnings, 'chronicle.events', 'chronicle.events');
+    } else if (!Array.isArray(state.chronicle.events)) {
+      errors.add('chronicle.events', 'INVALID_TYPE', 'chronicle.events must be an array');
+    } else {
     for (let i = 0; i < state.chronicle.events.length; i += 1) {
       const rawEntry = state.chronicle.events[i];
       const entryPath = `chronicle.events[${i}]`;
@@ -2040,6 +2212,72 @@ export function validateWorldState(
         involvedEntityIds,
         keywords,
       });
+    }
+    }
+    if (state.chronicle.digestEditions !== undefined) {
+      if (!Array.isArray(state.chronicle.digestEditions)) {
+        errors.add(
+          'chronicle.digestEditions',
+          'INVALID_TYPE',
+          'chronicle.digestEditions must be an array'
+        );
+      } else {
+        digestEditions = [];
+        for (let i = 0; i < state.chronicle.digestEditions.length; i += 1) {
+          const rawEdition = state.chronicle.digestEditions[i];
+          const editionPath = `chronicle.digestEditions[${i}]`;
+          if (!isPlainObject(rawEdition)) {
+            errors.add(editionPath, 'INVALID_TYPE', 'DigestEdition must be an object');
+            continue;
+          }
+          let id = '';
+          if (typeof rawEdition.id !== 'string' || rawEdition.id.trim().length === 0) {
+            errors.add(`${editionPath}.id`, 'REQUIRED', 'DigestEdition id must be a non-empty string');
+          } else {
+            id = rawEdition.id;
+          }
+          if (
+            typeof rawEdition.day !== 'number' ||
+            !Number.isInteger(rawEdition.day) ||
+            rawEdition.day < 0
+          ) {
+            errors.add(`${editionPath}.day`, 'INVALID_INTEGER', 'day must be an integer >= 0');
+          }
+          const inGameDate = validateNullableString(
+            rawEdition.inGameDate,
+            `${editionPath}.inGameDate`,
+            errors,
+            warnings
+          );
+          const masthead = validateStringWithDefault(
+            rawEdition.masthead,
+            '',
+            `${editionPath}.masthead`,
+            errors,
+            warnings
+          );
+          const headlines = validateStringArrayField(
+            rawEdition.headlines,
+            `${editionPath}.headlines`,
+            errors,
+            warnings
+          );
+          const locationIds = validateStringArrayField(
+            rawEdition.locationIds,
+            `${editionPath}.locationIds`,
+            errors,
+            warnings
+          );
+          digestEditions.push({
+            id,
+            day: typeof rawEdition.day === 'number' ? rawEdition.day : 1,
+            inGameDate,
+            masthead,
+            headlines,
+            locationIds,
+          });
+        }
+      }
     }
   }
 
@@ -2175,6 +2413,7 @@ export function validateWorldState(
     },
     chronicle: {
       events: chronicleEvents,
+      ...(digestEditions !== undefined ? { digestEditions } : {}),
     },
     turnEvents,
   };
@@ -2183,4 +2422,307 @@ export function validateWorldState(
     state: normalizedState,
     warnings: [...warnings.errors],
   });
+}
+
+const DISCOVERY_STATES: ReadonlySet<string> = new Set<DiscoveryState>([
+  'unknown',
+  'rumored',
+  'discovered',
+  'visited',
+]);
+
+const CONNECTION_STATE_KINDS: ReadonlySet<string> = new Set<ConnectionStateKind>([
+  'open',
+  'closed',
+  'locked',
+  'blocked',
+  'destroyed',
+  'secret',
+]);
+
+const HIDDEN_ASSET_KINDS: ReadonlySet<string> = new Set<HiddenAssetKind>([
+  'trap',
+  'hazard',
+  'loot',
+  'barrier',
+  'subdungeon',
+  'subinterior',
+  'clue',
+]);
+
+const ASSET_KNOWLEDGE_TIERS: ReadonlySet<string> = new Set<AssetKnowledgeTier>([
+  'unrevealed',
+  'suspected',
+  'known',
+]);
+
+const HIDDEN_ASSET_CANON_STATUSES: ReadonlySet<string> = new Set<HiddenAssetCanonStatus>([
+  'intact',
+  'triggered',
+  'disarmed',
+  'taken',
+  'destroyed',
+  'cleared',
+]);
+
+const FORBIDDEN_LOCATION_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+function isSafeLocationRecordKey(key: string): boolean {
+  return key.length > 0 && !FORBIDDEN_LOCATION_KEYS.has(key);
+}
+
+function attachValidatedLocationV2Fields(
+  rawLoc: Record<string, unknown>,
+  locEntity: LocationEntity,
+  locPath: string,
+  errors: { add: (path: string, code: string, message: string) => void }
+): void {
+  if (rawLoc.discoveryState !== undefined) {
+    if (typeof rawLoc.discoveryState !== 'string' || !DISCOVERY_STATES.has(rawLoc.discoveryState)) {
+      errors.add(
+        `${locPath}.discoveryState`,
+        'INVALID_ENUM',
+        'discoveryState must be unknown, rumored, discovered, or visited'
+      );
+    } else {
+      locEntity.discoveryState = rawLoc.discoveryState as DiscoveryState;
+    }
+  }
+
+  if (rawLoc.geometry !== undefined) {
+    if (!isPlainObject(rawLoc.geometry)) {
+      errors.add(`${locPath}.geometry`, 'INVALID_TYPE', 'geometry must be an object');
+    } else {
+      const g = rawLoc.geometry;
+      if (typeof g.x !== 'number' || !Number.isFinite(g.x) || typeof g.y !== 'number' || !Number.isFinite(g.y)) {
+        errors.add(`${locPath}.geometry`, 'INVALID_TYPE', 'geometry.x and geometry.y must be finite numbers');
+      } else {
+        const geom: LocationGeometry = {
+          x: g.x === 0 ? 0 : g.x,
+          y: g.y === 0 ? 0 : g.y,
+        };
+        if (typeof g.districtId === 'string') geom.districtId = g.districtId;
+        if (typeof g.regionId === 'string') geom.regionId = g.regionId;
+        if (Array.isArray(g.polygon)) {
+          const poly: [number, number][] = [];
+          let validPoly = true;
+          for (const pt of g.polygon) {
+            if (
+              Array.isArray(pt) &&
+              pt.length === 2 &&
+              typeof pt[0] === 'number' &&
+              Number.isFinite(pt[0]) &&
+              typeof pt[1] === 'number' &&
+              Number.isFinite(pt[1])
+            ) {
+              poly.push([pt[0] === 0 ? 0 : pt[0], pt[1] === 0 ? 0 : pt[1]]);
+            } else {
+              validPoly = false;
+              break;
+            }
+          }
+          if (!validPoly) {
+            errors.add(`${locPath}.geometry.polygon`, 'INVALID_TYPE', 'polygon must be an array of [number, number] pairs');
+          } else {
+            geom.polygon = poly;
+          }
+        }
+        if (isPlainObject(g.mapRef) && typeof g.mapRef.layer === 'string' && typeof g.mapRef.id === 'string') {
+          geom.mapRef = { layer: g.mapRef.layer, id: g.mapRef.id };
+        }
+        locEntity.geometry = geom;
+      }
+    }
+  }
+
+  if (rawLoc.mapAssets !== undefined) {
+    if (!isPlainObject(rawLoc.mapAssets)) {
+      errors.add(`${locPath}.mapAssets`, 'INVALID_TYPE', 'mapAssets must be an object');
+    } else {
+      const ma = rawLoc.mapAssets;
+      const assets: LocationMapAssets = {};
+      if (typeof ma.imagePath === 'string') assets.imagePath = ma.imagePath;
+      if (typeof ma.geoJsonPath === 'string') assets.geoJsonPath = ma.geoJsonPath;
+      if (typeof ma.svgPath === 'string') assets.svgPath = ma.svgPath;
+      if (typeof ma.width === 'number' && Number.isFinite(ma.width)) {
+        assets.width = ma.width === 0 ? 0 : ma.width;
+      }
+      if (typeof ma.height === 'number' && Number.isFinite(ma.height)) {
+        assets.height = ma.height === 0 ? 0 : ma.height;
+      }
+      locEntity.mapAssets = assets;
+    }
+  }
+
+  if (rawLoc.connectionsMeta !== undefined) {
+    if (!isPlainObject(rawLoc.connectionsMeta)) {
+      errors.add(`${locPath}.connectionsMeta`, 'INVALID_TYPE', 'connectionsMeta must be an object');
+    } else {
+      const meta: Record<string, ConnectionMeta> = {};
+      for (const [targetId, rawConn] of Object.entries(rawLoc.connectionsMeta)) {
+        if (!isSafeLocationRecordKey(targetId)) {
+          errors.add(`${locPath}.connectionsMeta`, 'FORBIDDEN_KEY', `Forbidden key "${targetId}"`);
+          continue;
+        }
+        if (!isPlainObject(rawConn) || typeof rawConn.state !== 'string' || !CONNECTION_STATE_KINDS.has(rawConn.state)) {
+          errors.add(`${locPath}.connectionsMeta.${targetId}`, 'INVALID_TYPE', 'Invalid connection metadata');
+          continue;
+        }
+        const entry: ConnectionMeta = { state: rawConn.state as ConnectionStateKind };
+        if (Array.isArray(rawConn.travelModes)) {
+          entry.travelModes = rawConn.travelModes.filter((m): m is string => typeof m === 'string');
+        }
+        if (typeof rawConn.keyItemId === 'string') {
+          entry.keyItemId = rawConn.keyItemId;
+        }
+        setRecordEntry(meta, targetId, entry);
+      }
+      locEntity.connectionsMeta = meta;
+    }
+  }
+
+  if (rawLoc.hiddenAssets !== undefined) {
+    if (!isPlainObject(rawLoc.hiddenAssets)) {
+      errors.add(`${locPath}.hiddenAssets`, 'INVALID_TYPE', 'hiddenAssets must be an object');
+    } else {
+      const hidden: Record<string, HiddenSiteAsset> = {};
+      for (const [assetId, rawAsset] of Object.entries(rawLoc.hiddenAssets)) {
+        if (!isSafeLocationRecordKey(assetId)) {
+          errors.add(`${locPath}.hiddenAssets`, 'FORBIDDEN_KEY', `Forbidden key "${assetId}"`);
+          continue;
+        }
+        if (
+          !isPlainObject(rawAsset) ||
+          typeof rawAsset.id !== 'string' ||
+          typeof rawAsset.kind !== 'string' ||
+          !HIDDEN_ASSET_KINDS.has(rawAsset.kind) ||
+          typeof rawAsset.name !== 'string' ||
+          typeof rawAsset.knowledgeTier !== 'string' ||
+          !ASSET_KNOWLEDGE_TIERS.has(rawAsset.knowledgeTier) ||
+          typeof rawAsset.canonStatus !== 'string' ||
+          !HIDDEN_ASSET_CANON_STATUSES.has(rawAsset.canonStatus) ||
+          typeof rawAsset.canonLocked !== 'boolean'
+        ) {
+          errors.add(`${locPath}.hiddenAssets.${assetId}`, 'INVALID_TYPE', 'Invalid HiddenSiteAsset');
+          continue;
+        }
+        const entry: HiddenSiteAsset = {
+          id: rawAsset.id,
+          kind: rawAsset.kind as HiddenAssetKind,
+          name: rawAsset.name,
+          knowledgeTier: rawAsset.knowledgeTier as AssetKnowledgeTier,
+          canonStatus: rawAsset.canonStatus as HiddenAssetCanonStatus,
+          canonLocked: rawAsset.canonLocked,
+        };
+        if (typeof rawAsset.description === 'string') {
+          entry.description = rawAsset.description;
+        }
+        if (typeof rawAsset.linkedLocationId === 'string') {
+          entry.linkedLocationId = rawAsset.linkedLocationId;
+        }
+        setRecordEntry(hidden, assetId, entry);
+      }
+      locEntity.hiddenAssets = hidden;
+    }
+  }
+}
+
+/**
+ * Bind the player to a canon roster character, syncing identity, location, sections,
+ * resources, and progression from the character (and its active form if `formIndex` is supplied),
+ * and removing the bound character (and same-formGroup forms) from `scene.presentCharacterIds`.
+ */
+export function bindPlayerToCanonCharacter(
+  worldState: WorldState,
+  canonCharacterId: string,
+  formIndex?: FormIndex
+): WorldState {
+  if (typeof canonCharacterId !== 'string' || canonCharacterId.trim().length === 0 || isUnsafeKey(canonCharacterId)) {
+    throw new RefereeError(`Invalid canonCharacterId "${String(canonCharacterId)}"`, {
+      code: 'INVALID_CANON_CHARACTER_ID',
+      details: { canonCharacterId },
+    });
+  }
+
+  if (!Object.hasOwn(worldState.entities.characters, canonCharacterId)) {
+    throw new RefereeError(`Canon character "${canonCharacterId}" was not found in entities.characters`, {
+      code: 'CHARACTER_NOT_FOUND',
+      details: { canonCharacterId },
+    });
+  }
+
+  const nextState = cloneWorldState(worldState);
+  const rawChar = Object.getOwnPropertyDescriptor(nextState.entities.characters, canonCharacterId)
+    ?.value as CharacterEntity | undefined;
+  if (!rawChar) {
+    throw new RefereeError(`Canon character "${canonCharacterId}" was not found in entities.characters`, {
+      code: 'CHARACTER_NOT_FOUND',
+      details: { canonCharacterId },
+    });
+  }
+
+  let effectiveChar = rawChar;
+  if (formIndex && rawChar.formId !== null && formIndex.byId.has(rawChar.formId)) {
+    effectiveChar = applyFormProfileOverlay(rawChar, rawChar.formId, formIndex);
+    setRecordEntry(nextState.entities.characters, canonCharacterId, effectiveChar);
+  }
+
+  nextState.player.characterId = effectiveChar.id;
+  nextState.player.canonCharacterId = effectiveChar.id;
+  nextState.player.name = effectiveChar.name;
+  nextState.player.locationId = effectiveChar.locationId;
+  nextState.player.sections = cloneSections(effectiveChar.sections);
+
+  if (effectiveChar.resources !== undefined) {
+    nextState.player.resources = cloneResources(effectiveChar.resources);
+  } else {
+    delete nextState.player.resources;
+  }
+
+  if (effectiveChar.progression !== undefined) {
+    nextState.player.progression = cloneProgression(effectiveChar.progression);
+  } else {
+    delete nextState.player.progression;
+  }
+
+  if (effectiveChar.locationId !== null) {
+    nextState.scene.locationId = effectiveChar.locationId;
+    if (!isUnsafeKey(effectiveChar.locationId) && Object.hasOwn(nextState.entities.locations, effectiveChar.locationId)) {
+      const loc = Object.getOwnPropertyDescriptor(
+        nextState.entities.locations,
+        effectiveChar.locationId
+      )?.value as LocationEntity | undefined;
+      if (loc) {
+        nextState.scene.location = loc.name;
+      }
+    }
+  }
+
+  const excludedGroup =
+    effectiveChar.formGroup ??
+    (effectiveChar.formId !== null ? formIndex?.byId.get(effectiveChar.formId)?.formGroup ?? null : null);
+  nextState.scene.presentCharacterIds = nextState.scene.presentCharacterIds.filter((id) => {
+    if (id === effectiveChar.id) {
+      return false;
+    }
+    if (excludedGroup !== null && !isUnsafeKey(id) && Object.hasOwn(nextState.entities.characters, id)) {
+      const other = Object.getOwnPropertyDescriptor(nextState.entities.characters, id)
+        ?.value as CharacterEntity | undefined;
+      if (other) {
+        const otherGroup =
+          other.formGroup ??
+          (other.formId !== null ? formIndex?.byId.get(other.formId)?.formGroup ?? null : null);
+        if (otherGroup === excludedGroup) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
+  return nextState;
 }

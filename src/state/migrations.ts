@@ -332,6 +332,16 @@ function migrateV1ToV2Candidate(raw: Record<string, unknown>): Record<string, un
   const locations = normalizeCollectionToMap(
     getOwn(rawEntities, 'locations') ?? getOwn(raw, 'locations')
   );
+  if (isPlainObject(locations)) {
+    for (const loc of Object.values(locations)) {
+      if (isPlainObject(loc) && getOwn(loc, 'discoveryState') === undefined) {
+        const discovered = getOwn(loc, 'discovered');
+        if (typeof discovered === 'boolean') {
+          setOwn(loc, 'discoveryState', discovered ? 'discovered' : 'unknown');
+        }
+      }
+    }
+  }
 
   // player
   const rawPlayerSource = getOwn(raw, 'player');

@@ -14,7 +14,7 @@ import {
   resolveSkillDefinition,
   validateSingleCombatAction,
 } from './action-validator.js';
-import type { GridCoord, TacticalGrid } from './grid-types.js';
+import type { GridCoord, TacticalGrid, TileHazard } from './grid-types.js';
 import type { SkillDefinition, SkillRegistry } from './skill-registry.js';
 import { findShortestPath, getTileAt } from './spatial-math.js';
 
@@ -191,12 +191,49 @@ function findBestValidAttackAgainst(
   return null;
 }
 
+function isDamagingHazard(hazard: TileHazard): boolean {
+  return hazard === 'fire' || hazard === 'acid' || hazard === 'ice' || hazard === 'electrified';
+}
+
+function getHazardAvoidCoords(grid: TacticalGrid, start: GridCoord): GridCoord[] {
+  const coords: GridCoord[] = [];
+  for (const tile of grid.tiles) {
+    if ((tile.x !== start.x || tile.y !== start.y) && isDamagingHazard(tile.hazard)) {
+      coords.push({ x: tile.x, y: tile.y });
+    }
+  }
+  return coords;
+}
+
 function findShortestPathTowardRangeOfTarget(
   grid: TacticalGrid,
   start: GridCoord,
   targetCoord: GridCoord,
   occupied: readonly GridCoord[],
   maxRange: number
+): { path: GridCoord[]; cost: number } | null {
+  const hazardAvoid = getHazardAvoidCoords(grid, start);
+  const safePath = findShortestPathWithAvoidance(
+    grid,
+    start,
+    targetCoord,
+    [...occupied, ...hazardAvoid],
+    maxRange,
+    true
+  );
+  if (safePath !== null) {
+    return safePath;
+  }
+  return findShortestPathWithAvoidance(grid, start, targetCoord, occupied, maxRange, false);
+}
+
+function findShortestPathWithAvoidance(
+  grid: TacticalGrid,
+  start: GridCoord,
+  targetCoord: GridCoord,
+  occupied: readonly GridCoord[],
+  maxRange: number,
+  avoidHazardGoals: boolean
 ): { path: GridCoord[]; cost: number } | null {
   const occupiedKeys = new Set<string>(occupied.map((c) => `${c.x},${c.y}`));
   const cappedRange = Math.min(Math.max(1, maxRange), 4);
@@ -211,6 +248,9 @@ function findShortestPathTowardRangeOfTarget(
         const goal: GridCoord = { x: targetCoord.x + dx, y: targetCoord.y + dy };
         const tile = getTileAt(grid, goal);
         if (tile === null || !tile.passable) {
+          continue;
+        }
+        if (avoidHazardGoals && isDamagingHazard(tile.hazard)) {
           continue;
         }
         if ((goal.x !== start.x || goal.y !== start.y) && occupiedKeys.has(`${goal.x},${goal.y}`)) {
@@ -322,16 +362,17 @@ export function computeFallbackActions(
   const canDefend = actor.remainingActions.action > 0;
 
   if (combat.mode === 'traditional') {
-    const primaryTarget = targets[0] as CombatantState;
-    const attackAction = findBestValidAttackAgainst(
-      combat,
-      actorId,
-      rankedSkills,
-      primaryTarget,
-      registry
-    );
-    if (attackAction !== null) {
-      return [attackAction];
+    for (const target of targets) {
+      const attackAction = findBestValidAttackAgainst(
+        combat,
+        actorId,
+        rankedSkills,
+        target,
+        registry
+      );
+      if (attackAction !== null) {
+        return [attackAction];
+      }
     }
     return canDefend ? [{ type: 'defend' }] : [];
   }

@@ -98,6 +98,21 @@ export type SessionRuntimeEvent =
       readonly type: 'turn_saved';
       readonly turn: number;
       readonly saveDir: string;
+    }
+  | {
+      readonly type: 'digest_published';
+      readonly turn: number;
+      readonly editionId: string;
+      readonly day: number;
+      readonly masthead: string;
+      readonly headlineCount: number;
+    }
+  | {
+      readonly type: 'auditor_completed';
+      readonly turn: number;
+      readonly findingsCount: number;
+      readonly autoCorrectedCount: number;
+      readonly skippedLlmByCadence: boolean;
     };
 
 export type SessionRuntimeEventType = SessionRuntimeEvent['type'];

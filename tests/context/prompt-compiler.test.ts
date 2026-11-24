@@ -202,7 +202,9 @@ describe('Tokenizer & Budget Utilities', () => {
     expect(estimateTokens('   \n\t  ')).toBe(0);
     expect(estimateTokens('abcd')).toBe(1);
     expect(estimateTokens('abcde')).toBe(2);
-    expect(estimateTokens('hello   \n\n  world')).toBe(estimateTokens('hello world'));
+    expect(estimateTokens('hello   \n\n  world', { mode: 'heuristic' })).toBe(
+      estimateTokens('hello world', { mode: 'heuristic' })
+    );
   });
 
   it('clips text cleanly within maxTokens including ellipsis', () => {
@@ -232,10 +234,10 @@ describe('Tokenizer & Budget Utilities', () => {
       { id: 'giant', text: 'Word '.repeat(80).trim() },
       { id: 'second', text: 'Should drop' },
     ];
-    const truncated = fitItemsToBudget(oversizedOnly, 12);
+    const truncated = fitItemsToBudget(oversizedOnly, 12, { mode: 'heuristic' });
     expect(truncated.included).toHaveLength(1);
     expect(truncated.included[0]?.id).toBe('giant');
-    expect(estimateTokens(truncated.included[0]!.text)).toBeLessThanOrEqual(12);
+    expect(estimateTokens(truncated.included[0]!.text, { mode: 'heuristic' })).toBeLessThanOrEqual(12);
     expect(truncated.droppedCount).toBe(1);
     // Input must remain unmutated
     expect(oversizedOnly[0]?.text.length).toBeGreaterThan(100);

@@ -1,9 +1,24 @@
 import { ValidationError, formatValidationErrors, validationError } from '../core/errors.js';
 import { Result, err, ok } from '../core/result.js';
 import { extractAndRepairJsonDetailed, validateAgainstJsonSchema } from './json-repair.js';
+import { AnthropicProvider } from './providers/anthropic-provider.js';
+import { GeminiProvider } from './providers/gemini-provider.js';
+import { OllamaProvider } from './providers/ollama-provider.js';
+import {
+  classifyCaughtProviderError,
+  classifyHttpFailure,
+  clonePartialSampler,
+  createCombinedSignal,
+  invokeFetch,
+  isPlainRecord,
+  readSseEvents,
+  resolveEffectiveSampler,
+  sleepWithAbort,
+} from './providers/provider-utils.js';
 import {
   AgentRole,
   ChatMessage,
+  ConnectionPreset,
   GatewayGenerateTextRequest,
   GatewayStructuredOutput,
   GatewayStructuredRequest,
@@ -11,9 +26,17 @@ import {
   ProviderFailure,
   ProviderKind,
   RoleConnectionConfig,
-  SamplingParameters,
+  SamplerPreset,
   StreamChunk,
 } from './types.js';
+
+export { AnthropicProvider, GeminiProvider, OllamaProvider };
+
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isSafeKey(key: string): boolean {
+  return key.length > 0 && !FORBIDDEN_KEYS.has(key);
+}
 
 /**
  * Configuration options for {@link ModelGateway}.
@@ -26,177 +49,12 @@ export interface ModelGatewayOptions {
   readonly providers?:
     | ReadonlyMap<ProviderKind, ModelProvider>
     | Partial<Record<ProviderKind, ModelProvider>>;
+  readonly connectionPresets?: readonly ConnectionPreset[];
+  readonly samplerPresets?: readonly SamplerPreset[];
   readonly maxRetries?: number;
   readonly baseRetryDelayMs?: number;
   readonly defaultMaxRepairAttempts?: number;
   readonly fetchImpl?: typeof fetch;
-}
-
-const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
-
-function isSafeKey(key: string): boolean {
-  return key.length > 0 && !FORBIDDEN_KEYS.has(key);
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function finiteOrUndefined(value: number | undefined): number | undefined {
-  return value !== undefined && Number.isFinite(value) ? value : undefined;
-}
-
-function resolveSamplingParameters(
-  config: RoleConnectionConfig,
-  req: SamplingParameters
-): SamplingParameters {
-  const stopSequences = req.stopSequences ?? config.stopSequences;
-  return {
-    temperature: finiteOrUndefined(req.temperature ?? config.temperature),
-    maxTokens: finiteOrUndefined(req.maxTokens ?? config.maxTokens),
-    maxContextTokens: finiteOrUndefined(req.maxContextTokens ?? config.maxContextTokens),
-    topP: finiteOrUndefined(req.topP ?? config.topP),
-    topK: finiteOrUndefined(req.topK ?? config.topK),
-    minP: finiteOrUndefined(req.minP ?? config.minP),
-    topA: finiteOrUndefined(req.topA ?? config.topA),
-    typicalP: finiteOrUndefined(req.typicalP ?? config.typicalP),
-    tfs: finiteOrUndefined(req.tfs ?? config.tfs),
-    frequencyPenalty: finiteOrUndefined(req.frequencyPenalty ?? config.frequencyPenalty),
-    presencePenalty: finiteOrUndefined(req.presencePenalty ?? config.presencePenalty),
-    repetitionPenalty: finiteOrUndefined(req.repetitionPenalty ?? config.repetitionPenalty),
-    stopSequences: stopSequences !== undefined ? [...stopSequences] : undefined,
-    seed: finiteOrUndefined(req.seed ?? config.seed),
-  };
-}
-
-function cloneConnectionFields<T extends Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }>(
-  config: T,
-  redactApiKeys = false
-): T {
-  const copy = {
-    ...config,
-    ...(config.stopSequences !== undefined ? { stopSequences: [...config.stopSequences] } : {}),
-  };
-  if (redactApiKeys && copy.apiKey !== undefined && copy.apiKey.length > 0) {
-    return { ...copy, apiKey: '***' };
-  }
-  return copy;
-}
-
-function serializeChatMessages(
-  messages: readonly ChatMessage[]
-): Array<{ role: ChatMessage['role']; content: string; name?: string }> {
-  return messages.map((msg) =>
-    msg.name !== undefined
-      ? { role: msg.role, content: msg.content, name: msg.name }
-      : { role: msg.role, content: msg.content }
-  );
-}
-
-function invokeFetchImpl(
-  customFetch: typeof fetch | undefined,
-  url: string,
-  init: RequestInit
-): Promise<Response> {
-  if (customFetch !== undefined) {
-    return customFetch(url, init);
-  }
-  if (typeof globalThis.fetch !== 'function') {
-    throw new Error('Global fetch is unavailable in the current runtime');
-  }
-  return globalThis.fetch(url, init);
-}
-
-function buildBearerHeaders(config: RoleConnectionConfig): Record<string, string> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-  if (config.apiKey !== undefined && config.apiKey.length > 0) {
-    headers.Authorization = `Bearer ${config.apiKey}`;
-  }
-  return headers;
-}
-
-function buildOpenAICompatibleRequestBody(
-  config: RoleConnectionConfig,
-  req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-  stream: boolean,
-  structuredReq?: GatewayStructuredRequest
-): Record<string, unknown> {
-  const sampling = resolveSamplingParameters(config, req);
-
-  const body: Record<string, unknown> = {
-    model: config.model,
-    messages: serializeChatMessages(req.messages),
-    stream,
-  };
-
-  if (sampling.temperature !== undefined) {
-    body.temperature = sampling.temperature;
-  }
-  if (sampling.maxTokens !== undefined) {
-    body.max_tokens = sampling.maxTokens;
-  }
-  if (sampling.topP !== undefined) {
-    body.top_p = sampling.topP;
-  }
-  if (sampling.topK !== undefined && sampling.topK > 0) {
-    body.top_k = sampling.topK;
-  }
-  if (sampling.minP !== undefined && sampling.minP > 0) {
-    body.min_p = sampling.minP;
-  }
-  if (sampling.topA !== undefined && sampling.topA > 0) {
-    body.top_a = sampling.topA;
-  }
-  if (sampling.typicalP !== undefined && sampling.typicalP < 1) {
-    body.typical_p = sampling.typicalP;
-  }
-  if (sampling.tfs !== undefined && sampling.tfs < 1) {
-    body.tfs = sampling.tfs;
-  }
-  if (sampling.frequencyPenalty !== undefined) {
-    body.frequency_penalty = sampling.frequencyPenalty;
-  }
-  if (sampling.presencePenalty !== undefined) {
-    body.presence_penalty = sampling.presencePenalty;
-  }
-  if (sampling.repetitionPenalty !== undefined) {
-    body.repetition_penalty = sampling.repetitionPenalty;
-  }
-  if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
-    body.stop = [...sampling.stopSequences];
-  }
-  if (sampling.seed !== undefined) {
-    body.seed = sampling.seed;
-  }
-
-  if (structuredReq !== undefined && config.supportsJsonSchema === true) {
-    body.response_format = {
-      type: 'json_schema',
-      json_schema: {
-        name: structuredReq.schemaName ?? 'structured_output',
-        strict: true,
-        schema: structuredReq.schema,
-      },
-    };
-  }
-
-  return body;
-}
-
-function isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.name === 'AbortError';
-}
-
-function isTimeoutError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.name === 'TimeoutError';
 }
 
 function extractTextFromChoiceContainer(choice: unknown, field: 'message' | 'delta'): string | undefined {
@@ -243,461 +101,32 @@ function extractOpenAIStreamDelta(payload: unknown): string | undefined {
   );
 }
 
-interface CombinedSignalHandle {
-  readonly signal: AbortSignal | undefined;
-  readonly isTimedOut: () => boolean;
-  readonly cleanup: () => void;
-}
-
-function createCombinedSignal(
-  callerSignal: AbortSignal | undefined,
-  timeoutMs: number | undefined
-): CombinedSignalHandle {
-  if (timeoutMs === undefined || timeoutMs <= 0) {
-    return {
-      signal: callerSignal,
-      isTimedOut: () => false,
-      cleanup: () => {},
-    };
-  }
-
-  const controller = new AbortController();
-  let timedOut = false;
-
-  const onCallerAbort = (): void => {
-    controller.abort(callerSignal?.reason);
-  };
-
-  if (callerSignal !== undefined) {
-    if (callerSignal.aborted) {
-      controller.abort(callerSignal.reason);
-    } else {
-      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
-    }
-  }
-
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError'));
-  }, timeoutMs);
-
+function cloneSamplerPreset(preset: SamplerPreset): SamplerPreset {
+  const normalized = clonePartialSampler(preset);
   return {
-    signal: controller.signal,
-    isTimedOut: () => timedOut,
-    cleanup: () => {
-      clearTimeout(timer);
-      callerSignal?.removeEventListener('abort', onCallerAbort);
-    },
+    ...normalized,
+    id: preset.id,
+    name: preset.name,
   };
 }
 
-function classifyHttpFailure(status: number, bodyText: string): ProviderFailure {
-  const retryable = status === 429 || (status >= 500 && status <= 599);
-  const code = status === 429 ? 'RATE_LIMITED' : `HTTP_${status}`;
-  const detail = bodyText.trim();
-  const message =
-    detail.length > 0 ? `Provider returned HTTP ${status}: ${detail}` : `Provider returned HTTP ${status}`;
-  return {
-    code,
-    message,
-    status,
-    retryable,
+function cloneConnectionPreset(preset: ConnectionPreset): ConnectionPreset {
+  return { ...preset };
+}
+
+function cloneRoleConnectionConfig<T extends Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }>(
+  config: T,
+  redactApiKeys = false
+): T {
+  const copy = {
+    ...config,
+    ...(config.stopSequences !== undefined ? { stopSequences: [...config.stopSequences] } : {}),
+    ...(config.sampler !== undefined ? { sampler: clonePartialSampler(config.sampler) } : {}),
   };
-}
-
-function classifyCaughtProviderError(
-  caught: unknown,
-  callerSignal?: AbortSignal,
-  isTimedOut?: () => boolean
-): ProviderFailure {
-  if (callerSignal?.aborted || isAbortError(caught)) {
-    return {
-      code: 'ABORTED',
-      message: caught instanceof Error && caught.message.length > 0 ? caught.message : 'Request was aborted',
-      isAbort: true,
-      retryable: false,
-    };
+  if (redactApiKeys && copy.apiKey !== undefined && copy.apiKey.length > 0) {
+    return { ...copy, apiKey: '***' };
   }
-  if (isTimedOut?.() || isTimeoutError(caught)) {
-    return {
-      code: 'TIMEOUT',
-      message: caught instanceof Error && caught.message.length > 0 ? caught.message : 'Request timed out',
-      retryable: false,
-    };
-  }
-  return {
-    code: 'NETWORK_ERROR',
-    message: caught instanceof Error ? caught.message : String(caught),
-    retryable: true,
-  };
-}
-
-function sleepWithAbort(delayMs: number, signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted) {
-    return Promise.resolve(false);
-  }
-  if (delayMs <= 0) {
-    return Promise.resolve().then(() => !signal?.aborted);
-  }
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    const onAbort = (): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(false);
-    };
-    const timer = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      signal?.removeEventListener('abort', onAbort);
-      resolve(true);
-    }, delayMs);
-
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
-interface ParsedStreamLineResult {
-  readonly text?: string;
-  readonly done?: boolean;
-  readonly error?: ProviderFailure;
-}
-
-async function executeJsonCompletion(
-  customFetch: typeof fetch | undefined,
-  url: string,
-  headers: Record<string, string>,
-  body: Record<string, unknown>,
-  config: RoleConnectionConfig,
-  req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-  extractContent: (payload: unknown) => string | undefined,
-  missingContentMessage: string
-): Promise<Result<string, ProviderFailure>> {
-  if (req.signal?.aborted) {
-    return err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-  }
-
-  const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
-  try {
-    const response = await invokeFetchImpl(customFetch, url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: signalHandle.signal,
-    });
-
-    if (!response.ok) {
-      const bodyText = await response.text().catch(() => '');
-      return err(classifyHttpFailure(response.status, bodyText));
-    }
-
-    let payload: unknown;
-    try {
-      payload = (await response.json()) as unknown;
-    } catch (caught) {
-      return err({
-        code: 'INVALID_PROVIDER_RESPONSE',
-        message: `Failed to decode provider JSON response: ${caught instanceof Error ? caught.message : String(caught)}`,
-        retryable: false,
-      });
-    }
-
-    const content = extractContent(payload);
-    if (content === undefined) {
-      return err({
-        code: 'INVALID_PROVIDER_RESPONSE',
-        message: missingContentMessage,
-        retryable: false,
-      });
-    }
-
-    return ok(content);
-  } catch (caught) {
-    return err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
-  } finally {
-    signalHandle.cleanup();
-  }
-}
-
-async function* executeLineStream(
-  customFetch: typeof fetch | undefined,
-  url: string,
-  headers: Record<string, string>,
-  body: Record<string, unknown>,
-  config: RoleConnectionConfig,
-  req: GatewayGenerateTextRequest,
-  parseLine: (trimmedLine: string) => ParsedStreamLineResult
-): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-  if (req.signal?.aborted) {
-    yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-    return;
-  }
-
-  const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-
-  try {
-    const response = await invokeFetchImpl(customFetch, url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: signalHandle.signal,
-    });
-
-    if (!response.ok) {
-      const bodyText = await response.text().catch(() => '');
-      yield err(classifyHttpFailure(response.status, bodyText));
-      return;
-    }
-
-    if (response.body === null) {
-      yield err({
-        code: 'EMPTY_RESPONSE_BODY',
-        message: 'Streaming response did not include a readable body',
-        retryable: false,
-      });
-      return;
-    }
-
-    reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let lineBuffer = '';
-    let emittedDone = false;
-
-    while (true) {
-      if (req.signal?.aborted) {
-        yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
-        return;
-      }
-
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      lineBuffer += decoder.decode(value, { stream: true });
-      const lines = lineBuffer.split(/\r?\n/);
-      lineBuffer = lines.pop() ?? '';
-
-      for (const rawLine of lines) {
-        const line = rawLine.trim();
-        if (line.length === 0) {
-          continue;
-        }
-        const parsed = parseLine(line);
-        if (parsed.error !== undefined) {
-          yield err(parsed.error);
-          return;
-        }
-        if (parsed.text !== undefined && parsed.text.length > 0) {
-          yield ok({ text: parsed.text, done: false });
-        }
-        if (parsed.done === true) {
-          emittedDone = true;
-          yield ok({ text: '', done: true });
-          return;
-        }
-      }
-    }
-
-    const trailing = (lineBuffer + decoder.decode()).trim();
-    if (trailing.length > 0) {
-      const parsed = parseLine(trailing);
-      if (parsed.error !== undefined) {
-        yield err(parsed.error);
-        return;
-      }
-      if (parsed.text !== undefined && parsed.text.length > 0) {
-        yield ok({ text: parsed.text, done: false });
-      }
-      if (parsed.done === true) {
-        emittedDone = true;
-        yield ok({ text: '', done: true });
-        return;
-      }
-    }
-
-    if (!emittedDone) {
-      yield ok({ text: '', done: true });
-    }
-  } catch (caught) {
-    yield err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
-  } finally {
-    if (reader !== undefined) {
-      await reader.cancel().catch(() => {});
-      reader.releaseLock();
-    }
-    signalHandle.cleanup();
-  }
-}
-
-function parseOpenAISseLine(trimmedLine: string): ParsedStreamLineResult {
-  if (trimmedLine.startsWith(':') || !trimmedLine.startsWith('data:')) {
-    return {};
-  }
-  const payloadText = trimmedLine.slice(5).trim();
-  if (payloadText === '[DONE]') {
-    return { done: true };
-  }
-  if (payloadText.length === 0) {
-    return {};
-  }
-
-  let parsedChunk: unknown;
-  try {
-    parsedChunk = JSON.parse(payloadText) as unknown;
-  } catch (caught) {
-    return {
-      error: {
-        code: 'INVALID_STREAM_PAYLOAD',
-        message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-        retryable: false,
-      },
-    };
-  }
-
-  const delta = extractOpenAIStreamDelta(parsedChunk);
-  return delta !== undefined && delta.length > 0 ? { text: delta } : {};
-}
-
-function extractOllamaMessageContent(payload: unknown): string | undefined {
-  if (isPlainRecord(payload) && isPlainRecord(payload.message) && typeof payload.message.content === 'string') {
-    return payload.message.content;
-  }
-  return extractOpenAIMessageContent(payload);
-}
-
-function parseOllamaNativeLine(trimmedLine: string): ParsedStreamLineResult {
-  if (trimmedLine.startsWith(':')) {
-    return {};
-  }
-  const payloadText = trimmedLine.startsWith('data:') ? trimmedLine.slice(5).trim() : trimmedLine;
-  if (payloadText === '[DONE]') {
-    return { done: true };
-  }
-  if (payloadText.length === 0) {
-    return {};
-  }
-
-  let parsedChunk: unknown;
-  try {
-    parsedChunk = JSON.parse(payloadText) as unknown;
-  } catch (caught) {
-    return {
-      error: {
-        code: 'INVALID_STREAM_PAYLOAD',
-        message: `Malformed Ollama stream JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-        retryable: false,
-      },
-    };
-  }
-
-  if (isPlainRecord(parsedChunk) && typeof parsedChunk.error === 'string') {
-    return {
-      error: {
-        code: 'PROVIDER_STREAM_ERROR',
-        message: parsedChunk.error,
-        retryable: false,
-      },
-    };
-  }
-
-  let delta: string | undefined;
-  if (
-    isPlainRecord(parsedChunk) &&
-    isPlainRecord(parsedChunk.message) &&
-    typeof parsedChunk.message.content === 'string'
-  ) {
-    delta = parsedChunk.message.content;
-  } else {
-    delta = extractOpenAIStreamDelta(parsedChunk);
-  }
-
-  const done = isPlainRecord(parsedChunk) && parsedChunk.done === true;
-  return {
-    ...(delta !== undefined && delta.length > 0 ? { text: delta } : {}),
-    ...(done ? { done: true } : {}),
-  };
-}
-
-function extractAnthropicMessageContent(payload: unknown): string | undefined {
-  if (!isPlainRecord(payload) || !Array.isArray(payload.content)) {
-    return undefined;
-  }
-  const parts: string[] = [];
-  for (const block of payload.content) {
-    if (isPlainRecord(block) && block.type === 'text' && typeof block.text === 'string') {
-      parts.push(block.text);
-    }
-  }
-  return parts.length > 0 ? parts.join('') : undefined;
-}
-
-function parseAnthropicSseLine(trimmedLine: string): ParsedStreamLineResult {
-  if (trimmedLine.startsWith(':') || !trimmedLine.startsWith('data:')) {
-    return {};
-  }
-  const payloadText = trimmedLine.slice(5).trim();
-  if (payloadText === '[DONE]') {
-    return { done: true };
-  }
-  if (payloadText.length === 0) {
-    return {};
-  }
-
-  let parsedChunk: unknown;
-  try {
-    parsedChunk = JSON.parse(payloadText) as unknown;
-  } catch (caught) {
-    return {
-      error: {
-        code: 'INVALID_STREAM_PAYLOAD',
-        message: `Malformed Anthropic SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-        retryable: false,
-      },
-    };
-  }
-
-  if (!isPlainRecord(parsedChunk)) {
-    return {};
-  }
-
-  if (parsedChunk.type === 'message_stop') {
-    return { done: true };
-  }
-
-  if (parsedChunk.type === 'error') {
-    const errRecord = isPlainRecord(parsedChunk.error) ? parsedChunk.error : undefined;
-    const message =
-      errRecord !== undefined && typeof errRecord.message === 'string'
-        ? errRecord.message
-        : 'Anthropic stream returned an error event';
-    return {
-      error: {
-        code: 'PROVIDER_STREAM_ERROR',
-        message,
-        retryable: false,
-      },
-    };
-  }
-
-  if (parsedChunk.type === 'content_block_delta' && isPlainRecord(parsedChunk.delta)) {
-    const delta = parsedChunk.delta;
-    if (
-      (delta.type === undefined || delta.type === 'text_delta') &&
-      typeof delta.text === 'string' &&
-      delta.text.length > 0
-    ) {
-      return { text: delta.text };
-    }
-  }
-
-  return {};
+  return copy;
 }
 
 /**
@@ -719,247 +148,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
     return `${normalized}/chat/completions`;
   }
 
-  private buildRequestBody(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-    stream: boolean,
-    structuredReq?: GatewayStructuredRequest
-  ): Record<string, unknown> {
-    return buildOpenAICompatibleRequestBody(config, req, stream, structuredReq);
-  }
-
-  async generateText(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest
-  ): Promise<Result<string, ProviderFailure>> {
-    return executeJsonCompletion(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      buildBearerHeaders(config),
-      this.buildRequestBody(config, req, false),
-      config,
-      req,
-      extractOpenAIMessageContent,
-      'Provider response did not include choices[0].message.content'
-    );
-  }
-
-  async generateStructuredRaw(
-    config: RoleConnectionConfig,
-    req: GatewayStructuredRequest
-  ): Promise<Result<string, ProviderFailure>> {
-    return executeJsonCompletion(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      buildBearerHeaders(config),
-      this.buildRequestBody(config, req, false, req),
-      config,
-      req,
-      extractOpenAIMessageContent,
-      'Provider response did not include choices[0].message.content'
-    );
-  }
-
-  streamText(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest
-  ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-    return executeLineStream(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      buildBearerHeaders(config),
-      this.buildRequestBody(config, req, true),
-      config,
-      req,
-      parseOpenAISseLine
-    );
-  }
-}
-
-/**
- * Built-in provider for Ollama instances supporting both OpenAI-compatible `/v1/chat/completions`
- * normalization and native `/api/chat` when the configured endpoint targets `/api/chat`.
- */
-export class OllamaProvider implements ModelProvider {
-  readonly kind = 'ollama' as const;
-  private readonly customFetch: typeof fetch | undefined;
-
-  constructor(fetchImpl?: typeof fetch) {
-    this.customFetch = fetchImpl;
-  }
-
-  private resolveEndpoint(baseUrl: string): { readonly url: string; readonly nativeApiChat: boolean } {
-    const normalized = baseUrl.replace(/\/+$/, '');
-    if (normalized.endsWith('/api/chat')) {
-      return { url: normalized, nativeApiChat: true };
-    }
-    if (normalized.endsWith('/v1/chat/completions') || normalized.endsWith('/chat/completions')) {
-      return { url: normalized, nativeApiChat: false };
-    }
-    if (normalized.endsWith('/v1')) {
-      return { url: `${normalized}/chat/completions`, nativeApiChat: false };
-    }
-    return { url: `${normalized}/v1/chat/completions`, nativeApiChat: false };
-  }
-
-  private buildNativeRequestBody(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-    stream: boolean,
-    structuredReq?: GatewayStructuredRequest
-  ): Record<string, unknown> {
-    const sampling = resolveSamplingParameters(config, req);
-    const options: Record<string, unknown> = {};
-
-    if (sampling.temperature !== undefined) {
-      options.temperature = sampling.temperature;
-    }
-    if (sampling.maxTokens !== undefined) {
-      options.num_predict = sampling.maxTokens;
-    }
-    if (sampling.maxContextTokens !== undefined) {
-      options.num_ctx = sampling.maxContextTokens;
-    }
-    if (sampling.topP !== undefined) {
-      options.top_p = sampling.topP;
-    }
-    if (sampling.topK !== undefined && sampling.topK > 0) {
-      options.top_k = sampling.topK;
-    }
-    if (sampling.minP !== undefined && sampling.minP > 0) {
-      options.min_p = sampling.minP;
-    }
-    if (sampling.typicalP !== undefined && sampling.typicalP < 1) {
-      options.typical_p = sampling.typicalP;
-    }
-    if (sampling.tfs !== undefined && sampling.tfs < 1) {
-      options.tfs_z = sampling.tfs;
-    }
-    if (sampling.frequencyPenalty !== undefined) {
-      options.frequency_penalty = sampling.frequencyPenalty;
-    }
-    if (sampling.presencePenalty !== undefined) {
-      options.presence_penalty = sampling.presencePenalty;
-    }
-    if (sampling.repetitionPenalty !== undefined) {
-      options.repeat_penalty = sampling.repetitionPenalty;
-    }
-    if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
-      options.stop = [...sampling.stopSequences];
-    }
-    if (sampling.seed !== undefined) {
-      options.seed = sampling.seed;
-    }
-
-    const body: Record<string, unknown> = {
-      model: config.model,
-      messages: serializeChatMessages(req.messages),
-      stream,
-    };
-
-    if (Object.keys(options).length > 0) {
-      body.options = options;
-    }
-    if (structuredReq !== undefined && config.supportsJsonSchema === true) {
-      body.format = structuredReq.schema;
-    }
-
-    return body;
-  }
-
-  async generateText(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest
-  ): Promise<Result<string, ProviderFailure>> {
-    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
-    const body = nativeApiChat
-      ? this.buildNativeRequestBody(config, req, false)
-      : buildOpenAICompatibleRequestBody(config, req, false);
-    return executeJsonCompletion(
-      this.customFetch,
-      url,
-      buildBearerHeaders(config),
-      body,
-      config,
-      req,
-      nativeApiChat ? extractOllamaMessageContent : extractOpenAIMessageContent,
-      nativeApiChat
-        ? 'Ollama response did not include message.content'
-        : 'Provider response did not include choices[0].message.content'
-    );
-  }
-
-  async generateStructuredRaw(
-    config: RoleConnectionConfig,
-    req: GatewayStructuredRequest
-  ): Promise<Result<string, ProviderFailure>> {
-    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
-    const body = nativeApiChat
-      ? this.buildNativeRequestBody(config, req, false, req)
-      : buildOpenAICompatibleRequestBody(config, req, false, req);
-    return executeJsonCompletion(
-      this.customFetch,
-      url,
-      buildBearerHeaders(config),
-      body,
-      config,
-      req,
-      nativeApiChat ? extractOllamaMessageContent : extractOpenAIMessageContent,
-      nativeApiChat
-        ? 'Ollama response did not include message.content'
-        : 'Provider response did not include choices[0].message.content'
-    );
-  }
-
-  streamText(
-    config: RoleConnectionConfig,
-    req: GatewayGenerateTextRequest
-  ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-    const { url, nativeApiChat } = this.resolveEndpoint(config.baseUrl);
-    const body = nativeApiChat
-      ? this.buildNativeRequestBody(config, req, true)
-      : buildOpenAICompatibleRequestBody(config, req, true);
-    return executeLineStream(
-      this.customFetch,
-      url,
-      buildBearerHeaders(config),
-      body,
-      config,
-      req,
-      nativeApiChat ? parseOllamaNativeLine : parseOpenAISseLine
-    );
-  }
-}
-
-/**
- * Built-in provider targeting Anthropic's `/v1/messages` API via native `fetch`.
- */
-export class AnthropicProvider implements ModelProvider {
-  readonly kind = 'anthropic' as const;
-  private readonly customFetch: typeof fetch | undefined;
-
-  constructor(fetchImpl?: typeof fetch) {
-    this.customFetch = fetchImpl;
-  }
-
-  private buildEndpointUrl(baseUrl: string): string {
-    const normalized = baseUrl.replace(/\/+$/, '');
-    if (normalized.endsWith('/v1/messages') || normalized.endsWith('/messages')) {
-      return normalized;
-    }
-    if (normalized.endsWith('/v1')) {
-      return `${normalized}/messages`;
-    }
-    return `${normalized}/v1/messages`;
-  }
-
   private buildHeaders(config: RoleConnectionConfig): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
     };
     if (config.apiKey !== undefined && config.apiKey.length > 0) {
-      headers['x-api-key'] = config.apiKey;
+      headers.Authorization = `Bearer ${config.apiKey}`;
     }
     return headers;
   }
@@ -967,104 +161,220 @@ export class AnthropicProvider implements ModelProvider {
   private buildRequestBody(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest | GatewayStructuredRequest,
-    stream: boolean
+    stream: boolean,
+    structuredReq?: GatewayStructuredRequest
   ): Record<string, unknown> {
-    const sampling = resolveSamplingParameters(config, req);
-    const systemParts: string[] = [];
-    const conversationMessages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
-
-    for (const msg of req.messages) {
-      if (msg.role === 'system') {
-        if (msg.content.length > 0) {
-          systemParts.push(msg.content);
-        }
-      } else {
-        conversationMessages.push({ role: msg.role, content: msg.content });
-      }
-    }
+    const sampler = resolveEffectiveSampler(config, req);
 
     const body: Record<string, unknown> = {
       model: config.model,
-      max_tokens: sampling.maxTokens ?? 1024,
-      messages: conversationMessages,
+      messages: req.messages.map((msg) =>
+        msg.name !== undefined
+          ? { role: msg.role, content: msg.content, name: msg.name }
+          : { role: msg.role, content: msg.content }
+      ),
       stream,
     };
 
-    if (systemParts.length > 0) {
-      body.system = systemParts.join('\n\n');
+    if (sampler.temperature !== undefined) {
+      body.temperature = sampler.temperature;
     }
-    if (sampling.temperature !== undefined) {
-      body.temperature = sampling.temperature;
+    if (sampler.maxTokens !== undefined) {
+      body.max_tokens = sampler.maxTokens;
     }
-    if (sampling.topP !== undefined) {
-      body.top_p = sampling.topP;
+    if (sampler.topP !== undefined) {
+      body.top_p = sampler.topP;
     }
-    if (sampling.topK !== undefined && sampling.topK > 0) {
-      body.top_k = sampling.topK;
+    if (sampler.topK !== undefined && sampler.topK > 0) {
+      body.top_k = sampler.topK;
     }
-    if (sampling.stopSequences !== undefined && sampling.stopSequences.length > 0) {
-      body.stop_sequences = [...sampling.stopSequences];
+    if (sampler.minP !== undefined && sampler.minP > 0) {
+      body.min_p = sampler.minP;
+    }
+    if (sampler.topA !== undefined && sampler.topA > 0) {
+      body.top_a = sampler.topA;
+    }
+    if (sampler.typicalP !== undefined && sampler.typicalP < 1) {
+      body.typical_p = sampler.typicalP;
+    }
+    if (sampler.tfs !== undefined && sampler.tfs < 1) {
+      body.tfs = sampler.tfs;
+    }
+    if (sampler.frequencyPenalty !== undefined) {
+      body.frequency_penalty = sampler.frequencyPenalty;
+    }
+    if (sampler.presencePenalty !== undefined) {
+      body.presence_penalty = sampler.presencePenalty;
+    }
+    if (sampler.repetitionPenalty !== undefined) {
+      body.repetition_penalty = sampler.repetitionPenalty;
+    }
+    if (sampler.stop !== undefined && sampler.stop.length > 0) {
+      body.stop = [...sampler.stop];
+    }
+    if (sampler.seed !== undefined) {
+      body.seed = sampler.seed;
+    }
+
+    if (structuredReq !== undefined && config.supportsJsonSchema === true) {
+      body.response_format = {
+        type: 'json_schema',
+        json_schema: {
+          name: structuredReq.schemaName ?? 'structured_output',
+          strict: true,
+          schema: structuredReq.schema,
+        },
+      };
     }
 
     return body;
+  }
+
+  private async executeCompletion(
+    config: RoleConnectionConfig,
+    req: GatewayGenerateTextRequest | GatewayStructuredRequest,
+    structuredReq?: GatewayStructuredRequest
+  ): Promise<Result<string, ProviderFailure>> {
+    if (req.signal?.aborted) {
+      return err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+    }
+
+    const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
+    try {
+      const response = await invokeFetch(this.customFetch, this.buildEndpointUrl(config.baseUrl), {
+        method: 'POST',
+        headers: this.buildHeaders(config),
+        body: JSON.stringify(this.buildRequestBody(config, req, false, structuredReq)),
+        signal: signalHandle.signal,
+      });
+
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        return err(classifyHttpFailure(response.status, bodyText));
+      }
+
+      let payload: unknown;
+      try {
+        payload = (await response.json()) as unknown;
+      } catch (caught) {
+        return err({
+          code: 'INVALID_PROVIDER_RESPONSE',
+          message: `Failed to decode provider JSON response: ${caught instanceof Error ? caught.message : String(caught)}`,
+          retryable: false,
+        });
+      }
+
+      const content = extractOpenAIMessageContent(payload);
+      if (content === undefined) {
+        return err({
+          code: 'INVALID_PROVIDER_RESPONSE',
+          message: 'Provider response did not include choices[0].message.content',
+          retryable: false,
+        });
+      }
+
+      return ok(content);
+    } catch (caught) {
+      return err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
+    } finally {
+      signalHandle.cleanup();
+    }
   }
 
   async generateText(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): Promise<Result<string, ProviderFailure>> {
-    return executeJsonCompletion(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      this.buildHeaders(config),
-      this.buildRequestBody(config, req, false),
-      config,
-      req,
-      extractAnthropicMessageContent,
-      'Anthropic response did not include content text blocks'
-    );
+    return this.executeCompletion(config, req);
   }
 
   async generateStructuredRaw(
     config: RoleConnectionConfig,
     req: GatewayStructuredRequest
   ): Promise<Result<string, ProviderFailure>> {
-    return executeJsonCompletion(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      this.buildHeaders(config),
-      this.buildRequestBody(config, req, false),
-      config,
-      req,
-      extractAnthropicMessageContent,
-      'Anthropic response did not include content text blocks'
-    );
+    return this.executeCompletion(config, req, req);
   }
 
-  streamText(
+  async *streamText(
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-    return executeLineStream(
-      this.customFetch,
-      this.buildEndpointUrl(config.baseUrl),
-      this.buildHeaders(config),
-      this.buildRequestBody(config, req, true),
-      config,
-      req,
-      parseAnthropicSseLine
-    );
+    if (req.signal?.aborted) {
+      yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+      return;
+    }
+
+    const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
+    try {
+      const response = await invokeFetch(this.customFetch, this.buildEndpointUrl(config.baseUrl), {
+        method: 'POST',
+        headers: this.buildHeaders(config),
+        body: JSON.stringify(this.buildRequestBody(config, req, true)),
+        signal: signalHandle.signal,
+      });
+
+      if (!response.ok) {
+        const bodyText = await response.text().catch(() => '');
+        yield err(classifyHttpFailure(response.status, bodyText));
+        return;
+      }
+
+      let emittedDone = false;
+      for await (const frameResult of readSseEvents(response, req.signal, signalHandle.isTimedOut)) {
+        if (!frameResult.ok) {
+          yield frameResult;
+          return;
+        }
+
+        const payloadText = frameResult.value.data.trim();
+        if (payloadText.length === 0) {
+          continue;
+        }
+        if (payloadText === '[DONE]') {
+          emittedDone = true;
+          yield ok({ text: '', done: true });
+          return;
+        }
+
+        let parsedChunk: unknown;
+        try {
+          parsedChunk = JSON.parse(payloadText) as unknown;
+        } catch (caught) {
+          yield err({
+            code: 'INVALID_STREAM_PAYLOAD',
+            message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
+            retryable: false,
+          });
+          return;
+        }
+
+        const delta = extractOpenAIStreamDelta(parsedChunk);
+        if (delta !== undefined && delta.length > 0) {
+          yield ok({ text: delta, done: false });
+        }
+      }
+
+      if (!emittedDone) {
+        yield ok({ text: '', done: true });
+      }
+    } catch (caught) {
+      yield err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
+    } finally {
+      signalHandle.cleanup();
+    }
   }
 }
 
 /**
- * Per-role model gateway supporting provider routing, bounded retries, streaming,
+ * Per-role model gateway supporting provider routing, presets, bounded retries, streaming,
  * and schema-validated structured JSON generation with automated repair.
  */
 export class ModelGateway {
   private readonly connections: Map<AgentRole, RoleConnectionConfig>;
   private defaultConnection: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined;
   private readonly providers: Map<ProviderKind, ModelProvider>;
+  private readonly connectionPresets: Map<string, ConnectionPreset>;
+  private readonly samplerPresets: Map<string, SamplerPreset>;
   private readonly maxRetries: number;
   private readonly baseRetryDelayMs: number;
   private readonly defaultMaxRepairAttempts: number;
@@ -1075,26 +385,31 @@ export class ModelGateway {
       if (options.connections instanceof Map) {
         for (const [role, config] of options.connections.entries()) {
           if (isSafeKey(role)) {
-            this.connections.set(role, cloneConnectionFields({ ...config, role }));
+            this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
           }
         }
       } else {
         for (const [roleKey, config] of Object.entries(options.connections)) {
           if (config !== undefined && isSafeKey(roleKey)) {
             const role = roleKey as AgentRole;
-            this.connections.set(role, cloneConnectionFields({ ...config, role }));
+            this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
           }
         }
       }
     }
 
     this.defaultConnection =
-      options.defaultConnection !== undefined ? cloneConnectionFields(options.defaultConnection) : undefined;
+      options.defaultConnection !== undefined
+        ? cloneRoleConnectionConfig(options.defaultConnection)
+        : undefined;
 
+    const openAiProvider = new OpenAICompatibleProvider(options.fetchImpl);
     this.providers = new Map<ProviderKind, ModelProvider>([
-      ['openai_compatible', new OpenAICompatibleProvider(options.fetchImpl)],
-      ['ollama', new OllamaProvider(options.fetchImpl)],
+      ['openai_compatible', openAiProvider],
+      ['openai', openAiProvider],
       ['anthropic', new AnthropicProvider(options.fetchImpl)],
+      ['gemini', new GeminiProvider(options.fetchImpl)],
+      ['ollama', new OllamaProvider(options.fetchImpl, openAiProvider)],
     ]);
 
     if (options.providers !== undefined) {
@@ -1111,9 +426,135 @@ export class ModelGateway {
       }
     }
 
+    this.connectionPresets = new Map<string, ConnectionPreset>();
+    if (options.connectionPresets !== undefined) {
+      for (const preset of options.connectionPresets) {
+        this.connectionPresets.set(preset.id, cloneConnectionPreset(preset));
+      }
+    }
+
+    this.samplerPresets = new Map<string, SamplerPreset>();
+    if (options.samplerPresets !== undefined) {
+      for (const preset of options.samplerPresets) {
+        this.samplerPresets.set(preset.id, cloneSamplerPreset(preset));
+      }
+    }
+
     this.maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.baseRetryDelayMs = Math.max(0, options.baseRetryDelayMs ?? 50);
     this.defaultMaxRepairAttempts = Math.max(0, options.defaultMaxRepairAttempts ?? 0);
+  }
+
+  /**
+   * Register or update a reusable {@link SamplerPreset}.
+   */
+  registerSamplerPreset(preset: SamplerPreset): void {
+    this.samplerPresets.set(preset.id, cloneSamplerPreset(preset));
+  }
+
+  /**
+   * Look up a registered {@link SamplerPreset} by ID.
+   */
+  getSamplerPreset(id: string): SamplerPreset | undefined {
+    const preset = this.samplerPresets.get(id);
+    return preset !== undefined ? cloneSamplerPreset(preset) : undefined;
+  }
+
+  /**
+   * Return all registered {@link SamplerPreset} definitions.
+   */
+  listSamplerPresets(): SamplerPreset[] {
+    return Array.from(this.samplerPresets.values(), cloneSamplerPreset);
+  }
+
+  /**
+   * Register or update a reusable {@link ConnectionPreset}.
+   */
+  registerConnectionPreset(preset: ConnectionPreset): void {
+    this.connectionPresets.set(preset.id, cloneConnectionPreset(preset));
+  }
+
+  /**
+   * Look up a registered {@link ConnectionPreset} by ID.
+   */
+  getConnectionPreset(id: string): ConnectionPreset | undefined {
+    const preset = this.connectionPresets.get(id);
+    return preset !== undefined ? cloneConnectionPreset(preset) : undefined;
+  }
+
+  /**
+   * Return all registered {@link ConnectionPreset} definitions.
+   */
+  listConnectionPresets(): ConnectionPreset[] {
+    return Array.from(this.connectionPresets.values(), cloneConnectionPreset);
+  }
+
+  /**
+   * Bind a registered {@link ConnectionPreset} to a specific {@link AgentRole}.
+   */
+  applyConnectionPreset(
+    role: AgentRole,
+    presetId: string,
+    env: Readonly<Record<string, string | undefined>> = typeof process !== 'undefined' ? process.env : {}
+  ): Result<RoleConnectionConfig, ValidationError[]> {
+    const preset = this.connectionPresets.get(presetId);
+    if (preset === undefined) {
+      return err([
+        validationError('presetId', 'UNKNOWN_CONNECTION_PRESET', `Unknown connection preset '${presetId}'`),
+      ]);
+    }
+
+    const resolvedApiKey =
+      preset.apiKey !== undefined && preset.apiKey.length > 0
+        ? preset.apiKey
+        : preset.apiKeyEnv !== undefined &&
+            preset.apiKeyEnv.length > 0 &&
+            Object.hasOwn(env, preset.apiKeyEnv)
+          ? env[preset.apiKeyEnv]
+          : undefined;
+
+    const config: Omit<RoleConnectionConfig, 'role'> = {
+      provider: preset.provider,
+      baseUrl: preset.baseUrl,
+      model: preset.model,
+      ...(resolvedApiKey !== undefined && resolvedApiKey.length > 0 ? { apiKey: resolvedApiKey } : {}),
+      ...(preset.samplerPresetId !== undefined ? { samplerPresetId: preset.samplerPresetId } : {}),
+      ...(preset.enablePromptCache !== undefined ? { enablePromptCache: preset.enablePromptCache } : {}),
+      ...(preset.timeoutMs !== undefined ? { timeoutMs: preset.timeoutMs } : {}),
+      ...(preset.supportsJsonSchema !== undefined ? { supportsJsonSchema: preset.supportsJsonSchema } : {}),
+    };
+
+    this.setRoleConnection(role, config);
+    return this.resolveConnection(role);
+  }
+
+  /**
+   * Attach a registered {@link SamplerPreset} to an existing {@link AgentRole} connection.
+   */
+  applySamplerPreset(role: AgentRole, samplerPresetId: string): Result<RoleConnectionConfig, ValidationError[]> {
+    const preset = this.samplerPresets.get(samplerPresetId);
+    if (preset === undefined) {
+      return err([
+        validationError(
+          'samplerPresetId',
+          'UNKNOWN_SAMPLER_PRESET',
+          `Unknown sampler preset '${samplerPresetId}'`
+        ),
+      ]);
+    }
+
+    const existing = this.connections.get(role) ?? this.defaultConnection;
+    if (existing === undefined) {
+      return err([
+        validationError('role', 'MISSING_ROLE_CONFIG', `No model connection configured for role '${role}'`),
+      ]);
+    }
+
+    this.setRoleConnection(role, {
+      ...existing,
+      samplerPresetId,
+    });
+    return this.resolveConnection(role);
   }
 
   /**
@@ -1122,7 +563,7 @@ export class ModelGateway {
   setDefaultConnection(
     config: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined
   ): void {
-    this.defaultConnection = config !== undefined ? cloneConnectionFields(config) : undefined;
+    this.defaultConnection = config !== undefined ? cloneRoleConnectionConfig(config) : undefined;
   }
 
   /**
@@ -1132,7 +573,7 @@ export class ModelGateway {
     if (!isSafeKey(role)) {
       return;
     }
-    this.connections.set(role, cloneConnectionFields({ ...config, role }));
+    this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
   }
 
   /**
@@ -1161,7 +602,7 @@ export class ModelGateway {
     for (const [role, cfg] of this.connections.entries()) {
       if (isSafeKey(role)) {
         Object.defineProperty(connections, role, {
-          value: cloneConnectionFields(cfg, redact),
+          value: cloneRoleConnectionConfig(cfg, redact),
           enumerable: true,
           writable: true,
           configurable: true,
@@ -1170,9 +611,27 @@ export class ModelGateway {
     }
     return {
       ...(this.defaultConnection !== undefined
-        ? { defaultConnection: cloneConnectionFields(this.defaultConnection, redact) }
+        ? { defaultConnection: cloneRoleConnectionConfig(this.defaultConnection, redact) }
         : {}),
       connections,
+    };
+  }
+
+  private hydrateConnectionSampler(config: RoleConnectionConfig): RoleConnectionConfig {
+    const preset =
+      config.samplerPresetId !== undefined ? this.samplerPresets.get(config.samplerPresetId) : undefined;
+    if (preset === undefined && config.sampler === undefined) {
+      return cloneRoleConnectionConfig(config);
+    }
+
+    const mergedSampler = clonePartialSampler({
+      ...(preset !== undefined ? clonePartialSampler(preset) : {}),
+      ...(config.sampler !== undefined ? clonePartialSampler(config.sampler) : {}),
+    });
+
+    return {
+      ...cloneRoleConnectionConfig(config),
+      sampler: mergedSampler,
     };
   }
 
@@ -1182,10 +641,10 @@ export class ModelGateway {
   resolveConnection(role: AgentRole): Result<RoleConnectionConfig, ValidationError[]> {
     const specific = this.connections.get(role);
     if (specific !== undefined) {
-      return ok(cloneConnectionFields(specific));
+      return ok(this.hydrateConnectionSampler({ ...specific, role }));
     }
     if (this.defaultConnection !== undefined) {
-      return ok(cloneConnectionFields({ ...this.defaultConnection, role }));
+      return ok(this.hydrateConnectionSampler({ ...this.defaultConnection, role }));
     }
     return err([
       validationError('role', 'MISSING_ROLE_CONFIG', `No model connection configured for role '${role}'`),

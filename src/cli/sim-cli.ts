@@ -17,7 +17,17 @@ import {
   detectBeatCycles,
   validateCrossFileReferences,
 } from '../cartridge/static-analyzer.js';
-import type { CombatantState, ProposedCombatAction } from '../combat/action-validator.js';
+import {
+  type CombatActionPreviewResult,
+  previewCombatAction,
+} from '../combat/action-preview.js';
+import type {
+  CombatState,
+  CombatantState,
+  ProposedCombatAction,
+} from '../combat/action-validator.js';
+import type { TerrainTheme } from '../combat/grid-types.js';
+import type { TraditionalTurnStyle } from '../combat/traditional-theater.js';
 import { type ValidationError, formatValidationErrors, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import { MockModelProvider, createMockModelGateway } from '../gateway/mock-provider.js';
@@ -25,6 +35,7 @@ import type { DirectorSteeringInput } from '../runtime/director-steering.js';
 import { SessionRuntime, type TurnExecutionResult } from '../runtime/session-runtime.js';
 import type { SystemPack } from '../schema/tracker-module.js';
 import type { WorldState } from '../state/world-state.js';
+import type { DowntimeActivity, DowntimeOptions, TravelOptions } from '../world/flow-hooks.js';
 
 export type SimEventStep =
   | {
@@ -39,6 +50,35 @@ export type SimEventStep =
       type: 'start_combat';
       participants: CombatantState[];
       mode?: 'tactical_grid' | 'traditional';
+      turnStyle?: TraditionalTurnStyle;
+      theme?: TerrainTheme;
+      gridSize?: { width: number; height: number };
+      xpAwardOnVictory?: number;
+    }
+  | {
+      type: 'preview';
+      actorId?: string;
+      action: ProposedCombatAction;
+      expectLegal?: boolean;
+    }
+  | {
+      type: 'travel';
+      targetLocationId: string;
+      options?: TravelOptions;
+    }
+  | {
+      type: 'downtime';
+      activity: DowntimeActivity;
+      options?: DowntimeOptions;
+    }
+  | {
+      type: 'takeover';
+      canonCharacterId: string;
+      name?: string;
+    }
+  | {
+      type: 'clone';
+      newSessionId?: string;
     }
   | {
       type: 'choose_branch';
@@ -58,6 +98,15 @@ export interface SimExpectations {
   arc?: WorldState['meta']['arc'];
   factionInfluenceMin?: Record<string, number>;
   sceneLocation?: string;
+  canonCharacterId?: string | null;
+  playerFormId?: string | null;
+  characterForms?: Record<string, string | null>;
+  day?: number;
+  combatActive?: boolean;
+  combatTurnStyle?: TraditionalTurnStyle;
+  combatSummonCountMin?: number;
+  combatTransformedActorIds?: string[];
+  previewCountMin?: number;
 }
 
 export interface SimValidateSuccess {
@@ -76,7 +125,9 @@ export interface SimPlaythroughParams {
 export interface SimPlaythroughSuccess {
   finalState: WorldState;
   finalBeatLedger: BeatLedgerState;
+  finalCombatState: CombatState | null;
   turnResults: TurnExecutionResult[];
+  previews: CombatActionPreviewResult[];
   failedAssertions: string[];
 }
 
@@ -179,7 +230,7 @@ export async function runSimValidateCommand(
   const refErrors = validateCrossFileReferences(bundle);
   collectedErrors.push(...refErrors);
 
-  const report = analyzeCartridgeGraph(bundle);
+  const report = analyzeCartridgeGraph(bundle, { maxExploreStates: 4096 });
   if (!report.ok) {
     collectedErrors.push(...report.errors);
   }
@@ -195,7 +246,9 @@ export async function runSimValidateCommand(
 function evaluateSimExpectations(
   expectations: SimExpectations | undefined,
   finalState: WorldState,
-  finalBeatLedger: BeatLedgerState
+  finalBeatLedger: BeatLedgerState,
+  finalCombatState: CombatState | null,
+  previews: readonly CombatActionPreviewResult[]
 ): string[] {
   const failures: string[] = [];
   if (expectations === undefined) {
@@ -307,6 +360,94 @@ function evaluateSimExpectations(
     }
   }
 
+  if (expectations.canonCharacterId !== undefined) {
+    if (finalState.player.canonCharacterId !== expectations.canonCharacterId) {
+      failures.push(
+        `player.canonCharacterId: expected ${String(expectations.canonCharacterId)}, got ${String(finalState.player.canonCharacterId)}`
+      );
+    }
+  }
+
+  if (expectations.playerFormId !== undefined) {
+    const canonId = finalState.player.canonCharacterId ?? finalState.player.characterId;
+    const actualFormId =
+      canonId !== null && canonId !== undefined
+        ? getSafeOwn(finalState.entities.characters, canonId)?.formId ?? null
+        : null;
+    if (actualFormId !== expectations.playerFormId) {
+      failures.push(
+        `playerFormId: expected ${String(expectations.playerFormId)}, got ${String(actualFormId)}`
+      );
+    }
+  }
+
+  if (expectations.characterForms !== undefined) {
+    for (const charId of Object.keys(expectations.characterForms)) {
+      if (isUnsafeRecordKey(charId)) {
+        failures.push(`Unsafe characterId "${charId}" in expectations.characterForms`);
+        continue;
+      }
+      const expected = getSafeOwn(expectations.characterForms, charId);
+      const actual = getSafeOwn(finalState.entities.characters, charId)?.formId ?? null;
+      if (actual !== expected) {
+        failures.push(
+          `Character "${charId}" formId: expected ${String(expected)}, got ${String(actual)}`
+        );
+      }
+    }
+  }
+
+  if (expectations.day !== undefined) {
+    if (finalState.clocks.day !== expectations.day) {
+      failures.push(`clocks.day: expected ${String(expectations.day)}, got ${String(finalState.clocks.day)}`);
+    }
+  }
+
+  if (expectations.combatActive !== undefined) {
+    const isActive = Boolean(finalCombatState?.active);
+    if (isActive !== expectations.combatActive) {
+      failures.push(
+        `combatActive: expected ${String(expectations.combatActive)}, got ${String(isActive)}`
+      );
+    }
+  }
+
+  if (expectations.combatTurnStyle !== undefined) {
+    if (finalCombatState?.turnStyle !== expectations.combatTurnStyle) {
+      failures.push(
+        `combatTurnStyle: expected "${expectations.combatTurnStyle}", got "${String(finalCombatState?.turnStyle)}"`
+      );
+    }
+  }
+
+  if (expectations.combatSummonCountMin !== undefined) {
+    const summonCount = finalCombatState
+      ? Object.values(finalCombatState.combatants).filter((c) => c.isSummon === true && c.alive).length
+      : 0;
+    if (summonCount < expectations.combatSummonCountMin) {
+      failures.push(
+        `combatSummonCountMin: expected >= ${String(expectations.combatSummonCountMin)}, got ${String(summonCount)}`
+      );
+    }
+  }
+
+  if (expectations.combatTransformedActorIds !== undefined) {
+    for (const actorId of expectations.combatTransformedActorIds) {
+      const actor = finalCombatState ? getSafeOwn(finalCombatState.combatants, actorId) : undefined;
+      if (!actor || actor.activeTransform === undefined) {
+        failures.push(`combatTransformedActorIds: actor "${actorId}" has no activeTransform`);
+      }
+    }
+  }
+
+  if (expectations.previewCountMin !== undefined) {
+    if (previews.length < expectations.previewCountMin) {
+      failures.push(
+        `previewCountMin: expected >= ${String(expectations.previewCountMin)}, got ${String(previews.length)}`
+      );
+    }
+  }
+
   return failures;
 }
 
@@ -374,6 +515,7 @@ export async function runSimPlaythroughCommand(
   }
 
   const turnResults: TurnExecutionResult[] = [];
+  const previews: CombatActionPreviewResult[] = [];
 
   for (let i = 0; i < params.events.length; i += 1) {
     const step = params.events[i];
@@ -400,13 +542,104 @@ export async function runSimPlaythroughCommand(
       }
 
       case 'start_combat': {
-        const combatRes = runtime.startCombat(
-          step.participants,
-          step.mode !== undefined ? { mode: step.mode } : undefined
-        );
+        const combatRes = runtime.startCombat(step.participants, {
+          ...(step.mode !== undefined ? { mode: step.mode } : {}),
+          ...(step.turnStyle !== undefined ? { turnStyle: step.turnStyle } : {}),
+          ...(step.theme !== undefined ? { theme: step.theme } : {}),
+          ...(step.gridSize !== undefined ? { gridSize: step.gridSize } : {}),
+          ...(step.xpAwardOnVictory !== undefined ? { xpAwardOnVictory: step.xpAwardOnVictory } : {}),
+        });
         if (!combatRes.ok) {
           return err(combatRes.error);
         }
+        break;
+      }
+
+      case 'preview': {
+        const combatState = runtime.getCombatState();
+        if (combatState === null || !combatState.active) {
+          return err([
+            validationError(
+              `events[${i}]`,
+              'NO_ACTIVE_COMBAT',
+              'Cannot preview combat action when no combat encounter is active'
+            ),
+          ]);
+        }
+        const actorId =
+          step.actorId ??
+          combatState.initiativeOrder[combatState.turnIndex] ??
+          runtime.getState().player.id;
+        const previewRes = previewCombatAction(
+          combatState,
+          actorId,
+          step.action,
+          runtime.getSkillRegistry(),
+          {
+            ...(bundle.combat?.summons !== undefined ? { summons: bundle.combat.summons } : {}),
+            ...(bundle.combat?.formLoadouts !== undefined
+              ? { formLoadouts: bundle.combat.formLoadouts }
+              : {}),
+            ...(bundle.combat?.effectTemplates !== undefined
+              ? { effectTemplates: bundle.combat.effectTemplates }
+              : {}),
+          }
+        );
+        previews.push(previewRes);
+        if (step.expectLegal !== undefined && previewRes.legal !== step.expectLegal) {
+          return err([
+            validationError(
+              `events[${i}].expectLegal`,
+              'PREVIEW_LEGALITY_MISMATCH',
+              `Preview legality mismatch: expected ${String(step.expectLegal)}, got ${String(previewRes.legal)}`
+            ),
+          ]);
+        }
+        break;
+      }
+
+      case 'travel': {
+        const travelRes = runtime.travel(step.targetLocationId, step.options);
+        if (!travelRes.ok) {
+          return err(travelRes.error);
+        }
+        break;
+      }
+
+      case 'downtime': {
+        const downtimeRes = runtime.downtime(step.activity, step.options);
+        if (!downtimeRes.ok) {
+          return err(downtimeRes.error);
+        }
+        break;
+      }
+
+      case 'takeover': {
+        const bindRes = runtime.updatePlayerBinding({
+          canonCharacterId: step.canonCharacterId,
+          ...(step.name !== undefined ? { name: step.name } : {}),
+        });
+        if (!bindRes.ok) {
+          return err(bindRes.error);
+        }
+        break;
+      }
+
+      case 'clone': {
+        const clonedRuntime = new SessionRuntime({
+          sessionId: step.newSessionId ?? `${runtime.getState().meta.sessionId}-clone-${i}`,
+          cartridge: bundle,
+          ...(params.systemPack !== undefined ? { systemPack: params.systemPack } : {}),
+          gateway,
+          seed,
+        });
+        clonedRuntime.restoreSnapshot({
+          state: runtime.getState(),
+          beatLedger: runtime.getBeatLedger(),
+          swipeTree: runtime.getSwipeTree(),
+          combatState: runtime.getCombatState(),
+        });
+        runtime = clonedRuntime;
         break;
       }
 
@@ -440,16 +673,21 @@ export async function runSimPlaythroughCommand(
 
   const finalState = runtime.getState();
   const finalBeatLedger = runtime.getBeatLedger();
+  const finalCombatState = runtime.getCombatState();
   const failedAssertions = evaluateSimExpectations(
     params.expectations,
     finalState,
-    finalBeatLedger
+    finalBeatLedger,
+    finalCombatState,
+    previews
   );
 
   return ok({
     finalState,
     finalBeatLedger,
+    finalCombatState,
     turnResults,
+    previews,
     failedAssertions,
   });
 }

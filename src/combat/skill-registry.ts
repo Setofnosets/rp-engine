@@ -1,6 +1,15 @@
 import { parseDiceNotation } from '../core/dice.js';
 import { RefereeError, type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
+import {
+  type CombatVariableScaleSpec,
+  validateCombatVariableScaleSpec,
+} from './combat-variables.js';
+import {
+  type EffectTemplate,
+  cloneEffectTemplate,
+  validateEffectTemplate,
+} from './effect-templates.js';
 
 export const SKILL_CATEGORIES = Object.freeze([
   'attack',
@@ -26,6 +35,10 @@ export const TARGETING_SHAPES = Object.freeze([
   'self',
   'single_enemy',
   'single_ally',
+  'single_tile',
+  'all_enemies',
+  'all_allies',
+  'splash',
   'aoe_radius',
   'line',
   'cone',
@@ -35,11 +48,16 @@ export type TargetingShape = (typeof TARGETING_SHAPES)[number];
 
 export const SKILL_EFFECT_TYPES = Object.freeze([
   'damage',
+  'drain',
   'heal',
   'apply_status',
   'remove_status',
   'knockback',
   'restore_resource',
+  'modify_terrain',
+  'summon',
+  'transform',
+  'revert_transform',
 ] as const);
 
 export type SkillEffectType = (typeof SKILL_EFFECT_TYPES)[number];
@@ -60,11 +78,16 @@ export interface SkillEffectSpec {
   readonly dice?: string;
   readonly flat?: number;
   readonly scalingStat?: string;
+  readonly scale?: CombatVariableScaleSpec;
   readonly statusId?: string;
   readonly statusDuration?: number;
   readonly statusIntensity?: number;
   readonly distance?: number;
   readonly resourceKey?: string;
+  readonly targetResource?: string;
+  readonly terrainSpec?: Record<string, unknown>;
+  readonly summonId?: string;
+  readonly formLoadoutId?: string;
 }
 
 /**
@@ -75,6 +98,7 @@ export interface SkillTargetingSpec {
   readonly minRange: number;
   readonly maxRange: number;
   readonly radius?: number;
+  readonly maxTargets?: number;
   readonly requiresLos: boolean;
 }
 
@@ -102,6 +126,7 @@ export interface SkillDefinition {
   readonly targeting: SkillTargetingSpec;
   readonly hitResolution: SkillHitResolutionSpec;
   readonly effects: readonly SkillEffectSpec[];
+  readonly effectTemplate?: EffectTemplate;
   readonly tags?: readonly string[];
 }
 
@@ -164,17 +189,42 @@ function cloneResourceCosts(costs: Record<string, number>): Record<string, numbe
   return out;
 }
 
+function clonePlainRecord(record: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) {
+    if (!isSafeKey(key) || !Object.hasOwn(record, key)) {
+      continue;
+    }
+    const val = Object.getOwnPropertyDescriptor(record, key)?.value;
+    let cloned: unknown = val;
+    if (typeof val === 'number') {
+      cloned = val === 0 ? 0 : val;
+    } else if (Array.isArray(val)) {
+      cloned = [...val];
+    } else if (isPlainObject(val)) {
+      cloned = clonePlainRecord(val);
+    }
+    setOwnValue(out, key, cloned);
+  }
+  return out;
+}
+
 function cloneEffectSpec(effect: SkillEffectSpec): SkillEffectSpec {
   return {
     type: effect.type,
     ...(effect.dice !== undefined ? { dice: effect.dice } : {}),
     ...(effect.flat !== undefined ? { flat: effect.flat === 0 ? 0 : effect.flat } : {}),
     ...(effect.scalingStat !== undefined ? { scalingStat: effect.scalingStat } : {}),
+    ...(effect.scale !== undefined ? { scale: { ...effect.scale } } : {}),
     ...(effect.statusId !== undefined ? { statusId: effect.statusId } : {}),
     ...(effect.statusDuration !== undefined ? { statusDuration: effect.statusDuration } : {}),
     ...(effect.statusIntensity !== undefined ? { statusIntensity: effect.statusIntensity } : {}),
     ...(effect.distance !== undefined ? { distance: effect.distance === 0 ? 0 : effect.distance } : {}),
     ...(effect.resourceKey !== undefined ? { resourceKey: effect.resourceKey } : {}),
+    ...(effect.targetResource !== undefined ? { targetResource: effect.targetResource } : {}),
+    ...(effect.terrainSpec !== undefined ? { terrainSpec: clonePlainRecord(effect.terrainSpec) } : {}),
+    ...(effect.summonId !== undefined ? { summonId: effect.summonId } : {}),
+    ...(effect.formLoadoutId !== undefined ? { formLoadoutId: effect.formLoadoutId } : {}),
   };
 }
 
@@ -194,6 +244,9 @@ function cloneSkillDefinition(skill: SkillDefinition): SkillDefinition {
       ...(skill.targeting.radius !== undefined
         ? { radius: skill.targeting.radius === 0 ? 0 : skill.targeting.radius }
         : {}),
+      ...(skill.targeting.maxTargets !== undefined
+        ? { maxTargets: skill.targeting.maxTargets }
+        : {}),
       requiresLos: skill.targeting.requiresLos,
     },
     hitResolution: {
@@ -205,6 +258,9 @@ function cloneSkillDefinition(skill: SkillDefinition): SkillDefinition {
       ...(skill.hitResolution.dc !== undefined ? { dc: skill.hitResolution.dc } : {}),
     },
     effects: skill.effects.map(cloneEffectSpec),
+    ...(skill.effectTemplate !== undefined
+      ? { effectTemplate: cloneEffectTemplate(skill.effectTemplate) }
+      : {}),
     ...(skill.tags !== undefined ? { tags: [...skill.tags] } : {}),
   };
 }
@@ -335,6 +391,68 @@ export function validateSkillEffectSpec(
     }
   }
 
+  const rawTargetResource = getOwnValue(raw, 'targetResource');
+  let targetResource: string | undefined;
+  if (rawTargetResource !== undefined) {
+    if (typeof rawTargetResource !== 'string' || !isSafeKey(rawTargetResource.trim())) {
+      acc.add(
+        'targetResource',
+        'INVALID_STRING',
+        'Effect targetResource must be a safe non-empty string'
+      );
+    } else {
+      targetResource = rawTargetResource.trim();
+    }
+  }
+
+  const rawScale = getOwnValue(raw, 'scale');
+  let scale: CombatVariableScaleSpec | undefined;
+  if (rawScale !== undefined) {
+    const scaleRes = validateCombatVariableScaleSpec(rawScale);
+    if (!scaleRes.ok) {
+      acc.scope('scale').addAll(scaleRes.error);
+    } else {
+      scale = scaleRes.value;
+    }
+  }
+
+  const rawTerrainSpec = getOwnValue(raw, 'terrainSpec');
+  let terrainSpec: Record<string, unknown> | undefined;
+  if (rawTerrainSpec !== undefined) {
+    if (!isPlainObject(rawTerrainSpec)) {
+      acc.add('terrainSpec', 'INVALID_TYPE', 'Effect terrainSpec must be a plain object');
+    } else {
+      const terrainAcc = acc.scope('terrainSpec');
+      if (checkNoForbiddenKeys(rawTerrainSpec, terrainAcc)) {
+        terrainSpec = clonePlainRecord(rawTerrainSpec);
+      }
+    }
+  }
+
+  const rawSummonId = getOwnValue(raw, 'summonId');
+  let summonId: string | undefined;
+  if (rawSummonId !== undefined) {
+    if (typeof rawSummonId !== 'string' || !isSafeKey(rawSummonId.trim())) {
+      acc.add('summonId', 'INVALID_STRING', 'Effect summonId must be a safe non-empty string');
+    } else {
+      summonId = rawSummonId.trim();
+    }
+  }
+
+  const rawFormLoadoutId = getOwnValue(raw, 'formLoadoutId');
+  let formLoadoutId: string | undefined;
+  if (rawFormLoadoutId !== undefined) {
+    if (typeof rawFormLoadoutId !== 'string' || !isSafeKey(rawFormLoadoutId.trim())) {
+      acc.add(
+        'formLoadoutId',
+        'INVALID_STRING',
+        'Effect formLoadoutId must be a safe non-empty string'
+      );
+    } else {
+      formLoadoutId = rawFormLoadoutId.trim();
+    }
+  }
+
   if (typeof rawType === 'string' && VALID_EFFECT_TYPES.has(rawType)) {
     const effectType = rawType as SkillEffectType;
     if ((effectType === 'apply_status' || effectType === 'remove_status') && statusId === undefined) {
@@ -354,6 +472,15 @@ export function validateSkillEffectSpec(
     if (effectType === 'knockback' && distance === undefined) {
       acc.add('distance', 'REQUIRED', 'Effect type "knockback" requires distance');
     }
+    if (effectType === 'modify_terrain' && terrainSpec === undefined) {
+      acc.add('terrainSpec', 'REQUIRED', 'Effect type "modify_terrain" requires terrainSpec');
+    }
+    if (effectType === 'summon' && summonId === undefined) {
+      acc.add('summonId', 'REQUIRED', 'Effect type "summon" requires summonId');
+    }
+    if (effectType === 'transform' && formLoadoutId === undefined) {
+      acc.add('formLoadoutId', 'REQUIRED', 'Effect type "transform" requires formLoadoutId');
+    }
   }
 
   if (acc.hasErrors()) {
@@ -365,11 +492,16 @@ export function validateSkillEffectSpec(
     ...(dice !== undefined ? { dice } : {}),
     ...(flat !== undefined ? { flat } : {}),
     ...(scalingStat !== undefined ? { scalingStat } : {}),
+    ...(scale !== undefined ? { scale } : {}),
     ...(statusId !== undefined ? { statusId } : {}),
     ...(statusDuration !== undefined ? { statusDuration } : {}),
     ...(statusIntensity !== undefined ? { statusIntensity } : {}),
     ...(distance !== undefined ? { distance } : {}),
     ...(resourceKey !== undefined ? { resourceKey } : {}),
+    ...(targetResource !== undefined ? { targetResource } : {}),
+    ...(terrainSpec !== undefined ? { terrainSpec } : {}),
+    ...(summonId !== undefined ? { summonId } : {}),
+    ...(formLoadoutId !== undefined ? { formLoadoutId } : {}),
   });
 }
 
@@ -515,12 +647,31 @@ export function validateSkillDefinition(
       targetAcc.add('requiresLos', 'INVALID_TYPE', 'requiresLos must be a boolean');
     }
 
+    const rawMaxTargets = getOwnValue(rawTargeting, 'maxTargets');
+    let maxTargets: number | undefined;
+    if (rawMaxTargets !== undefined) {
+      if (
+        typeof rawMaxTargets !== 'number' ||
+        !Number.isSafeInteger(rawMaxTargets) ||
+        rawMaxTargets < 1
+      ) {
+        targetAcc.add(
+          'maxTargets',
+          'INVALID_INTEGER',
+          'maxTargets must be a safe integer >= 1'
+        );
+      } else {
+        maxTargets = rawMaxTargets;
+      }
+    }
+
     if (!targetAcc.hasErrors()) {
       targeting = {
         shape: rawShape as TargetingShape,
         minRange: (rawMinRange as number) === 0 ? 0 : (rawMinRange as number),
         maxRange: (rawMaxRange as number) === 0 ? 0 : (rawMaxRange as number),
         ...(radius !== undefined ? { radius } : {}),
+        ...(maxTargets !== undefined ? { maxTargets } : {}),
         requiresLos: rawRequiresLos as boolean,
       };
     }
@@ -629,6 +780,17 @@ export function validateSkillDefinition(
     }
   }
 
+  const rawEffectTemplate = getOwnValue(raw, 'effectTemplate');
+  let effectTemplate: EffectTemplate | undefined;
+  if (rawEffectTemplate !== undefined) {
+    const tplRes = validateEffectTemplate(rawEffectTemplate);
+    if (!tplRes.ok) {
+      acc.scope('effectTemplate').addAll(tplRes.error);
+    } else {
+      effectTemplate = tplRes.value;
+    }
+  }
+
   if (acc.hasErrors() || targeting === undefined || hitResolution === undefined) {
     return err([...acc.errors]);
   }
@@ -644,6 +806,7 @@ export function validateSkillDefinition(
     targeting,
     hitResolution,
     effects,
+    ...(effectTemplate !== undefined ? { effectTemplate } : {}),
     ...(tags !== undefined ? { tags } : {}),
   });
 }
@@ -686,6 +849,7 @@ export function validateSkillCatalog(
  */
 export class SkillRegistry {
   private readonly skills = new Map<string, SkillDefinition>();
+  private readonly effectTemplates = new Map<string, EffectTemplate>();
 
   constructor(initialSkills: readonly SkillDefinition[] = []) {
     for (const skill of initialSkills) {
@@ -736,6 +900,41 @@ export class SkillRegistry {
    */
   list(): readonly SkillDefinition[] {
     return Array.from(this.skills.values(), (skill) => cloneSkillDefinition(skill));
+  }
+
+  /**
+   * Validate and cache a compiled {@link EffectTemplate} for a skill ID.
+   */
+  cacheEffectTemplate(skillId: string, template: EffectTemplate): Result<void, ValidationError[]> {
+    if (typeof skillId !== 'string' || !isSafeKey(skillId.trim())) {
+      return err([
+        validationError('skillId', 'INVALID_SKILL_ID', 'Skill id must be a safe non-empty string'),
+      ]);
+    }
+    const validated = validateEffectTemplate(template);
+    if (!validated.ok) {
+      return validated;
+    }
+    this.effectTemplates.set(skillId.trim(), validated.value);
+    return ok();
+  }
+
+  /**
+   * Retrieve a defensive copy of a cached {@link EffectTemplate} for a skill ID,
+   * falling back to the skill's inline `effectTemplate` if present.
+   */
+  getEffectTemplate(skillId: string): EffectTemplate | undefined {
+    if (typeof skillId !== 'string' || !isSafeKey(skillId)) {
+      return undefined;
+    }
+    const cached = this.effectTemplates.get(skillId);
+    if (cached !== undefined) {
+      return cloneEffectTemplate(cached);
+    }
+    const skill = this.skills.get(skillId);
+    return skill?.effectTemplate !== undefined
+      ? cloneEffectTemplate(skill.effectTemplate)
+      : undefined;
   }
 
   /**

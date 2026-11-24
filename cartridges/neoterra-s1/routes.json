@@ -1,88 +1,126 @@
 {
   "routes": [
     {
-      "id": "hero-route",
-      "lock": "route_hero",
+      "id": "s1.post-victory.resistance",
+      "group": "s1-post-victory",
+      "lock": "route_s1_post_resistance",
       "priority": 2,
       "when": {
-        "flag": "hero_triumph"
+        "all": [
+          {
+            "clock": "turn",
+            "op": ">=",
+            "value": 90
+          },
+          {
+            "flag": "post_victory_s1_resistance_chosen",
+            "value": true
+          }
+        ]
       },
-      "announce": "Clarity's grid override collapses — Hero Victory route locked."
+      "announce": "The Broken Colorgarde begins."
     },
     {
-      "id": "villain-route",
-      "lock": "route_villain",
+      "id": "s1.post-victory.join-villain",
+      "group": "s1-post-victory",
+      "lock": "route_s1_post_join_villain",
       "priority": 1,
       "when": {
-        "flag": "villain_ascendant"
+        "all": [
+          {
+            "clock": "turn",
+            "op": ">=",
+            "value": 90
+          },
+          {
+            "flag": "post_victory_s1_join_chosen",
+            "value": true
+          }
+        ]
       },
-      "announce": "Day 5 arrives unchecked: Clarity Syndicate seizes NeoTerra — Villain Victory route locked."
-    },
-    {
-      "id": "post-resistance",
-      "group": "post_victory",
-      "lock": "route_post_resistance",
-      "priority": 2,
-      "when": {
-        "flag": "joined_resistance"
-      },
-      "announce": "You vanish into the Old Subway to lead the Resistance."
-    },
-    {
-      "id": "post-join-villain",
-      "group": "post_victory",
-      "lock": "route_post_join_villain",
-      "priority": 1,
-      "when": {
-        "flag": "joined_clarity"
-      },
-      "announce": "You accept Claire Atropos's pact under the new Clarity regime."
+      "announce": "Serve the Mandate begins."
     }
   ],
   "endings": [
     {
-      "id": "hero-victory",
-      "route": "hero-route",
-      "priority": 2,
+      "id": "s1.ending.resolution",
+      "priority": 10,
       "when": {
-        "flag": "hero_triumph"
+        "beat": "s1.resolution.clarity-falls",
+        "status": [
+          "resolved",
+          "adapted"
+        ]
       },
       "epilogue": {
-        "promptPath": "assets/endings/hero-victory.md"
+        "promptPath": "assets/endings/s1.ending.resolution.md"
       },
-      "mark": "ending_hero_victory"
+      "mark": "ending_s1_resolution"
     },
     {
-      "id": "villain-victory",
-      "route": "villain-route",
-      "priority": 1,
+      "id": "s1.ending.post-resistance",
+      "route": "s1.post-victory.resistance",
+      "priority": 20,
       "when": {
-        "flag": "villain_ascendant"
+        "beat": "s1.post.resistance.strike",
+        "status": [
+          "resolved",
+          "adapted"
+        ]
       },
       "epilogue": {
-        "promptPath": "assets/endings/villain-victory.md"
+        "promptPath": "assets/endings/s1.ending.post-resistance.md"
       },
-      "mark": "ending_villain_victory",
+      "mark": "ending_s1_post_resistance"
+    },
+    {
+      "id": "s1.ending.post-join-villain",
+      "route": "s1.post-victory.join-villain",
+      "priority": 20,
+      "when": {
+        "beat": "s1.post.join.conquer",
+        "status": [
+          "resolved",
+          "adapted"
+        ]
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/s1.ending.post-join-villain.md"
+      },
+      "mark": "ending_s1_post_join-villain"
+    },
+    {
+      "id": "s1.ending.villain-victory",
+      "priority": 5,
+      "when": {
+        "clock": "turn",
+        "op": ">=",
+        "value": 90
+      },
+      "epilogue": {
+        "promptPath": "assets/endings/s1.ending.villain-victory.md"
+      },
+      "mark": "ending_s1_villain_victory",
       "branches": [
         {
           "id": "resistance",
-          "label": "Lead the Underground Resistance",
-          "activateRoute": "post-resistance",
-          "routeGroup": "post_victory",
-          "targetArc": "post-victory",
+          "label": "The Broken Colorgarde",
+          "activateRoute": "s1.post-victory.resistance",
+          "routeGroup": "s1-post-victory",
           "patch": {
-            "flags.joined_resistance": true
-          }
+            "flags.post_victory_s1_resistance_chosen": true
+          },
+          "targetArc": "post-victory"
         },
         {
           "id": "join-villain",
-          "label": "Join Claire Atropos's Clarity Order",
-          "activateRoute": "post-join-villain",
-          "routeGroup": "post_victory",
-          "targetArc": "post-victory",
+          "label": "Serve the Mandate",
+          "activateRoute": "s1.post-victory.join-villain",
+          "routeGroup": "s1-post-victory",
           "patch": {
-            "flags.joined_clarity": true
-          }
+            "flags.post_victory_s1_join_chosen": true
+          },
+          "targetArc": "post-victory"
         }
       ]
     }

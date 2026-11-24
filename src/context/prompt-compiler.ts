@@ -9,7 +9,8 @@ import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import type { ChatMessage } from '../gateway/types.js';
 import type { FormDefinition } from '../state/forms.js';
-import type { WorldState } from '../state/world-state.js';
+import type { CharacterCardLoreEntry, CharacterCardSheet } from '../state/character-card-sheet.js';
+import type { CharacterEntity, WorldState } from '../state/world-state.js';
 import { computeLocationCast } from '../world/cast-presence.js';
 import { getRelevantChronicleEntries } from '../world/chronicle.js';
 import {
@@ -413,10 +414,100 @@ function buildGameSystemRulesSection(
   return `[GAME_SYSTEM_RULES]\n${rules.join('\n')}`;
 }
 
+interface ScopedCastCards {
+  playerPersonaCard: CharacterCardSheet | null;
+  presentCharacters: Array<{ id: string; entity: CharacterEntity; isPlayerCanon: boolean }>;
+  offscreenCharacters: Array<{ id: string; entity: CharacterEntity }>;
+}
+
+function collectScopedCastCards(state: WorldState): ScopedCastCards {
+  const presentIdSet = new Set<string>();
+  for (const id of state.scene.presentCharacterIds) {
+    if (isSafeRecordKey(id) && getOwnSafe(state.entities.characters, id) !== undefined) {
+      presentIdSet.add(id);
+    }
+  }
+  const canonId = state.player.canonCharacterId;
+  if (typeof canonId === 'string' && isSafeRecordKey(canonId) && getOwnSafe(state.entities.characters, canonId) !== undefined) {
+    presentIdSet.add(canonId);
+  }
+
+  const presentCharacters: Array<{ id: string; entity: CharacterEntity; isPlayerCanon: boolean }> = [];
+  const offscreenCharacters: Array<{ id: string; entity: CharacterEntity }> = [];
+
+  for (const id of Object.keys(state.entities.characters)
+    .filter(isSafeRecordKey)
+    .sort(compareStringsDeterministic)) {
+    const entity = getOwnSafe(state.entities.characters, id);
+    if (entity === undefined) {
+      continue;
+    }
+    if (presentIdSet.has(id)) {
+      presentCharacters.push({ id, entity, isPlayerCanon: id === canonId });
+    } else {
+      offscreenCharacters.push({ id, entity });
+    }
+  }
+
+  return {
+    playerPersonaCard: state.player.personaCard ?? null,
+    presentCharacters,
+    offscreenCharacters,
+  };
+}
+
+function resolveActiveFormSummary(
+  entity: CharacterEntity,
+  formDefinitions?: readonly FormDefinition[]
+): string | undefined {
+  if (typeof entity.formId !== 'string' || entity.formId.trim().length === 0) {
+    return undefined;
+  }
+  const formId = entity.formId.trim();
+  const def = formDefinitions?.find((f) => f.id === formId);
+  if (def !== undefined) {
+    const traits = (def.traits ?? []).filter((t) => t.trim().length > 0);
+    return traits.length > 0 ? `${def.displayName} (${traits.join(', ')})` : def.displayName;
+  }
+  return formId;
+}
+
+function formatCardSheetLines(
+  header: string,
+  sheet: CharacterCardSheet,
+  activeFormSummary?: string
+): string[] {
+  const lines: string[] = [header];
+  if (sheet.name.trim().length > 0) {
+    lines.push(`Name: ${sheet.name.trim()}`);
+  }
+  if (activeFormSummary !== undefined && activeFormSummary.trim().length > 0) {
+    lines.push(`Active Form: ${activeFormSummary.trim()}`);
+  }
+  if (sheet.description.trim().length > 0) {
+    lines.push(`Description: ${sheet.description.trim()}`);
+  }
+  if (sheet.personality.trim().length > 0) {
+    lines.push(`Personality: ${sheet.personality.trim()}`);
+  }
+  if (sheet.scenario.trim().length > 0) {
+    lines.push(`Scenario: ${sheet.scenario.trim()}`);
+  }
+  if (sheet.mesExample.trim().length > 0) {
+    lines.push(`Example Dialogue: ${sheet.mesExample.trim()}`);
+  }
+  if (sheet.systemPrompt.trim().length > 0) {
+    lines.push(`Card Instructions: ${sheet.systemPrompt.trim()}`);
+  }
+  return lines;
+}
+
 function buildCardSection(
   cardPersona: CardPersonaInput,
   macroCtx?: PromptMacroContext,
-  stFormatTemplates?: StFormatTemplates
+  stFormatTemplates?: StFormatTemplates,
+  state?: WorldState,
+  formDefinitions?: readonly FormDefinition[]
 ): string {
   const expandField = (text: string): string => {
     if (macroCtx === undefined) {
@@ -462,7 +553,6 @@ function buildCardSection(
           },
         }
       : undefined;
-
   const lines: string[] = [];
   if (cardPersona.name.trim().length > 0) {
     lines.push(`Name: ${cardPersona.name.trim()}`);
@@ -503,6 +593,32 @@ function buildCardSection(
   if (resolvedSystemPrompt.length > 0) {
     lines.push(`Card Instructions: ${resolvedSystemPrompt}`);
   }
+
+  if (state !== undefined) {
+    const scoped = collectScopedCastCards(state);
+    if (scoped.playerPersonaCard !== null) {
+      lines.push(...formatCardSheetLines('[PLAYER PERSONA CARD]', scoped.playerPersonaCard));
+    }
+    for (const { entity, isPlayerCanon } of scoped.presentCharacters) {
+      if (entity.cardSheet !== undefined) {
+        const header = isPlayerCanon
+          ? `[PLAYER CANON CARD: ${entity.name}]`
+          : `[SCENE CAST CARD: ${entity.name}]`;
+        const formSummary = resolveActiveFormSummary(entity, formDefinitions);
+        lines.push(...formatCardSheetLines(header, entity.cardSheet, formSummary));
+      }
+    }
+    if (scoped.offscreenCharacters.length > 0) {
+      lines.push('[OFF-SCREEN ROSTER]');
+      for (const { entity } of scoped.offscreenCharacters) {
+        const loc = typeof entity.locationId === 'string' && entity.locationId.trim().length > 0
+          ? entity.locationId.trim()
+          : 'unknown';
+        lines.push(`- ${entity.name} (${entity.status}) @ ${loc}`);
+      }
+    }
+  }
+
   if (lines.length === 0) {
     return '';
   }
@@ -990,6 +1106,69 @@ function renderPlotSection(
   return buildBudgetedBlock('[PLOT]', plotItems, budgets.plot);
 }
 
+function evaluateEmbeddedCardLorebooks(
+  state: WorldState,
+  recentTranscript: readonly ChatMessage[],
+  latestInput: string
+): Array<{ text: string }> {
+  const scoped = collectScopedCastCards(state);
+  const sheets: CharacterCardSheet[] = [];
+  if (scoped.playerPersonaCard !== null) {
+    sheets.push(scoped.playerPersonaCard);
+  }
+  for (const { entity } of scoped.presentCharacters) {
+    if (entity.cardSheet !== undefined) {
+      sheets.push(entity.cardSheet);
+    }
+  }
+  if (sheets.length === 0) {
+    return [];
+  }
+
+  const corpus = [...recentTranscript.map((m) => m.content), latestInput]
+    .join('\n')
+    .toLowerCase();
+
+  const activated: Array<{ entry: CharacterCardLoreEntry; sheetName: string }> = [];
+  for (const sheet of sheets) {
+    for (const entry of sheet.embeddedLoreEntries) {
+      if (!entry.enabled || entry.content.trim().length === 0) {
+        continue;
+      }
+      if (!entry.constant) {
+        const primaryKeys = entry.keys
+          .map((k) => k.trim().toLowerCase())
+          .filter((k) => k.length > 0);
+        if (primaryKeys.length === 0 || !primaryKeys.some((k) => corpus.includes(k))) {
+          continue;
+        }
+        const secondaryKeys = entry.secondaryKeys
+          .map((k) => k.trim().toLowerCase())
+          .filter((k) => k.length > 0);
+        if (secondaryKeys.length > 0 && !secondaryKeys.some((k) => corpus.includes(k))) {
+          continue;
+        }
+      }
+      activated.push({ entry, sheetName: sheet.name });
+    }
+  }
+
+  activated.sort(
+    (a, b) =>
+      a.entry.insertionOrder - b.entry.insertionOrder ||
+      compareStringsDeterministic(a.entry.name ?? '', b.entry.name ?? '') ||
+      compareStringsDeterministic(a.entry.content, b.entry.content)
+  );
+
+  return activated.map(({ entry, sheetName }) => {
+    const label =
+      typeof entry.name === 'string' && entry.name.trim().length > 0
+        ? `${sheetName} · ${entry.name.trim()}`
+        : sheetName;
+    return { text: `- [Card Lore · ${label}] ${entry.content.trim()}` };
+  });
+}
+
 function renderWorldSection(
   input: CompilePromptInput,
   effectiveCapabilities: ReturnType<typeof resolveEffectiveCapabilities>,
@@ -1055,6 +1234,15 @@ function renderWorldSection(
     for (const txt of scriptAddons) {
       worldItems.push({ text: txt });
     }
+  }
+
+  const cardLoreItems = evaluateEmbeddedCardLorebooks(
+    input.state,
+    input.recentTranscript,
+    input.latestInput
+  );
+  for (const item of cardLoreItems) {
+    worldItems.push(item);
   }
 
   if (worldItems.length === 0) {
@@ -1434,7 +1622,13 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
         const basePersona = hasUserPersona
           ? buildUserPersonaSection(input.userPersona, baseMacroCtx)
           : !hasCardSlot
-            ? buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates)
+            ? buildCardSection(
+                input.cardPersona,
+                baseMacroCtx,
+                stFormatTemplates,
+                input.state,
+                input.formDefinitions
+              )
             : '';
         const personaText = applySectionBudget(
           !hasCardSlot && !hasUserPersona ? 'card' : 'persona',
@@ -1451,7 +1645,13 @@ export function compileNarratorPrompt(input: CompilePromptInput): CompiledPrompt
         const cardText = applySectionBudget(
           'card',
           appendScriptTexts(
-            buildCardSection(input.cardPersona, baseMacroCtx, stFormatTemplates),
+            buildCardSection(
+              input.cardPersona,
+              baseMacroCtx,
+              stFormatTemplates,
+              input.state,
+              input.formDefinitions
+            ),
             scriptBySection.get('card')
           ),
           budgets

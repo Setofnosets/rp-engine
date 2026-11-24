@@ -1,5 +1,24 @@
-import { RefereeError } from '../core/errors.js';
-import type { CharacterEntity, CharacterProgression, ResourcePool } from './world-state.js';
+import {
+  type DependencyIndex,
+  buildDependencyIndex,
+  findDirtyIds,
+} from '../beats/dependency-compiler.js';
+import {
+  type BeatStatus,
+  type PredicateAst,
+  isUnsafePropertyKey,
+  validatePredicateAst,
+} from '../beats/predicate-ast.js';
+import { evaluatePredicate } from '../beats/predicate-evaluator.js';
+import { RefereeError, type ValidationError, validationError } from '../core/errors.js';
+import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
+import type { PatchOperation } from './patch.js';
+import type {
+  CharacterEntity,
+  CharacterProgression,
+  ResourcePool,
+  WorldState,
+} from './world-state.js';
 
 /**
  * Definition of an alternate or base character form within a mutually exclusive form group.
@@ -266,6 +285,15 @@ export function applyFormProfileOverlay(
   if (character.corruption !== undefined) {
     nextCharacter.corruption = { ...character.corruption };
   }
+  if (character.lockedForms !== undefined) {
+    const clonedLocked: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(character.lockedForms)) {
+      if (!isUnsafePropertyKey(k)) {
+        setRecordEntry(clonedLocked, k, v);
+      }
+    }
+    nextCharacter.lockedForms = clonedLocked;
+  }
 
   return nextCharacter;
 }
@@ -320,4 +348,365 @@ export function selectExclusiveCast<T extends { id: string; formGroup?: string |
   }
 
   return selected;
+}
+
+/**
+ * Secret identity visibility metadata for a {@link FormTransitionRule}.
+ */
+export interface FormTransitionSecretIdentity {
+  knownByCharacterIds: string[];
+  unmaskOnPublicTransform: boolean;
+}
+
+/**
+ * Declarative reactive rule that triggers a `form_transform` when its {@link PredicateAst}
+ * evaluates to `true`.
+ */
+export interface FormTransitionRule {
+  id: string;
+  formGroup: string;
+  fromFormId: string | '*';
+  toFormId: string;
+  when: PredicateAst;
+  priority: number;
+  permanent?: boolean;
+  reversibleBy?: string[];
+  triggerTag?: string;
+  secretIdentity?: FormTransitionSecretIdentity;
+}
+
+/**
+ * Options controlling deterministic evaluation of {@link FormTransitionRule}s.
+ */
+export interface EvaluateFormRulesOptions {
+  readonly dependencyIndex?: DependencyIndex;
+  readonly changedPaths?: ReadonlySet<string>;
+  readonly activeCureTriggers?: readonly string[];
+  readonly beatStatuses?: ReadonlyMap<string, BeatStatus> | Readonly<Record<string, BeatStatus>>;
+  readonly recentTranscriptLines?: readonly string[];
+  readonly warnings?: ValidationError[];
+}
+
+const EMPTY_BEAT_STATUSES: ReadonlyMap<string, BeatStatus> = new Map();
+
+function getOwnRecordValue<T>(record: Readonly<Record<string, T>>, key: string): T | undefined {
+  if (isUnsafePropertyKey(key) || !Object.hasOwn(record, key)) {
+    return undefined;
+  }
+  return Object.getOwnPropertyDescriptor(record, key)?.value as T | undefined;
+}
+
+function compareRulesDeterministic(a: FormTransitionRule, b: FormTransitionRule): number {
+  if (a.priority !== b.priority) {
+    return b.priority - a.priority;
+  }
+  return compareIdsDeterministic(a.id, b.id);
+}
+
+/**
+ * Validate a collection of {@link FormTransitionRule} definitions.
+ */
+export function validateFormTransitionRules(
+  rules: readonly FormTransitionRule[],
+  formIndex?: FormIndex,
+  path = 'formRules'
+): Result<readonly FormTransitionRule[], ValidationError[]> {
+  if (!Array.isArray(rules)) {
+    return err([validationError(path, 'INVALID_TYPE', 'formRules must be an array')]);
+  }
+
+  const acc = new ErrorAccumulator(path);
+  const seenIds = new Set<string>();
+
+  for (let i = 0; i < rules.length; i += 1) {
+    const rule = rules[i];
+    const ruleAcc = acc.scope(`[${i}]`);
+    if (!rule || typeof rule !== 'object') {
+      ruleAcc.add('', 'INVALID_TYPE', 'FormTransitionRule must be an object');
+      continue;
+    }
+
+    if (typeof rule.id !== 'string' || rule.id.trim().length === 0) {
+      ruleAcc.add('id', 'REQUIRED', 'rule.id must be a non-empty string');
+    } else if (isUnsafePropertyKey(rule.id)) {
+      ruleAcc.add('id', 'UNSAFE_PROPERTY_KEY', `Unsafe rule.id "${rule.id}"`);
+    } else if (seenIds.has(rule.id)) {
+      ruleAcc.add('id', 'DUPLICATE_ID', `Duplicate form rule id "${rule.id}"`);
+    } else {
+      seenIds.add(rule.id);
+    }
+
+    if (typeof rule.formGroup !== 'string' || rule.formGroup.trim().length === 0) {
+      ruleAcc.add('formGroup', 'REQUIRED', 'rule.formGroup must be a non-empty string');
+    } else if (isUnsafePropertyKey(rule.formGroup)) {
+      ruleAcc.add('formGroup', 'UNSAFE_PROPERTY_KEY', `Unsafe formGroup "${rule.formGroup}"`);
+    }
+
+    if (typeof rule.fromFormId !== 'string' || rule.fromFormId.trim().length === 0) {
+      ruleAcc.add('fromFormId', 'REQUIRED', 'rule.fromFormId must be "*" or a non-empty string');
+    } else if (rule.fromFormId !== '*' && formIndex) {
+      const fromForm = formIndex.byId.get(rule.fromFormId);
+      if (!fromForm) {
+        ruleAcc.add(
+          'fromFormId',
+          'FORM_NOT_FOUND',
+          `fromFormId "${rule.fromFormId}" was not found in FormIndex`
+        );
+      } else if (fromForm.formGroup !== rule.formGroup) {
+        ruleAcc.add(
+          'fromFormId',
+          'FORM_GROUP_MISMATCH',
+          `fromFormId "${rule.fromFormId}" belongs to formGroup "${fromForm.formGroup}", expected "${rule.formGroup}"`
+        );
+      }
+    }
+
+    if (typeof rule.toFormId !== 'string' || rule.toFormId.trim().length === 0) {
+      ruleAcc.add('toFormId', 'REQUIRED', 'rule.toFormId must be a non-empty string');
+    } else if (formIndex) {
+      const toForm = formIndex.byId.get(rule.toFormId);
+      if (!toForm) {
+        ruleAcc.add(
+          'toFormId',
+          'FORM_NOT_FOUND',
+          `toFormId "${rule.toFormId}" was not found in FormIndex`
+        );
+      } else if (toForm.formGroup !== rule.formGroup) {
+        ruleAcc.add(
+          'toFormId',
+          'FORM_GROUP_MISMATCH',
+          `toFormId "${rule.toFormId}" belongs to formGroup "${toForm.formGroup}", expected "${rule.formGroup}"`
+        );
+      }
+    }
+
+    if (typeof rule.priority !== 'number' || !Number.isFinite(rule.priority)) {
+      ruleAcc.add('priority', 'INVALID_NUMBER', 'rule.priority must be a finite number');
+    }
+
+    if (rule.permanent !== undefined && typeof rule.permanent !== 'boolean') {
+      ruleAcc.add('permanent', 'INVALID_TYPE', 'rule.permanent must be a boolean');
+    }
+
+    if (rule.reversibleBy !== undefined) {
+      if (!Array.isArray(rule.reversibleBy)) {
+        ruleAcc.add('reversibleBy', 'INVALID_TYPE', 'rule.reversibleBy must be an array of strings');
+      } else {
+        for (let j = 0; j < rule.reversibleBy.length; j += 1) {
+          const item = rule.reversibleBy[j];
+          if (typeof item !== 'string' || item.trim().length === 0) {
+            ruleAcc.add(
+              `reversibleBy[${j}]`,
+              'REQUIRED',
+              'reversibleBy entries must be non-empty strings'
+            );
+          }
+        }
+      }
+    }
+
+    if (rule.triggerTag !== undefined && (typeof rule.triggerTag !== 'string' || rule.triggerTag.trim().length === 0)) {
+      ruleAcc.add('triggerTag', 'REQUIRED', 'rule.triggerTag must be a non-empty string');
+    }
+
+    if (rule.secretIdentity !== undefined) {
+      if (!rule.secretIdentity || typeof rule.secretIdentity !== 'object') {
+        ruleAcc.add('secretIdentity', 'INVALID_TYPE', 'rule.secretIdentity must be an object');
+      } else {
+        if (!Array.isArray(rule.secretIdentity.knownByCharacterIds)) {
+          ruleAcc.add(
+            'secretIdentity.knownByCharacterIds',
+            'INVALID_TYPE',
+            'knownByCharacterIds must be an array of strings'
+          );
+        } else {
+          for (let k = 0; k < rule.secretIdentity.knownByCharacterIds.length; k += 1) {
+            const charId = rule.secretIdentity.knownByCharacterIds[k];
+            if (typeof charId !== 'string' || charId.trim().length === 0) {
+              ruleAcc.add(
+                `secretIdentity.knownByCharacterIds[${k}]`,
+                'REQUIRED',
+                'knownByCharacterIds entries must be non-empty strings'
+              );
+            }
+          }
+        }
+        if (typeof rule.secretIdentity.unmaskOnPublicTransform !== 'boolean') {
+          ruleAcc.add(
+            'secretIdentity.unmaskOnPublicTransform',
+            'INVALID_TYPE',
+            'unmaskOnPublicTransform must be a boolean'
+          );
+        }
+      }
+    }
+
+    const whenRes = validatePredicateAst(rule.when, `[${i}].when`);
+    if (!whenRes.ok) {
+      acc.addAll(whenRes.error);
+    }
+  }
+
+  return acc.toResult(rules);
+}
+
+/**
+ * Build a {@link DependencyIndex} from {@link FormTransitionRule} predicates for dirty-path filtering.
+ */
+export function buildFormRuleDependencyIndex(rules: readonly FormTransitionRule[]): DependencyIndex {
+  return buildDependencyIndex(
+    rules.map((rule) => ({
+      id: rule.id,
+      predicates: [rule.when],
+    }))
+  );
+}
+
+function findMatchingCureTrigger(
+  currentFormId: string,
+  rule: FormTransitionRule,
+  allRules: readonly FormTransitionRule[],
+  activeCures: ReadonlySet<string>
+): string | undefined {
+  if (activeCures.size === 0) {
+    return undefined;
+  }
+
+  if (rule.reversibleBy) {
+    for (const cure of rule.reversibleBy) {
+      if (activeCures.has(cure)) {
+        return cure;
+      }
+    }
+  }
+
+  for (const candidate of allRules) {
+    if (
+      candidate.formGroup === rule.formGroup &&
+      candidate.toFormId === currentFormId &&
+      candidate.permanent === true &&
+      candidate.reversibleBy
+    ) {
+      for (const cure of candidate.reversibleBy) {
+        if (activeCures.has(cure)) {
+          return cure;
+        }
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Deterministically evaluate {@link FormTransitionRule}s against `worldState` and return
+ * ordered `form_transform` {@link PatchOperation}s.
+ *
+ * Rules are sorted by descending `priority`, then ascending `id`. At most one transition
+ * is emitted per character. Permanently locked forms (`character.lockedForms[formId] === true`)
+ * are respected unless an active cure trigger matches `reversibleBy`.
+ */
+export function evaluateFormTransitionRules(
+  worldState: WorldState,
+  formIndex: FormIndex,
+  rules: readonly FormTransitionRule[],
+  options?: EvaluateFormRulesOptions
+): PatchOperation[] {
+  if (rules.length === 0) {
+    return [];
+  }
+
+  const orderedRules = [...rules].sort(compareRulesDeterministic);
+  const activeCures = new Set(options?.activeCureTriggers ?? []);
+
+  let dirtyRuleIds: ReadonlySet<string> | null = null;
+  if (options?.dependencyIndex && options.changedPaths && options.changedPaths.size > 0) {
+    dirtyRuleIds = findDirtyIds(options.dependencyIndex, options.changedPaths);
+  }
+
+  const charIds = Object.keys(worldState.entities.characters)
+    .filter((id) => !isUnsafePropertyKey(id))
+    .sort(compareIdsDeterministic);
+
+  const operations: PatchOperation[] = [];
+
+  for (const charId of charIds) {
+    const character = getOwnRecordValue(worldState.entities.characters, charId);
+    if (!character) {
+      continue;
+    }
+
+    const currentFormId = character.formId;
+    const charFormGroup =
+      character.formGroup ??
+      (currentFormId !== null ? formIndex.byId.get(currentFormId)?.formGroup ?? null : null);
+    if (!charFormGroup) {
+      continue;
+    }
+
+    const isCurrentLocked =
+      currentFormId !== null &&
+      character.lockedForms !== undefined &&
+      getOwnRecordValue(character.lockedForms, currentFormId) === true;
+
+    for (const rule of orderedRules) {
+      if (rule.formGroup !== charFormGroup) {
+        continue;
+      }
+      if (dirtyRuleIds !== null && !dirtyRuleIds.has(rule.id)) {
+        continue;
+      }
+      if (rule.fromFormId !== '*' && rule.fromFormId !== currentFormId) {
+        continue;
+      }
+      if (rule.toFormId === currentFormId) {
+        continue;
+      }
+
+      const targetForm = formIndex.byId.get(rule.toFormId);
+      if (!targetForm || targetForm.formGroup !== rule.formGroup) {
+        continue;
+      }
+      if (targetForm.characterId !== charId) {
+        continue;
+      }
+
+      let matchedCureTrigger: string | undefined;
+      if (isCurrentLocked && currentFormId !== null) {
+        matchedCureTrigger = findMatchingCureTrigger(
+          currentFormId,
+          rule,
+          orderedRules,
+          activeCures
+        );
+        if (matchedCureTrigger === undefined) {
+          continue;
+        }
+      }
+
+      const matched = evaluatePredicate(rule.when, {
+        state: worldState,
+        beatStatuses: options?.beatStatuses ?? EMPTY_BEAT_STATUSES,
+        recentTranscriptLines: options?.recentTranscriptLines,
+        warnings: options?.warnings,
+      });
+
+      if (!matched) {
+        continue;
+      }
+
+      const op: PatchOperation = {
+        op: 'form_transform',
+        characterId: charId,
+        targetFormId: rule.toFormId,
+        ...(rule.permanent === true ? { lockPermanent: true } : {}),
+        ...(matchedCureTrigger !== undefined ? { cureTrigger: matchedCureTrigger } : {}),
+        ...(rule.triggerTag !== undefined ? { triggerTag: rule.triggerTag } : {}),
+      };
+      operations.push(op);
+      break;
+    }
+  }
+
+  return operations;
 }

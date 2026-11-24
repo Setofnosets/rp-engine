@@ -670,7 +670,101 @@ describe('PR-6.2: SillyTavern Bridge Extension (referee-st-bridge)', () => {
     expect(dir.buildDirectorSteeringPayload()).toEqual({});
   });
 
-  it('7. Wave 5 RefereeBridgeClient methods hit exact URLs, HTTP methods, query params, and payloads', async () => {
+  it('7. PR-10.2: RefereeBridgeClient new endpoints and HUD parity (Traditional Theater, hazards, discoveryState, newsroom)', async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const client = new RefereeBridgeClient({
+      baseUrl: 'http://127.0.0.1:4120',
+      fetchImpl: async (url, init) => {
+        calls.push({ url: String(url), method: init?.method ?? 'GET' });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+
+    await client.previewCombat('s1', { skillId: 'slash' });
+    await client.travel('s1', { destinationId: 'loc_2' });
+    await client.downtime('s1', { activity: 'rest' });
+    await client.cloneSession('s1', { label: 'alt' });
+    await client.listSessions();
+    await client.getContextBudget('s1');
+    await client.importCard({ path: 'card.png' });
+    await client.bindPlayer('s1', { canonCharacterId: 'char_1' });
+
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'POST http://127.0.0.1:4120/api/sessions/s1/combat/preview',
+      'POST http://127.0.0.1:4120/api/sessions/s1/travel',
+      'POST http://127.0.0.1:4120/api/sessions/s1/downtime',
+      'POST http://127.0.0.1:4120/api/sessions/s1/clone',
+      'GET http://127.0.0.1:4120/api/sessions',
+      'GET http://127.0.0.1:4120/api/sessions/s1/context-budget',
+      'POST http://127.0.0.1:4120/api/cards/import',
+      'POST http://127.0.0.1:4120/api/sessions/s1/player/bind',
+    ]);
+
+    const html = renderHudStateHtml({
+      config: {
+        packId: 'stock-rpg-full',
+        packName: 'Full RPG',
+        capabilities: { combatMode: 'traditional' },
+        gameSystems: [],
+      },
+      state: {
+        meta: { turn: 2 },
+        scene: { location: 'Keep', locationId: 'loc_keep', mood: 'alert' },
+        entities: {
+          locations: { loc_keep: { discoveryState: 'visited' } },
+        },
+        chronicle: {
+          digestEditions: [
+            {
+              id: 'ed-1',
+              day: 4,
+              masthead: 'The <script>Daily</script>',
+              headlines: ['Dragon Sighted', '<b>Alert</b>'],
+            },
+          ],
+        },
+      },
+      combatState: {
+        mode: 'traditional',
+        turnStyle: 'phased',
+        round: 1,
+        activeCombatantId: 'c1',
+        combatants: {
+          c1: {
+            id: 'c1',
+            name: 'Aria',
+            formationRow: 'back',
+            isSummon: true,
+            activeTransform: { loadoutId: 'phoenix' },
+            hp: 12,
+            maxHp: 20,
+            willpower: 3,
+            maxWillpower: 5,
+          },
+        },
+        grid: {
+          tiles: [[{ hazard: 'fire' }, { hazard: 'sanctuary' }]],
+        },
+      },
+    });
+
+    expect(html).toContain('visited');
+    expect(html).toContain('phased');
+    expect(html).toContain('BACK');
+    expect(html).toContain('SUMMON');
+    expect(html).toContain('FORM:phoenix');
+    expect(html).toContain('WP 3/5');
+    expect(html).toContain('(0,0)=fire');
+    expect(html).toContain('(1,0)=sanctuary');
+    expect(html).toContain('The &lt;script&gt;Daily&lt;/script&gt;');
+    expect(html).toContain('&lt;b&gt;Alert&lt;/b&gt;');
+    expect(html).not.toContain('<script>');
+  });
+
+  it('8. Wave 5 RefereeBridgeClient methods hit exact URLs, HTTP methods, query params, and payloads', async () => {
     interface RecordedCall {
       url: string;
       method: string;

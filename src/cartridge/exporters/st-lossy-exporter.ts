@@ -1,6 +1,13 @@
 import type { BeatDefinition } from '../../beats/beat-ledger.js';
 import type { PredicateAst } from '../../beats/predicate-ast.js';
+import type { ValidationError } from '../../core/errors.js';
+import type { Result } from '../../core/result.js';
 import { type CartridgeBundle, getSafeProperty } from '../cartridge-schema.js';
+import {
+  type EmbedCharaJsonOptions,
+  type PngCardKeyword,
+  embedCharaJsonInPng,
+} from '../png-card-codec.js';
 
 export interface SillyTavernV2LorebookEntry {
   id: number;
@@ -248,4 +255,57 @@ export function exportCartridgeToSillyTavernV2(bundle: CartridgeBundle): SillyTa
  */
 export function exportCartridgeToSillyTavernV2Json(bundle: CartridgeBundle): string {
   return JSON.stringify(exportCartridgeToSillyTavernV2(bundle), null, 2);
+}
+
+export interface ExportCartridgeToPngOptions extends EmbedCharaJsonOptions {
+  keyword?: PngCardKeyword;
+}
+
+/**
+ * Lossy export of a {@link CartridgeBundle} into a SillyTavern `.png` character card,
+ * embedding `ccv3` (default) or `chara` metadata into `basePngBuffer` while preserving
+ * all pixel chunks bit-for-bit.
+ */
+export function exportCartridgeToPngCard(
+  bundle: CartridgeBundle,
+  basePngBuffer: Buffer,
+  options: ExportCartridgeToPngOptions = {}
+): Result<Buffer, ValidationError[]> {
+  const v2Card = exportCartridgeToSillyTavernV2(bundle);
+
+  // If the cartridge carries a card-backed primary character sheet, preserve its structured fields.
+  const chars = bundle.initialEntities?.characters;
+  if (chars) {
+    const primaryChar = Object.values(chars).find((c) => c.cardSheet !== undefined);
+    if (primaryChar?.cardSheet) {
+      const sheet = primaryChar.cardSheet;
+      v2Card.data.name = sheet.name;
+      v2Card.data.description = sheet.description;
+      v2Card.data.personality = sheet.personality;
+      v2Card.data.scenario = sheet.scenario;
+      v2Card.data.first_mes = sheet.firstMes;
+      v2Card.data.alternate_greetings = [...sheet.alternateGreetings];
+      v2Card.data.mes_example = sheet.mesExample;
+      if (sheet.creatorNotes.length > 0 && v2Card.data.creator_notes.length === 0) {
+        v2Card.data.creator_notes = sheet.creatorNotes;
+      }
+      v2Card.data.system_prompt = sheet.systemPrompt;
+      v2Card.data.post_history_instructions = sheet.postHistoryInstructions;
+      if (sheet.tags.length > 0) {
+        v2Card.data.tags = [...sheet.tags];
+      }
+    }
+  }
+
+  const keyword: PngCardKeyword = options.keyword ?? 'ccv3';
+  const payload =
+    keyword === 'ccv3'
+      ? {
+          spec: 'chara_card_v3',
+          spec_version: '3.0',
+          data: v2Card.data,
+        }
+      : v2Card;
+
+  return embedCharaJsonInPng(basePngBuffer, payload, keyword, options);
 }

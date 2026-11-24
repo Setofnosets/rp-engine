@@ -30,15 +30,58 @@ export const AGENT_ROLES: readonly AgentRole[] = [
 /**
  * Supported backend provider kinds.
  */
-export type ProviderKind = 'openai_compatible' | 'ollama' | 'anthropic' | 'mock';
+export type ProviderKind =
+  | 'openai_compatible'
+  | 'openai'
+  | 'anthropic'
+  | 'gemini'
+  | 'ollama'
+  | 'mock';
+
+/**
+ * Reusable sampler configuration preset assignable to roles or connections.
+ */
+export interface SamplerPreset {
+  readonly id: string;
+  readonly name: string;
+  readonly temperature?: number;
+  readonly topP?: number;
+  readonly topK?: number;
+  readonly minP?: number;
+  readonly repetitionPenalty?: number;
+  readonly frequencyPenalty?: number;
+  readonly presencePenalty?: number;
+  readonly maxTokens?: number;
+  readonly stop?: readonly string[];
+  readonly seed?: number;
+}
+
+/**
+ * Reusable connection preset for cloud or local model endpoints.
+ */
+export interface ConnectionPreset {
+  readonly id: string;
+  readonly name: string;
+  readonly provider: ProviderKind;
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly apiKeyEnv?: string;
+  readonly apiKey?: string;
+  readonly samplerPresetId?: string;
+  readonly enablePromptCache?: boolean;
+  readonly timeoutMs?: number;
+  readonly supportsJsonSchema?: boolean;
+}
 
 /**
  * Canonical list of all supported {@link ProviderKind} identifiers.
  */
 export const PROVIDER_KINDS: readonly ProviderKind[] = [
   'openai_compatible',
-  'ollama',
+  'openai',
   'anthropic',
+  'gemini',
+  'ollama',
   'mock',
 ];
 
@@ -73,6 +116,9 @@ export interface RoleConnectionConfig extends SamplingParameters {
   readonly model: string;
   readonly timeoutMs?: number;
   readonly supportsJsonSchema?: boolean;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly samplerPresetId?: string;
+  readonly enablePromptCache?: boolean;
 }
 
 /**
@@ -91,6 +137,8 @@ export interface GatewayGenerateTextRequest extends SamplingParameters {
   readonly role: AgentRole;
   readonly messages: readonly ChatMessage[];
   readonly signal?: AbortSignal;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly enablePromptCache?: boolean;
 }
 
 /**
@@ -103,6 +151,8 @@ export interface GatewayStructuredRequest extends SamplingParameters {
   readonly schemaName?: string;
   readonly signal?: AbortSignal;
   readonly maxRepairAttempts?: number;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly enablePromptCache?: boolean;
 }
 
 /**

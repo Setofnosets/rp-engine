@@ -7,7 +7,12 @@ import type {
 } from '../schema/dynamic-schema-compiler.js';
 import type { DynamicFieldSpec } from '../schema/tracker-module.js';
 import type { AuditEntry } from './audit-log.js';
-import { type FormIndex, applyFormProfileOverlay, isLegalTransform } from './forms.js';
+import {
+  type FormIndex,
+  type FormTransitionRule,
+  applyFormProfileOverlay,
+  isLegalTransform,
+} from './forms.js';
 import {
   type EntityCollectionName,
   PATCH_SOURCES,
@@ -55,6 +60,7 @@ import {
 export interface ReducerOptions {
   compiledSchema?: CompiledTrackerSchema;
   formIndex?: FormIndex;
+  formRules?: readonly FormTransitionRule[];
   auditSeqStart?: number;
 }
 
@@ -896,6 +902,84 @@ function validateEntityFieldValue(
           return isStringArray(value)
             ? ok([...value])
             : err([validationError(path, 'INVALID_TYPE', `${path} must be string[]`)]);
+        case 'discoveryState': {
+          if (
+            value !== 'unknown' &&
+            value !== 'rumored' &&
+            value !== 'discovered' &&
+            value !== 'visited'
+          ) {
+            return err([
+              validationError(
+                path,
+                'INVALID_ENUM',
+                `${path} must be unknown, rumored, discovered, or visited`
+              ),
+            ]);
+          }
+          return ok(value);
+        }
+        case 'geometry': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          if (
+            typeof value.x !== 'number' ||
+            !Number.isFinite(value.x) ||
+            typeof value.y !== 'number' ||
+            !Number.isFinite(value.y)
+          ) {
+            return err([
+              validationError(path, 'INVALID_TYPE', `${path}.x and ${path}.y must be finite numbers`),
+            ]);
+          }
+          return ok(value);
+        }
+        case 'mapAssets': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          return ok(value);
+        }
+        case 'connectionsMeta': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          for (const key of Object.keys(value)) {
+            if (!isSafeKey(key)) {
+              return err([validationError(path, 'FORBIDDEN_KEY', `Forbidden key "${key}"`)]);
+            }
+          }
+          return ok(value);
+        }
+        case 'hiddenAssets': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          const existingLoc = entity as LocationEntity;
+          const existingAssets = existingLoc.hiddenAssets ?? {};
+          for (const [assetId, rawAsset] of Object.entries(value)) {
+            if (!isSafeKey(assetId)) {
+              return err([validationError(path, 'FORBIDDEN_KEY', `Forbidden key "${assetId}"`)]);
+            }
+            if (!isPlainObject(rawAsset)) {
+              return err([
+                validationError(`${path}.${assetId}`, 'INVALID_TYPE', 'HiddenSiteAsset must be an object'),
+              ]);
+            }
+            const prevAsset = Object.hasOwn(existingAssets, assetId) ? existingAssets[assetId] : undefined;
+            if (prevAsset?.canonLocked && rawAsset.canonStatus === 'intact') {
+              return err([
+                validationError(
+                  `${path}.${assetId}.canonStatus`,
+                  'CANON_LOCKED',
+                  `HiddenSiteAsset "${assetId}" is canonLocked and cannot revert to "intact"`
+                ),
+              ]);
+            }
+          }
+          return ok(value);
+        }
         default:
           return err([
             validationError(path, 'INVALID_PATH', `Unknown LocationEntity field "${field}"`),
@@ -1288,6 +1372,22 @@ function resolveWorldStateTarget(
     return err([validationError(path, 'INVALID_PATH', `Invalid player path "${path}"`)]);
   }
 
+  if (root === 'chronicle' && segs.length === 2 && segs[1] === 'digestEditions') {
+    return ok({
+      canonicalPath: path,
+      allowPushCreate: true,
+      read: () => state.chronicle.digestEditions,
+      validateValue: (v) =>
+        Array.isArray(v)
+          ? ok(v)
+          : err([validationError(path, 'INVALID_TYPE', `${path} must be DigestEdition[]`)]),
+      write: (v) => {
+        state.chronicle.digestEditions = v as WorldState['chronicle']['digestEditions'];
+        return ok(undefined);
+      },
+    });
+  }
+
   if (root === 'turnEvents' && segs.length === 2) {
     const field = segs[1] as string;
     if (field !== 'combatOutcomes' && field !== 'rumors' && field !== 'systemNotices') {
@@ -1507,6 +1607,24 @@ function resolveWorldStateTarget(
         validateValue: (v) => validateEntityFieldValue(collection, entity, field, v, path, state),
         write: (v) => {
           setOwn(entity, field, v);
+          if (collection === 'locations') {
+            const loc = entity as LocationEntity;
+            if (field === 'discovered') {
+              if (v === true) {
+                if (
+                  loc.discoveryState === undefined ||
+                  loc.discoveryState === 'unknown' ||
+                  loc.discoveryState === 'rumored'
+                ) {
+                  loc.discoveryState = 'discovered';
+                }
+              } else {
+                loc.discoveryState = 'unknown';
+              }
+            } else if (field === 'discoveryState') {
+              loc.discovered = v === 'discovered' || v === 'visited';
+            }
+          }
           return ok(undefined);
         },
       });
@@ -2944,6 +3062,68 @@ function applySingleOperation(
         return ok(undefined);
       }
 
+      const isCurrentLocked =
+        oldFormId !== null &&
+        char.lockedForms !== undefined &&
+        getOwn(char.lockedForms, oldFormId) === true;
+
+      if (isCurrentLocked && oldFormId !== null) {
+        const cureTrigger =
+          typeof op.cureTrigger === 'string' && op.cureTrigger.trim().length > 0
+            ? op.cureTrigger
+            : undefined;
+
+        let cureAllowed = cureTrigger !== undefined;
+        if (cureTrigger !== undefined && ctx.options.formRules) {
+          const matchingRules = ctx.options.formRules.filter(
+            (rule) =>
+              (char.formGroup === null || rule.formGroup === char.formGroup) &&
+              (rule.toFormId === oldFormId || rule.toFormId === op.targetFormId)
+          );
+          cureAllowed = matchingRules.some(
+            (rule) => rule.reversibleBy !== undefined && rule.reversibleBy.includes(cureTrigger)
+          );
+        }
+
+        if (!cureAllowed) {
+          return err([
+            validationError(
+              canonicalPath,
+              'FORM_LOCKED',
+              `Form "${oldFormId}" for "${op.characterId}" is permanently locked`
+            ),
+          ]);
+        }
+      }
+
+      const applyLockState = (targetChar: CharacterEntity): void => {
+        if (isCurrentLocked && oldFormId !== null && targetChar.lockedForms) {
+          const nextLocked: Record<string, boolean> = {};
+          for (const [k, v] of Object.entries(targetChar.lockedForms)) {
+            if (isSafeKey(k) && k !== oldFormId) {
+              setOwn(nextLocked, k, v);
+            }
+          }
+          if (Object.keys(nextLocked).length === 0) {
+            delete targetChar.lockedForms;
+          } else {
+            targetChar.lockedForms = nextLocked;
+          }
+        }
+        if (op.lockPermanent === true && isSafeKey(op.targetFormId)) {
+          const nextLocked: Record<string, boolean> = {};
+          if (targetChar.lockedForms) {
+            for (const [k, v] of Object.entries(targetChar.lockedForms)) {
+              if (isSafeKey(k)) {
+                setOwn(nextLocked, k, v);
+              }
+            }
+          }
+          setOwn(nextLocked, op.targetFormId, true);
+          targetChar.lockedForms = nextLocked;
+        }
+      };
+
       if (ctx.options.formIndex) {
         if (!isLegalTransform(char.formId, op.targetFormId, ctx.options.formIndex)) {
           return err([
@@ -2955,7 +3135,22 @@ function applySingleOperation(
           ]);
         }
         const transformed = applyFormProfileOverlay(char, op.targetFormId, ctx.options.formIndex);
+        applyLockState(transformed);
         setOwn(ctx.nextState.entities.characters, op.characterId, transformed);
+        if (ctx.nextState.player.characterId === op.characterId) {
+          ctx.nextState.player.name = transformed.name;
+          const nextPlayerSections: Record<string, string | string[]> = {};
+          for (const [secKey, secVal] of Object.entries(transformed.sections)) {
+            if (isSafeKey(secKey)) {
+              setOwn(
+                nextPlayerSections,
+                secKey,
+                typeof secVal === 'string' ? secVal : [...secVal]
+              );
+            }
+          }
+          ctx.nextState.player.sections = nextPlayerSections;
+        }
         recordChangedIfDifferent(
           ctx,
           `entities.characters.${op.characterId}.formId`,
@@ -2997,6 +3192,7 @@ function applySingleOperation(
         emitAudit(ctx, op.op, canonicalPath, oldFormId, transformed.formId, 'committed');
       } else {
         char.formId = op.targetFormId;
+        applyLockState(char);
         recordChangedIfDifferent(ctx, canonicalPath, oldFormId, op.targetFormId);
         emitAudit(ctx, op.op, canonicalPath, oldFormId, op.targetFormId, 'committed');
       }
@@ -3097,6 +3293,7 @@ function applySingleOperation(
       const targetLoc = getOwn(ctx.nextState.entities.locations, targetId) as LocationEntity;
       const wasDiscovered = targetLoc.discovered;
       targetLoc.discovered = true;
+      targetLoc.discoveryState = 'visited';
       ctx.nextState.scene.locationId = targetId;
       ctx.nextState.scene.location = travelRes.value.targetName;
       ctx.nextState.player.locationId = targetId;
