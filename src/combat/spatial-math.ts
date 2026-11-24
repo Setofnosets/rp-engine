@@ -350,7 +350,34 @@ function buildOccupiedIndexSet(
 }
 
 function getTileMoveCost(tile: GridTile): number {
-  return tile.hazard === 'difficult' ? 2 : 1;
+  switch (tile.hazard) {
+    case 'difficult':
+    case 'ice':
+      return 2;
+    case 'none':
+    case 'fire':
+    case 'acid':
+    case 'electrified':
+    case 'sanctuary':
+      return 1;
+  }
+}
+
+/**
+ * Compute the high-ground attack bonus (`+1` when the attacker stands at a strictly
+ * higher elevation than the defender, `0` otherwise or if either coordinate is invalid).
+ */
+export function computeHighGroundAttackBonus(
+  grid: TacticalGrid,
+  attackerCoord: GridCoord,
+  defenderCoord: GridCoord
+): number {
+  const attackerTile = getTileAt(grid, attackerCoord);
+  const defenderTile = getTileAt(grid, defenderCoord);
+  if (attackerTile === null || defenderTile === null) {
+    return 0;
+  }
+  return attackerTile.elevation > defenderTile.elevation ? 1 : 0;
 }
 
 function canStepDiagonal(
