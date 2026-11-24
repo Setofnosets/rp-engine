@@ -15,6 +15,11 @@ import {
   cloneSystemCapabilities,
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
+import {
+  type CharacterCardSheet,
+  cloneCharacterCardSheet,
+  validateCharacterCardSheet,
+} from './character-card-sheet.js';
 import type { LocationEntity } from './spatial-topology.js';
 
 export const WORLD_STATE_SCHEMA_VERSION = 2 as const;
@@ -71,6 +76,8 @@ export interface CharacterEntity {
   allegiance: string;
   mood: string;
   traits: string[];
+  cardSheet?: CharacterCardSheet;
+  portraitAsset?: string;
 }
 
 export const FACTION_SIDES = Object.freeze([
@@ -181,6 +188,8 @@ export interface WorldState {
     };
     customFields: Record<string, unknown>;
     sections: Record<string, string | string[]>;
+    personaCard?: CharacterCardSheet | null;
+    portraitAsset?: string | null;
   };
   scene: {
     location: string;
@@ -398,6 +407,12 @@ function cloneCharacterEntity(character: CharacterEntity): CharacterEntity {
   if (character.corruption !== undefined) {
     cloned.corruption = { ...character.corruption };
   }
+  if (character.cardSheet !== undefined) {
+    cloned.cardSheet = cloneCharacterCardSheet(character.cardSheet);
+  }
+  if (character.portraitAsset !== undefined) {
+    cloned.portraitAsset = character.portraitAsset;
+  }
   return cloned;
 }
 
@@ -516,6 +531,15 @@ export function cloneWorldState(state: WorldState): WorldState {
   }
   if (state.player.resources !== undefined) {
     player.resources = cloneResources(state.player.resources);
+  }
+  if (state.player.personaCard !== undefined) {
+    player.personaCard =
+      state.player.personaCard === null
+        ? null
+        : cloneCharacterCardSheet(state.player.personaCard);
+  }
+  if (state.player.portraitAsset !== undefined) {
+    player.portraitAsset = state.player.portraitAsset;
   }
 
   const characters: Record<string, CharacterEntity> = {};
@@ -676,6 +700,15 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
       willpower: { current: 10, max: 10 },
       stamina: { current: 100, max: 100 },
     };
+  }
+  if (options.player?.personaCard !== undefined) {
+    player.personaCard =
+      options.player.personaCard === null
+        ? null
+        : cloneCharacterCardSheet(options.player.personaCard);
+  }
+  if (options.player?.portraitAsset !== undefined) {
+    player.portraitAsset = options.player.portraitAsset;
   }
 
   const defaultArc: WorldArc =
@@ -1530,6 +1563,25 @@ export function validateWorldState(
         if (corruption !== undefined) {
           entity.corruption = corruption;
         }
+        if (rawChar.cardSheet !== undefined) {
+          const sheetRes = validateCharacterCardSheet(rawChar.cardSheet, `${charPath}.cardSheet`);
+          if (!sheetRes.ok) {
+            errors.addAll(sheetRes.error);
+          } else {
+            entity.cardSheet = sheetRes.value;
+          }
+        }
+        if (rawChar.portraitAsset !== undefined) {
+          if (typeof rawChar.portraitAsset !== 'string') {
+            errors.add(
+              `${charPath}.portraitAsset`,
+              'INVALID_TYPE',
+              `${charPath}.portraitAsset must be a string`
+            );
+          } else {
+            entity.portraitAsset = rawChar.portraitAsset;
+          }
+        }
         setRecordEntry(characters, key, entity);
       }
     }
@@ -1810,6 +1862,32 @@ export function validateWorldState(
       warnings
     );
     player.sections = validateSectionsField(rawPlayer.sections, 'player.sections', errors, warnings);
+    if (rawPlayer.personaCard !== undefined) {
+      if (rawPlayer.personaCard === null) {
+        player.personaCard = null;
+      } else {
+        const personaRes = validateCharacterCardSheet(
+          rawPlayer.personaCard,
+          'player.personaCard'
+        );
+        if (!personaRes.ok) {
+          errors.addAll(personaRes.error);
+        } else {
+          player.personaCard = personaRes.value;
+        }
+      }
+    }
+    if (rawPlayer.portraitAsset !== undefined) {
+      if (rawPlayer.portraitAsset !== null && typeof rawPlayer.portraitAsset !== 'string') {
+        errors.add(
+          'player.portraitAsset',
+          'INVALID_TYPE',
+          'player.portraitAsset must be a string or null'
+        );
+      } else {
+        player.portraitAsset = rawPlayer.portraitAsset;
+      }
+    }
   }
 
   // scene
