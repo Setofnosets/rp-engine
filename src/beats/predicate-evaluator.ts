@@ -502,12 +502,36 @@ export function evaluatePredicate(ast: PredicateAst, ctx: PredicateEvalContext):
   }
 
   if ('at' in ast) {
-    return matchesLocationPredicate(
-      ctx.state.capabilities.spatialMode,
-      ctx.state.scene,
-      ctx.state.entities.locations,
-      ast.at
-    );
+    if (
+      !matchesLocationPredicate(
+        ctx.state.capabilities.spatialMode,
+        ctx.state.scene,
+        ctx.state.entities.locations,
+        ast.at
+      )
+    ) {
+      return false;
+    }
+    if (ast.discoveryState !== undefined || ast.districtId !== undefined) {
+      const locId = ctx.state.scene.locationId;
+      const loc =
+        locId !== null && Object.hasOwn(ctx.state.entities.locations, locId)
+          ? ctx.state.entities.locations[locId]
+          : undefined;
+      if (!loc) {
+        return false;
+      }
+      if (ast.discoveryState !== undefined) {
+        const effectiveState = loc.discoveryState ?? (loc.discovered ? 'discovered' : 'unknown');
+        if (effectiveState !== ast.discoveryState) {
+          return false;
+        }
+      }
+      if (ast.districtId !== undefined && loc.geometry?.districtId !== ast.districtId) {
+        return false;
+      }
+    }
+    return true;
   }
 
   if ('relation' in ast) {

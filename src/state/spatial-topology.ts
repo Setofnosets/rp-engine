@@ -8,6 +8,90 @@ import type { SpatialMode } from '../schema/tracker-module.js';
 export type LocationStatus = 'normal' | 'contested' | 'destroyed' | 'locked' | (string & {});
 
 /**
+ * Fog-of-war discovery state for a {@link LocationEntity}.
+ */
+export type DiscoveryState = 'unknown' | 'rumored' | 'discovered' | 'visited';
+
+/**
+ * Operational state of a connection edge between two locations.
+ */
+export type ConnectionStateKind = 'open' | 'closed' | 'locked' | 'blocked' | 'destroyed' | 'secret';
+
+/**
+ * Category of a hidden site asset within a location.
+ */
+export type HiddenAssetKind =
+  | 'trap'
+  | 'hazard'
+  | 'loot'
+  | 'barrier'
+  | 'subdungeon'
+  | 'subinterior'
+  | 'clue';
+
+/**
+ * Player knowledge tier for a {@link HiddenSiteAsset}.
+ */
+export type AssetKnowledgeTier = 'unrevealed' | 'suspected' | 'known';
+
+/**
+ * Canon status of a {@link HiddenSiteAsset}.
+ */
+export type HiddenAssetCanonStatus =
+  | 'intact'
+  | 'triggered'
+  | 'disarmed'
+  | 'taken'
+  | 'destroyed'
+  | 'cleared';
+
+/**
+ * A hidden site asset (trap, hazard, loot, secret, etc.) inside a {@link LocationEntity}.
+ */
+export interface HiddenSiteAsset {
+  id: string;
+  kind: HiddenAssetKind;
+  name: string;
+  description?: string;
+  knowledgeTier: AssetKnowledgeTier;
+  canonStatus: HiddenAssetCanonStatus;
+  canonLocked: boolean;
+  linkedLocationId?: string;
+}
+
+/**
+ * 2D spatial geometry and district/region metadata for a {@link LocationEntity}.
+ */
+export interface LocationGeometry {
+  x: number;
+  y: number;
+  districtId?: string;
+  regionId?: string;
+  polygon?: readonly [number, number][];
+  mapRef?: { layer: string; id: string };
+}
+
+/**
+ * External map asset references for a {@link LocationEntity}.
+ */
+export interface LocationMapAssets {
+  imagePath?: string;
+  geoJsonPath?: string;
+  svgPath?: string;
+  width?: number;
+  height?: number;
+}
+
+/**
+ * Metadata for an outgoing connection from a {@link LocationEntity}.
+ */
+export interface ConnectionMeta {
+  state: ConnectionStateKind;
+  travelModes?: string[];
+  keyItemId?: string;
+}
+
+/**
  * Spatial node in the WorldState location graph (used by Tier 1 emergent and Tier 2 authored modes).
  */
 export interface LocationEntity {
@@ -20,6 +104,11 @@ export interface LocationEntity {
   discovered: boolean;
   tags: string[];
   notes: string;
+  discoveryState?: DiscoveryState;
+  geometry?: LocationGeometry;
+  mapAssets?: LocationMapAssets;
+  connectionsMeta?: Record<string, ConnectionMeta>;
+  hiddenAssets?: Record<string, HiddenSiteAsset>;
 }
 
 /**
@@ -61,8 +150,8 @@ function setRecordEntry<T>(record: Record<string, T>, key: string, value: T): vo
   });
 }
 
-function cloneLocationEntity(location: LocationEntity): LocationEntity {
-  return {
+export function cloneLocationEntity(location: LocationEntity): LocationEntity {
+  const cloned: LocationEntity = {
     id: location.id,
     name: location.name,
     kind: location.kind,
@@ -73,6 +162,89 @@ function cloneLocationEntity(location: LocationEntity): LocationEntity {
     tags: [...location.tags],
     notes: location.notes,
   };
+  if (location.discoveryState !== undefined) {
+    cloned.discoveryState = location.discoveryState;
+  }
+  if (location.geometry !== undefined) {
+    const geom: LocationGeometry = {
+      x: location.geometry.x === 0 ? 0 : location.geometry.x,
+      y: location.geometry.y === 0 ? 0 : location.geometry.y,
+    };
+    if (location.geometry.districtId !== undefined) {
+      geom.districtId = location.geometry.districtId;
+    }
+    if (location.geometry.regionId !== undefined) {
+      geom.regionId = location.geometry.regionId;
+    }
+    if (location.geometry.polygon !== undefined) {
+      geom.polygon = location.geometry.polygon.map(([px, py]) => [
+        px === 0 ? 0 : px,
+        py === 0 ? 0 : py,
+      ]);
+    }
+    if (location.geometry.mapRef !== undefined) {
+      geom.mapRef = {
+        layer: location.geometry.mapRef.layer,
+        id: location.geometry.mapRef.id,
+      };
+    }
+    cloned.geometry = geom;
+  }
+  if (location.mapAssets !== undefined) {
+    const assets: LocationMapAssets = {};
+    if (location.mapAssets.imagePath !== undefined) {
+      assets.imagePath = location.mapAssets.imagePath;
+    }
+    if (location.mapAssets.geoJsonPath !== undefined) {
+      assets.geoJsonPath = location.mapAssets.geoJsonPath;
+    }
+    if (location.mapAssets.svgPath !== undefined) {
+      assets.svgPath = location.mapAssets.svgPath;
+    }
+    if (location.mapAssets.width !== undefined) {
+      assets.width = location.mapAssets.width === 0 ? 0 : location.mapAssets.width;
+    }
+    if (location.mapAssets.height !== undefined) {
+      assets.height = location.mapAssets.height === 0 ? 0 : location.mapAssets.height;
+    }
+    cloned.mapAssets = assets;
+  }
+  if (location.connectionsMeta !== undefined) {
+    const meta: Record<string, ConnectionMeta> = {};
+    for (const [targetId, conn] of Object.entries(location.connectionsMeta)) {
+      const entry: ConnectionMeta = { state: conn.state };
+      if (conn.travelModes !== undefined) {
+        entry.travelModes = [...conn.travelModes];
+      }
+      if (conn.keyItemId !== undefined) {
+        entry.keyItemId = conn.keyItemId;
+      }
+      setRecordEntry(meta, targetId, entry);
+    }
+    cloned.connectionsMeta = meta;
+  }
+  if (location.hiddenAssets !== undefined) {
+    const hidden: Record<string, HiddenSiteAsset> = {};
+    for (const [assetId, asset] of Object.entries(location.hiddenAssets)) {
+      const entry: HiddenSiteAsset = {
+        id: asset.id,
+        kind: asset.kind,
+        name: asset.name,
+        knowledgeTier: asset.knowledgeTier,
+        canonStatus: asset.canonStatus,
+        canonLocked: asset.canonLocked,
+      };
+      if (asset.description !== undefined) {
+        entry.description = asset.description;
+      }
+      if (asset.linkedLocationId !== undefined) {
+        entry.linkedLocationId = asset.linkedLocationId;
+      }
+      setRecordEntry(hidden, assetId, entry);
+    }
+    cloned.hiddenAssets = hidden;
+  }
+  return cloned;
 }
 
 function cloneLocationsRecord(
@@ -299,18 +471,35 @@ export function validateTravelTarget(
           ]);
         }
         const origin = locations[fromLocationId];
-        if (
-          origin &&
-          target.id !== fromLocationId &&
-          !origin.connectedLocations.includes(target.id)
-        ) {
-          return err([
-            validationError(
-              'target',
-              'UNREACHABLE_LOCATION',
-              `Location "${target.id}" is not connected to "${fromLocationId}"`
-            ),
-          ]);
+        if (origin && target.id !== fromLocationId) {
+          if (!origin.connectedLocations.includes(target.id)) {
+            return err([
+              validationError(
+                'target',
+                'UNREACHABLE_LOCATION',
+                `Location "${target.id}" is not connected to "${fromLocationId}"`
+              ),
+            ]);
+          }
+          const connMeta =
+            origin.connectionsMeta && Object.hasOwn(origin.connectionsMeta, target.id)
+              ? origin.connectionsMeta[target.id]
+              : undefined;
+          if (
+            connMeta &&
+            (connMeta.state === 'locked' ||
+              connMeta.state === 'blocked' ||
+              connMeta.state === 'destroyed' ||
+              connMeta.state === 'secret')
+          ) {
+            return err([
+              validationError(
+                'target',
+                'CONNECTION_BLOCKED',
+                `Connection from "${fromLocationId}" to "${target.id}" is ${connMeta.state}`
+              ),
+            ]);
+          }
         }
       }
 
@@ -383,4 +572,48 @@ export function matchesLocationPredicate(
   }
 
   return location.tags.some((tag) => tag.trim().toLowerCase() === targetLower);
+}
+
+/**
+ * Deep-clone locations for player-facing projection, stripping `'unrevealed'` `hiddenAssets`
+ * and `'secret'` entries from `connectedLocations` and `connectionsMeta`.
+ */
+export function projectPlayerVisibleLocations(
+  locations: Record<string, LocationEntity>
+): Record<string, LocationEntity> {
+  const projected: Record<string, LocationEntity> = {};
+  for (const [id, location] of Object.entries(locations)) {
+    const cloned = cloneLocationEntity(location);
+
+    if (cloned.connectionsMeta !== undefined) {
+      const secretTargets = new Set<string>();
+      const visibleMeta: Record<string, ConnectionMeta> = {};
+      for (const [targetId, meta] of Object.entries(cloned.connectionsMeta)) {
+        if (meta.state === 'secret') {
+          secretTargets.add(targetId);
+        } else {
+          setRecordEntry(visibleMeta, targetId, meta);
+        }
+      }
+      if (secretTargets.size > 0) {
+        cloned.connectedLocations = cloned.connectedLocations.filter(
+          (targetId) => !secretTargets.has(targetId)
+        );
+      }
+      cloned.connectionsMeta = visibleMeta;
+    }
+
+    if (cloned.hiddenAssets !== undefined) {
+      const visibleAssets: Record<string, HiddenSiteAsset> = {};
+      for (const [assetId, asset] of Object.entries(cloned.hiddenAssets)) {
+        if (asset.knowledgeTier !== 'unrevealed') {
+          setRecordEntry(visibleAssets, assetId, asset);
+        }
+      }
+      cloned.hiddenAssets = visibleAssets;
+    }
+
+    setRecordEntry(projected, id, cloned);
+  }
+  return projected;
 }
