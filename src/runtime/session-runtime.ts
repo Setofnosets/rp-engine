@@ -1,4 +1,5 @@
 import { parsePlayerIntent, type ParsedPlayerIntent } from '../agents/intent-parser.js';
+import { runAuditorPass } from '../agents/auditor-agent.js';
 import { proposeNpcCombatActions } from '../agents/combat-agent.js';
 import { runCastDirector } from '../agents/cast-director-agent.js';
 import { runChronicleRouter } from '../agents/chronicle-router-agent.js';
@@ -81,7 +82,13 @@ import {
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
 import type { AuditEntry } from '../state/audit-log.js';
-import { type FormDefinition, type FormIndex, buildFormIndex } from '../state/forms.js';
+import {
+  type FormDefinition,
+  type FormIndex,
+  type FormTransitionRule,
+  buildFormIndex,
+  buildFormRuleDependencyIndex,
+} from '../state/forms.js';
 import type { PatchBatch, PatchOperation } from '../state/patch.js';
 import {
   appendAuditRecords,
@@ -114,6 +121,17 @@ import {
 } from '../state/world-state.js';
 import { type AgendaConfig, DEFAULT_AGENDA_CONFIG, runAgendaTick } from '../world/agendas.js';
 import { computeLocationCast } from '../world/cast-presence.js';
+import {
+  type DigestFlowConfig,
+  type DowntimeActivity,
+  type DowntimeExecutionResult,
+  type DowntimeOptions,
+  type TravelExecutionResult,
+  type TravelOptions,
+  evaluateDigestFlow,
+  executeDowntime,
+  executeTravel,
+} from '../world/flow-hooks.js';
 import { type DirectorSteeringInput, applyDirectorSteering } from './director-steering.js';
 import { SessionEventBus } from './event-bus.js';
 
@@ -126,10 +144,14 @@ export interface SessionRuntimeOptions {
   readonly seed?: string | number;
   readonly saveDir?: string | null;
   readonly skillRegistry?: SkillRegistry;
+  readonly formRules?: readonly FormTransitionRule[];
+  readonly digestConfig?: DigestFlowConfig | false;
+  readonly auditorLlmCadenceTurns?: number;
   readonly useBoundaryLlmAgents?: {
     readonly intentParser?: boolean;
     readonly castDirector?: boolean;
     readonly storylinePlanner?: boolean;
+    readonly auditor?: boolean;
   };
 }
 
@@ -160,6 +182,7 @@ export interface TurnExecutionResult {
 
 export interface StartCombatOptions {
   readonly mode?: 'tactical_grid' | 'traditional';
+  readonly turnStyle?: 'initiative' | 'phased';
   readonly theme?: TerrainTheme;
   readonly gridSize?: { readonly width: number; readonly height: number };
   readonly xpAwardOnVictory?: number;
@@ -292,6 +315,7 @@ function cloneCombatStateSnapshot(state: CombatState): CombatState {
   return {
     active: state.active,
     mode: state.mode,
+    ...(state.turnStyle !== undefined ? { turnStyle: state.turnStyle } : {}),
     round: state.round,
     turnIndex: state.turnIndex,
     initiativeOrder: [...state.initiativeOrder],
@@ -533,7 +557,10 @@ export class SessionRuntime {
     readonly intentParser: boolean;
     readonly castDirector: boolean;
     readonly storylinePlanner: boolean;
+    readonly auditor: boolean;
   };
+  private readonly digestConfig: DigestFlowConfig | false;
+  private readonly auditorLlmCadenceTurns: number;
 
   private basePack: SystemPack;
   private userLayer: ControlRoomLayer;
@@ -547,6 +574,8 @@ export class SessionRuntime {
   private readonly agendaConfig: AgendaConfig;
   private readonly formDefinitions: readonly FormDefinition[];
   private readonly formIndex: FormIndex | undefined;
+  private readonly formRules: readonly FormTransitionRule[];
+  private readonly formRuleDependencyIndex: DependencyIndex | undefined;
 
   private state: WorldState;
   private beatLedger: BeatLedgerState;
@@ -582,7 +611,15 @@ export class SessionRuntime {
       intentParser: options.useBoundaryLlmAgents?.intentParser === true,
       castDirector: options.useBoundaryLlmAgents?.castDirector === true,
       storylinePlanner: options.useBoundaryLlmAgents?.storylinePlanner === true,
+      auditor: options.useBoundaryLlmAgents?.auditor === true,
     };
+    this.digestConfig = options.digestConfig ?? {};
+    this.auditorLlmCadenceTurns =
+      options.auditorLlmCadenceTurns !== undefined &&
+      Number.isInteger(options.auditorLlmCadenceTurns) &&
+      options.auditorLlmCadenceTurns >= 1
+        ? options.auditorLlmCadenceTurns
+        : 5;
 
     if (this.cartridge !== null) {
       const packRes = resolveEffectivePackForCartridge(this.cartridge, options.systemPack);
@@ -650,6 +687,9 @@ export class SessionRuntime {
     this.formDefinitions = this.cartridge?.initialEntities?.forms ?? [];
     this.formIndex =
       this.formDefinitions.length > 0 ? buildFormIndex(this.formDefinitions) : undefined;
+    this.formRules = options.formRules ? [...options.formRules] : [];
+    this.formRuleDependencyIndex =
+      this.formRules.length > 0 ? buildFormRuleDependencyIndex(this.formRules) : undefined;
 
     const initialWorld = createWorldState(buildInitialWorldStateOptions(options, this.config));
     if (this.cartridge?.initialState?.scene?.presentCharacterIds === undefined) {
@@ -746,6 +786,10 @@ export class SessionRuntime {
       throw caught;
     }
 
+    if (mode === 'traditional' && options.turnStyle !== undefined) {
+      startRes.combatState.turnStyle = options.turnStyle;
+    }
+
     const batchRes = applyPatchBatch(
       this.state,
       {
@@ -773,6 +817,143 @@ export class SessionRuntime {
 
     return ok({
       combatState: cloneCombatStateSnapshot(this.combatState),
+      state: cloneWorldState(this.state),
+      auditEntries: batchRes.value.auditEntries,
+    });
+  }
+
+  /**
+   * Execute a deterministic living-world travel transition to `targetLocationId`.
+   */
+  travel(
+    targetLocationId: string,
+    options: TravelOptions = {}
+  ): Result<
+    TravelExecutionResult & { readonly state: WorldState; readonly auditEntries: AuditEntry[] },
+    ValidationError[]
+  > {
+    if (this.combatState?.active) {
+      return err([
+        validationError('combatState', 'COMBAT_ACTIVE', 'Cannot travel while combat is active'),
+      ]);
+    }
+
+    const travelRes = executeTravel(this.state, targetLocationId, options);
+    if (!travelRes.ok) {
+      return err(travelRes.error);
+    }
+
+    const batchRes = applyPatchBatch(
+      this.state,
+      {
+        eventId: `travel:t${this.state.meta.turn}:s${this.auditSeq}`,
+        source: 'engine',
+        operations: travelRes.value.patches,
+        reason: `Travel to ${travelRes.value.arrivalSummary.targetLocationName}`,
+      },
+      {
+        compiledSchema: this.fullCompiledSchema,
+        formIndex: this.formIndex,
+        formRules: this.formRules,
+        auditSeqStart: this.auditSeq,
+      }
+    );
+    if (!batchRes.ok) {
+      return err(batchRes.error);
+    }
+
+    let nextState = batchRes.value.nextState;
+    nextState.meta.rngState = cloneRngState(travelRes.value.nextRng);
+    const totalAuditEntries = [...batchRes.value.auditEntries];
+    let nextAuditSeq = this.auditSeq + batchRes.value.auditEntries.length;
+
+    const cast = computeLocationCast(nextState, this.formDefinitions);
+    if (!arraysEqual(cast.presentCharacterIds, nextState.scene.presentCharacterIds)) {
+      const castBatchRes = applyPatchBatch(
+        nextState,
+        {
+          eventId: `travel:t${this.state.meta.turn}:cast_sync:s${nextAuditSeq}`,
+          source: 'engine',
+          operations: [
+            {
+              op: 'set',
+              path: 'scene.presentCharacterIds',
+              value: cast.presentCharacterIds,
+            },
+          ],
+          reason: 'Sync scene.presentCharacterIds after travel',
+        },
+        {
+          compiledSchema: this.fullCompiledSchema,
+          formIndex: this.formIndex,
+          auditSeqStart: nextAuditSeq,
+        }
+      );
+      if (castBatchRes.ok) {
+        nextState = castBatchRes.value.nextState;
+        totalAuditEntries.push(...castBatchRes.value.auditEntries);
+        nextAuditSeq += castBatchRes.value.auditEntries.length;
+      }
+    }
+
+    this.state = nextState;
+    this.auditSeq = nextAuditSeq;
+    this.auditLog.push(...totalAuditEntries);
+
+    return ok({
+      ...travelRes.value,
+      state: cloneWorldState(this.state),
+      auditEntries: totalAuditEntries,
+    });
+  }
+
+  /**
+   * Execute a deterministic safehouse/hub downtime activity (`recover`, `train`, `research`,
+   * `patrol`, or `socialize`).
+   */
+  downtime(
+    activity: DowntimeActivity,
+    options: DowntimeOptions = {}
+  ): Result<
+    DowntimeExecutionResult & { readonly state: WorldState; readonly auditEntries: AuditEntry[] },
+    ValidationError[]
+  > {
+    if (this.combatState?.active) {
+      return err([
+        validationError('combatState', 'COMBAT_ACTIVE', 'Cannot perform downtime while combat is active'),
+      ]);
+    }
+
+    const downtimeRes = executeDowntime(this.state, activity, options);
+    if (!downtimeRes.ok) {
+      return err(downtimeRes.error);
+    }
+
+    const batchRes = applyPatchBatch(
+      this.state,
+      {
+        eventId: `downtime:${activity}:t${this.state.meta.turn}:s${this.auditSeq}`,
+        source: 'engine',
+        operations: downtimeRes.value.patches,
+        reason: `Downtime activity: ${activity}`,
+      },
+      {
+        compiledSchema: this.fullCompiledSchema,
+        formIndex: this.formIndex,
+        formRules: this.formRules,
+        auditSeqStart: this.auditSeq,
+      }
+    );
+    if (!batchRes.ok) {
+      return err(batchRes.error);
+    }
+
+    this.state = batchRes.value.nextState;
+    this.auditSeq += batchRes.value.auditEntries.length;
+    this.auditLog.push(...batchRes.value.auditEntries);
+
+    return ok({
+      ...downtimeRes.value,
       state: cloneWorldState(this.state),
       auditEntries: batchRes.value.auditEntries,
     });
@@ -968,11 +1149,21 @@ export class SessionRuntime {
               dependencyIndex: this.dependencyIndex,
               changedPaths: changedPathsForEval,
             }),
+        ...(this.formRules.length > 0 && this.formIndex !== undefined
+          ? {
+              formRules: this.formRules,
+              formIndex: this.formIndex,
+              ...(useFullEval || this.formRuleDependencyIndex === undefined
+                ? {}
+                : { formRuleDependencyIndex: this.formRuleDependencyIndex }),
+            }
+          : {}),
         recentTranscriptLines,
         beatPressure: this.config.tuningDials.beatPressure,
         reducerOptions: {
           compiledSchema: this.fullCompiledSchema,
           formIndex: this.formIndex,
+          ...(this.formRules.length > 0 ? { formRules: this.formRules } : {}),
           auditSeqStart: workingAuditSeq,
         },
       });
@@ -1236,6 +1427,29 @@ export class SessionRuntime {
       });
     }
 
+    if (this.digestConfig !== false && workingState.capabilities.clocks !== 'disabled') {
+      const digestRes = evaluateDigestFlow(workingState, this.digestConfig);
+      if (digestRes.published && digestRes.edition !== null && digestRes.patches.length > 0) {
+        const digestCommit = commitWorkingBatch({
+          eventId: `turn:${workingState.meta.turn}:digest:${digestRes.edition.id}`,
+          source: 'engine',
+          operations: digestRes.patches,
+          reason: `Newsroom digest published for Day ${digestRes.edition.day}`,
+        });
+        if (!digestCommit.ok) {
+          return digestCommit;
+        }
+        this.eventBus.emit({
+          type: 'digest_published',
+          turn: workingState.meta.turn,
+          editionId: digestRes.edition.id,
+          day: digestRes.edition.day,
+          masthead: digestRes.edition.masthead,
+          headlineCount: digestRes.edition.headlines.length,
+        });
+      }
+    }
+
     const castAfterClock = computeLocationCast(workingState, this.formDefinitions);
     if (!arraysEqual(castAfterClock.presentCharacterIds, workingState.scene.presentCharacterIds)) {
       const castSyncRes = commitWorkingBatch({
@@ -1313,7 +1527,11 @@ export class SessionRuntime {
     const compiledPrompt = narrationPhaseRes.value.compiledPrompt;
     const trackerSkippedByCadence = narrationPhaseRes.value.trackerSkippedByCadence;
 
-    if (narrationPhaseRes.value.postTurnChangedPaths.size > 0 && workingState.capabilities.beats) {
+    if (
+      narrationPhaseRes.value.postTurnChangedPaths.size > 0 &&
+      (workingState.capabilities.beats ||
+        (this.formRules.length > 0 && this.formIndex !== undefined))
+    ) {
       const postTranscriptLines = [...recentTranscriptLines, narratorText];
       await evaluateNarrativeGraph(postTranscriptLines, narrationPhaseRes.value.postTurnChangedPaths);
     }
@@ -2582,6 +2800,29 @@ export class SessionRuntime {
       chronicleRes.proposedBatch.operations.length > 0
     ) {
       applyAgentBatch(chronicleRes.proposedBatch, this.fullCompiledSchema);
+    }
+
+    const auditorRes = await runAuditorPass({
+      state: workingState,
+      formIndex: this.formIndex,
+      gateway: this.gateway,
+      useLlmPass: this.useBoundaryLlmAgents.auditor,
+      llmCadenceTurns: this.auditorLlmCadenceTurns,
+      recentExchangeText,
+      signal: params.signal,
+    });
+    params.turnWarnings.push(...auditorRes.warnings);
+    if (auditorRes.proposedBatch !== null && auditorRes.proposedBatch.operations.length > 0) {
+      applyAgentBatch(auditorRes.proposedBatch, this.fullCompiledSchema);
+    }
+    if (auditorRes.findings.length > 0 || !auditorRes.skippedLlmByCadence) {
+      this.eventBus.emit({
+        type: 'auditor_completed',
+        turn: workingState.meta.turn,
+        findingsCount: auditorRes.findings.length,
+        autoCorrectedCount: auditorRes.correctivePatches.length,
+        skippedLlmByCadence: auditorRes.skippedLlmByCadence,
+      });
     }
 
     return ok({

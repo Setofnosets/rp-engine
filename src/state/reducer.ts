@@ -1361,6 +1361,22 @@ function resolveWorldStateTarget(
     return err([validationError(path, 'INVALID_PATH', `Invalid player path "${path}"`)]);
   }
 
+  if (root === 'chronicle' && segs.length === 2 && segs[1] === 'digestEditions') {
+    return ok({
+      canonicalPath: path,
+      allowPushCreate: true,
+      read: () => state.chronicle.digestEditions,
+      validateValue: (v) =>
+        Array.isArray(v)
+          ? ok(v)
+          : err([validationError(path, 'INVALID_TYPE', `${path} must be DigestEdition[]`)]),
+      write: (v) => {
+        state.chronicle.digestEditions = v as WorldState['chronicle']['digestEditions'];
+        return ok(undefined);
+      },
+    });
+  }
+
   if (root === 'turnEvents' && segs.length === 2) {
     const field = segs[1] as string;
     if (field !== 'combatOutcomes' && field !== 'rumors' && field !== 'systemNotices') {

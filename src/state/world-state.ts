@@ -160,6 +160,18 @@ export interface ChronicleEntry {
   keywords: string[];
 }
 
+/**
+ * Published in-world newsroom digest edition synthesized from chronicle events and agendas.
+ */
+export interface DigestEdition {
+  id: string;
+  day: number;
+  inGameDate: string | null;
+  masthead: string;
+  headlines: string[];
+  locationIds: string[];
+}
+
 export interface RelationEntry {
   affinity: number;
   maxAffinity: number;
@@ -228,6 +240,7 @@ export interface WorldState {
   };
   chronicle: {
     events: ChronicleEntry[];
+    digestEditions?: DigestEdition[];
   };
   turnEvents: {
     combatOutcomes: string[];
@@ -258,6 +271,7 @@ export interface CreateWorldStateOptions {
   locations?: Record<string, LocationEntity> | readonly LocationEntity[];
   entities?: Partial<WorldState['entities']>;
   chronicleEvents?: readonly ChronicleEntry[];
+  digestEditions?: readonly DigestEdition[];
   turnEvents?: Partial<WorldState['turnEvents']>;
 }
 
@@ -481,6 +495,17 @@ function cloneChronicleEntry(entry: ChronicleEntry): ChronicleEntry {
   };
 }
 
+function cloneDigestEdition(edition: DigestEdition): DigestEdition {
+  return {
+    id: edition.id,
+    day: edition.day,
+    inGameDate: edition.inGameDate,
+    masthead: edition.masthead,
+    headlines: [...edition.headlines],
+    locationIds: [...edition.locationIds],
+  };
+}
+
 function cloneRelations(
   relations: Record<string, Record<string, RelationEntry>>
 ): Record<string, Record<string, RelationEntry>> {
@@ -606,6 +631,9 @@ export function cloneWorldState(state: WorldState): WorldState {
     },
     chronicle: {
       events: state.chronicle.events.map(cloneChronicleEntry),
+      ...(state.chronicle.digestEditions !== undefined
+        ? { digestEditions: state.chronicle.digestEditions.map(cloneDigestEdition) }
+        : {}),
     },
     turnEvents: {
       combatOutcomes: [...state.turnEvents.combatOutcomes],
@@ -766,6 +794,9 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
     },
     chronicle: {
       events: options.chronicleEvents ? options.chronicleEvents.map(cloneChronicleEntry) : [],
+      ...(options.digestEditions !== undefined
+        ? { digestEditions: options.digestEditions.map(cloneDigestEdition) }
+        : {}),
     },
     turnEvents: {
       combatOutcomes: options.turnEvents?.combatOutcomes
@@ -2091,15 +2122,17 @@ export function validateWorldState(
 
   // chronicle
   const chronicleEvents: ChronicleEntry[] = [];
+  let digestEditions: DigestEdition[] | undefined;
   if (state.chronicle === undefined) {
     warnMissing(warnings, 'chronicle', 'chronicle');
   } else if (!isPlainObject(state.chronicle)) {
     errors.add('chronicle', 'INVALID_TYPE', 'chronicle must be an object');
-  } else if (state.chronicle.events === undefined) {
-    warnMissing(warnings, 'chronicle.events', 'chronicle.events');
-  } else if (!Array.isArray(state.chronicle.events)) {
-    errors.add('chronicle.events', 'INVALID_TYPE', 'chronicle.events must be an array');
   } else {
+    if (state.chronicle.events === undefined) {
+      warnMissing(warnings, 'chronicle.events', 'chronicle.events');
+    } else if (!Array.isArray(state.chronicle.events)) {
+      errors.add('chronicle.events', 'INVALID_TYPE', 'chronicle.events must be an array');
+    } else {
     for (let i = 0; i < state.chronicle.events.length; i += 1) {
       const rawEntry = state.chronicle.events[i];
       const entryPath = `chronicle.events[${i}]`;
@@ -2179,6 +2212,72 @@ export function validateWorldState(
         involvedEntityIds,
         keywords,
       });
+    }
+    }
+    if (state.chronicle.digestEditions !== undefined) {
+      if (!Array.isArray(state.chronicle.digestEditions)) {
+        errors.add(
+          'chronicle.digestEditions',
+          'INVALID_TYPE',
+          'chronicle.digestEditions must be an array'
+        );
+      } else {
+        digestEditions = [];
+        for (let i = 0; i < state.chronicle.digestEditions.length; i += 1) {
+          const rawEdition = state.chronicle.digestEditions[i];
+          const editionPath = `chronicle.digestEditions[${i}]`;
+          if (!isPlainObject(rawEdition)) {
+            errors.add(editionPath, 'INVALID_TYPE', 'DigestEdition must be an object');
+            continue;
+          }
+          let id = '';
+          if (typeof rawEdition.id !== 'string' || rawEdition.id.trim().length === 0) {
+            errors.add(`${editionPath}.id`, 'REQUIRED', 'DigestEdition id must be a non-empty string');
+          } else {
+            id = rawEdition.id;
+          }
+          if (
+            typeof rawEdition.day !== 'number' ||
+            !Number.isInteger(rawEdition.day) ||
+            rawEdition.day < 0
+          ) {
+            errors.add(`${editionPath}.day`, 'INVALID_INTEGER', 'day must be an integer >= 0');
+          }
+          const inGameDate = validateNullableString(
+            rawEdition.inGameDate,
+            `${editionPath}.inGameDate`,
+            errors,
+            warnings
+          );
+          const masthead = validateStringWithDefault(
+            rawEdition.masthead,
+            '',
+            `${editionPath}.masthead`,
+            errors,
+            warnings
+          );
+          const headlines = validateStringArrayField(
+            rawEdition.headlines,
+            `${editionPath}.headlines`,
+            errors,
+            warnings
+          );
+          const locationIds = validateStringArrayField(
+            rawEdition.locationIds,
+            `${editionPath}.locationIds`,
+            errors,
+            warnings
+          );
+          digestEditions.push({
+            id,
+            day: typeof rawEdition.day === 'number' ? rawEdition.day : 1,
+            inGameDate,
+            masthead,
+            headlines,
+            locationIds,
+          });
+        }
+      }
     }
   }
 
@@ -2314,6 +2413,7 @@ export function validateWorldState(
     },
     chronicle: {
       events: chronicleEvents,
+      ...(digestEditions !== undefined ? { digestEditions } : {}),
     },
     turnEvents,
   };
