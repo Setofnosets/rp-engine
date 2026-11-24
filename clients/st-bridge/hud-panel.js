@@ -148,9 +148,17 @@ function renderSceneCastWidget(state) {
           .join('')
       : '<span class="referee-bridge-tag">Solo / None listed</span>';
 
+  const locations = state?.entities?.locations ?? {};
+  const currentLoc =
+    typeof scene.locationId === 'string' ? getSafeOwn(locations, scene.locationId) : undefined;
+  const discoveryBadge =
+    currentLoc && typeof currentLoc === 'object' && typeof currentLoc.discoveryState === 'string'
+      ? ` <span class="referee-bridge-badge">${escapeHtml(currentLoc.discoveryState)}</span>`
+      : '';
+
   return `<section class="referee-bridge-widget" data-widget="scene-cast">
     <div class="referee-bridge-widget-title">Scene &amp; Cast</div>
-    <div>Location: <strong>${escapeHtml(scene.location || 'Unknown')}</strong></div>
+    <div>Location: <strong>${escapeHtml(scene.location || 'Unknown')}</strong>${discoveryBadge}</div>
     <div>Mood: <strong>${escapeHtml(scene.mood || 'neutral')}</strong></div>
     <div class="referee-bridge-tags" style="margin-top:4px">${castChips}</div>
   </section>`;
@@ -289,9 +297,58 @@ function renderCombatWidget(combatState, combatMode) {
   }
   const round = combatState.round ?? 1;
   const activeId = combatState.activeCombatantId ?? 'none';
+  const turnStyle = typeof combatState.turnStyle === 'string' ? ` · ${escapeHtml(combatState.turnStyle)}` : '';
+
+  const combatantRows = safeEntries(combatState.combatants)
+    .map(([, c]) => {
+      if (!c || typeof c !== 'object') return '';
+      const name = escapeHtml(c.name ?? c.id ?? 'Unit');
+      const rowBadge =
+        combatState.mode === 'traditional' || typeof c.formationRow === 'string'
+          ? ` <span class="referee-bridge-badge">${escapeHtml(
+              String(c.formationRow ?? 'front').toUpperCase()
+            )}</span>`
+          : '';
+      const summonBadge =
+        c.isSummon === true ? ' <span class="referee-bridge-badge">SUMMON</span>' : '';
+      const transformBadge =
+        c.activeTransform && typeof c.activeTransform === 'object' && typeof c.activeTransform.loadoutId === 'string'
+          ? ` <span class="referee-bridge-badge">FORM:${escapeHtml(c.activeTransform.loadoutId)}</span>`
+          : '';
+      const hpText = `${escapeHtml(c.hp ?? 0)}/${escapeHtml(c.maxHp ?? 0)} HP`;
+      const wpText =
+        typeof c.willpower === 'number' && typeof c.maxWillpower === 'number'
+          ? ` · WP ${escapeHtml(c.willpower)}/${escapeHtml(c.maxWillpower)}`
+          : '';
+      return `<div class="referee-bridge-combatant">${name}${rowBadge}${summonBadge}${transformBadge} (${hpText}${wpText})</div>`;
+    })
+    .filter(Boolean)
+    .join('');
+
+  const hazardList = [];
+  const tiles = combatState.grid?.tiles;
+  if (Array.isArray(tiles)) {
+    for (let y = 0; y < tiles.length; y += 1) {
+      const row = tiles[y];
+      if (!Array.isArray(row)) continue;
+      for (let x = 0; x < row.length; x += 1) {
+        const tile = row[x];
+        if (tile && typeof tile === 'object' && typeof tile.hazard === 'string' && tile.hazard !== 'none') {
+          hazardList.push(`(${x},${y})=${escapeHtml(tile.hazard)}`);
+        }
+      }
+    }
+  }
+  const hazardHtml =
+    hazardList.length > 0
+      ? `<div class="referee-bridge-hazards">Hazards: ${hazardList.join(', ')}</div>`
+      : '';
+
   return `<section class="referee-bridge-widget" data-widget="combat-panel">
-    <div class="referee-bridge-widget-title">Combat (${escapeHtml(combatMode)})</div>
+    <div class="referee-bridge-widget-title">Combat (${escapeHtml(combatMode)}${turnStyle})</div>
     <div>Round <strong>${escapeHtml(round)}</strong> · Active: <strong>${escapeHtml(activeId)}</strong></div>
+    ${combatantRows}
+    ${hazardHtml}
   </section>`;
 }
 
@@ -391,6 +448,24 @@ function renderPendingConfirmationsToast(pendingConfirmations) {
  * @param {any} sessionState
  * @returns {string}
  */
+function renderNewsroomWidget(state) {
+  const editions = state?.chronicle?.digestEditions;
+  if (!Array.isArray(editions) || editions.length === 0) {
+    return '';
+  }
+  const latest = editions[editions.length - 1];
+  if (!latest || typeof latest !== 'object') {
+    return '';
+  }
+  const headlines = Array.isArray(latest.headlines)
+    ? latest.headlines.slice(0, 3).map((h) => `<li>${escapeHtml(h)}</li>`).join('')
+    : '';
+  return `<section class="referee-bridge-widget" data-widget="newsroom">
+    <div class="referee-bridge-widget-title">${escapeHtml(latest.masthead ?? 'Newsroom')} (Day ${escapeHtml(latest.day ?? 0)})</div>
+    ${headlines ? `<ul>${headlines}</ul>` : ''}
+  </section>`;
+}
+
 export function renderHudStateHtml(sessionState) {
   if (!sessionState || typeof sessionState !== 'object') {
     return '<div class="referee-bridge-root" data-referee-hud="empty"><em>No active Referee session</em></div>';
@@ -433,6 +508,9 @@ export function renderHudStateHtml(sessionState) {
 
   const factionHtml = renderFactionsThreatsWidget(state, factionsEnabled);
   if (factionHtml) widgets.push(factionHtml);
+
+  const newsHtml = renderNewsroomWidget(state);
+  if (newsHtml) widgets.push(newsHtml);
 
   const toastHtml = renderPendingConfirmationsToast(sessionState.pendingConfirmations);
 

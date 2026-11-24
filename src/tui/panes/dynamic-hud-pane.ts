@@ -119,10 +119,26 @@ export function renderDynamicHudPane(params: RenderDynamicHudPaneParams): string
   const lines: string[] = [];
 
   const locationLabel = state.scene.location.trim().length > 0 ? state.scene.location : 'Scene';
+  const currentLoc =
+    state.scene.locationId !== null && state.scene.locationId !== undefined
+      ? getSafeOwn(state.entities.locations, state.scene.locationId)
+      : undefined;
+  const discoveryTag =
+    currentLoc?.discoveryState !== undefined ? ` [${currentLoc.discoveryState}]` : '';
   const moodLabel = state.scene.mood.trim().length > 0 ? state.scene.mood : 'neutral';
   lines.push(
-    truncateLine(`Loc: ${locationLabel} | Mood: ${moodLabel} | Turn: ${state.meta.turn}`, width)
+    truncateLine(
+      `Loc: ${locationLabel}${discoveryTag} | Mood: ${moodLabel} | Turn: ${state.meta.turn}`,
+      width
+    )
   );
+
+  if (
+    typeof state.player.canonCharacterId === 'string' &&
+    state.player.canonCharacterId.trim().length > 0
+  ) {
+    lines.push(truncateLine(`POV: ${state.player.canonCharacterId}`, width));
+  }
 
   if (caps.clocks !== 'disabled') {
     const clockStr = formatClockDisplay(state.clocks, {
@@ -176,6 +192,17 @@ export function renderDynamicHudPane(params: RenderDynamicHudPaneParams): string
 
   if (caps.beats && beatLedger.liveGateId !== null) {
     lines.push(truncateLine(`LIVE Gate: ${beatLedger.liveGateId}`, width));
+  }
+
+  const editions = state.chronicle.digestEditions;
+  if (editions !== undefined && editions.length > 0) {
+    const latest = editions[editions.length - 1];
+    if (latest !== undefined && latest.headlines.length > 0) {
+      const summary = latest.headlines.slice(0, 2).join(' | ');
+      lines.push(
+        truncateLine(`News (${latest.masthead} D${latest.day}): ${summary}`, width)
+      );
+    }
   }
 
   if (caps.factions) {

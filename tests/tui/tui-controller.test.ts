@@ -679,4 +679,148 @@ describe('PR-6.3: Native CLI/TUI Client & Panes', () => {
     expect(stdout.join('\n')).toContain('Referee Engine CLI');
     expect(stderr).toHaveLength(0);
   });
+
+  it('8. PR-10.2: Traditional Theater combat, hazards, discoveryState, newsroom, POV badge, and new slash commands', async () => {
+    const baseState = createWorldState({
+      sessionId: 'tui-pr10-2',
+      player: {
+        name: 'Lyra',
+      },
+      scene: {
+        location: 'Sunken Shrine',
+        locationId: 'loc_shrine',
+        mood: 'tense',
+      },
+      digestEditions: [
+        {
+          id: 'ed-1',
+          day: 3,
+          inGameDate: '2026-04-03',
+          masthead: 'Ironhold Gazette',
+          headlines: ['Shrine Gates Unsealed', 'Guilds Rally'],
+          locationIds: ['loc_shrine'],
+        },
+      ],
+    });
+    baseState.player.canonCharacterId = 'char_lyra';
+    baseState.entities.locations['loc_shrine'] = {
+      id: 'loc_shrine',
+      name: 'Sunken Shrine',
+      kind: 'shrine',
+      status: 'active',
+      controllingFactionId: null,
+      connectedLocations: [],
+      tags: [],
+      discovered: true,
+      notes: '',
+      discoveryState: 'discovered',
+    };
+
+    const runtime = new SessionRuntime({
+      sessionId: 'tui-pr10-2',
+      gateway: {
+        generate: async () => ({
+          text: '',
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        }),
+      } as never,
+    });
+    const controller = new TuiController({ runtime });
+    const hudLines = renderDynamicHudPane({
+      state: baseState,
+      config: controller['getSnapshot']().config,
+      beatLedger: { records: {}, liveGateId: null, liveNudgeIds: [], activeAmbientIds: [] },
+      pendingConfirmationsCount: 0,
+      width: 100,
+    });
+    const hudText = hudLines.join('\n');
+    expect(hudText).toContain('[discovered]');
+    expect(hudText).toContain('POV: char_lyra');
+    expect(hudText).toContain('News (Ironhold Gazette D3): Shrine Gates Unsealed | Guilds Rally');
+
+    const tradCombat = {
+      active: true,
+      mode: 'traditional' as const,
+      turnStyle: 'phased' as const,
+      round: 2,
+      turnIndex: 0,
+      initiativeOrder: ['c1', 'c2'],
+      grid: null,
+      triggerCountsThisTurn: {},
+      combatants: {
+        c1: {
+          id: 'c1',
+          name: 'Lyra',
+          team: 'ally' as const,
+          coord: { x: 0, y: 0 },
+          alive: true,
+          hp: 24,
+          maxHp: 30,
+          ac: 14,
+          speed: 30,
+          remainingMovement: 30,
+          remainingActions: { action: 1, bonus: 1, reaction: 1 },
+          resources: {},
+          cooldowns: {},
+          stats: {},
+          statuses: [],
+          abilities: [],
+          passives: [],
+          willpower: 4,
+          maxWillpower: 6,
+          formationRow: 'front' as const,
+          activeTransform: {
+            loadoutId: 'wolf_form',
+            remainingTurns: 3,
+            tempHp: 8,
+            revertOnZeroTempHp: true,
+            preTransformSnapshot: {},
+          },
+        },
+        c2: {
+          id: 'c2',
+          name: 'Fire Imp',
+          team: 'ally' as const,
+          coord: { x: 0, y: 0 },
+          alive: true,
+          hp: 10,
+          maxHp: 10,
+          ac: 12,
+          speed: 30,
+          remainingMovement: 30,
+          remainingActions: { action: 1, bonus: 1, reaction: 1 },
+          resources: {},
+          cooldowns: {},
+          stats: {},
+          statuses: [],
+          abilities: [],
+          passives: [],
+          willpower: 2,
+          maxWillpower: 2,
+          formationRow: 'back' as const,
+          isSummon: true,
+        },
+      },
+    };
+    const tradLines = renderCombatGridPane(tradCombat, 100).join('\n');
+    expect(tradLines).toContain('TurnStyle: phased');
+    expect(tradLines).toContain('[FRONT]');
+    expect(tradLines).toContain('[BACK]');
+    expect(tradLines).toContain('[SUMMON]');
+    expect(tradLines).toContain('[FORM:wolf_form +8THP]');
+    expect(tradLines).toContain('WP 4/6');
+
+    const previewRes = await controller.handleInput('/preview slash c2');
+    expect(previewRes.outputLines[0]).toContain('Preview [slash]');
+    const travelRes = await controller.handleInput('/travel loc_shrine');
+    expect(travelRes.outputLines[0]).toContain('loc_shrine');
+    const downtimeRes = await controller.handleInput('/downtime rest');
+    expect(downtimeRes.outputLines[0]).toContain('rest');
+    const newsRes = await controller.handleInput('/news');
+    expect(newsRes.outputLines[0]).toContain('No digest news editions available yet.');
+    const cloneRes = await controller.handleInput('/clone branch-a');
+    expect(cloneRes.outputLines[0]).toContain('Cloned session');
+    const takeoverRes = await controller.handleInput('/takeover char_lyra');
+    expect(takeoverRes.outputLines[0]).toContain('char_lyra');
+  });
 });

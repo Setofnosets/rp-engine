@@ -54,4 +54,15 @@ export class RefereeBridgeClient {
     query?: { turn?: number; pathPrefix?: string; source?: string }
   ): Promise<Record<string, unknown>>;
   getChronicle(sessionId: string): Promise<Record<string, unknown>>;
+  previewCombat(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  travel(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  downtime(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  cloneSession(
+    sessionId: string,
+    payload?: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
+  listSessions(): Promise<Record<string, unknown>>;
+  getContextBudget(sessionId: string): Promise<Record<string, unknown>>;
+  importCard(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  bindPlayer(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
 }

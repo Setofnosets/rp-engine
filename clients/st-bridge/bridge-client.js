@@ -291,4 +291,78 @@ export class RefereeBridgeClient {
     const id = assertValidSessionId(sessionId);
     return this._request('GET', `/api/sessions/${encodeURIComponent(id)}/chronicle`);
   }
+
+  /**
+   * POST /api/sessions/:id/combat/preview
+   * @param {string} sessionId
+   * @param {Record<string, unknown>} payload
+   */
+  async previewCombat(sessionId, payload) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('POST', `/api/sessions/${encodeURIComponent(id)}/combat/preview`, payload);
+  }
+
+  /**
+   * POST /api/sessions/:id/travel
+   * @param {string} sessionId
+   * @param {Record<string, unknown>} payload
+   */
+  async travel(sessionId, payload) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('POST', `/api/sessions/${encodeURIComponent(id)}/travel`, payload);
+  }
+
+  /**
+   * POST /api/sessions/:id/downtime
+   * @param {string} sessionId
+   * @param {Record<string, unknown>} payload
+   */
+  async downtime(sessionId, payload) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('POST', `/api/sessions/${encodeURIComponent(id)}/downtime`, payload);
+  }
+
+  /**
+   * POST /api/sessions/:id/clone
+   * @param {string} sessionId
+   * @param {Record<string, unknown>} [payload]
+   */
+  async cloneSession(sessionId, payload = {}) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('POST', `/api/sessions/${encodeURIComponent(id)}/clone`, payload);
+  }
+
+  /**
+   * GET /api/sessions
+   */
+  async listSessions() {
+    return this._request('GET', '/api/sessions');
+  }
+
+  /**
+   * GET /api/sessions/:id/context-budget
+   * @param {string} sessionId
+   */
+  async getContextBudget(sessionId) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('GET', `/api/sessions/${encodeURIComponent(id)}/context-budget`);
+  }
+
+  /**
+   * POST /api/cards/import
+   * @param {Record<string, unknown>} payload
+   */
+  async importCard(payload) {
+    return this._request('POST', '/api/cards/import', payload);
+  }
+
+  /**
+   * POST /api/sessions/:id/player/bind
+   * @param {string} sessionId
+   * @param {Record<string, unknown>} payload
+   */
+  async bindPlayer(sessionId, payload) {
+    const id = assertValidSessionId(sessionId);
+    return this._request('POST', `/api/sessions/${encodeURIComponent(id)}/player/bind`, payload);
+  }
 }
