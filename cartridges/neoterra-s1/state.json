@@ -5,8 +5,13 @@
     "storyTurn": 0,
     "day": 1,
     "inGameDate": "2037-03-01",
-    "slot": "evening",
-    "slotsPerDay": ["morning", "afternoon", "evening", "night"],
+    "slotsPerDay": [
+      "morning",
+      "afternoon",
+      "evening",
+      "night"
+    ],
+    "slot": "morning",
     "held": false,
     "holdReason": null,
     "timers": {}
@@ -14,28 +19,25 @@
   "scene": {
     "location": "Central Plaza",
     "locationId": "central-plaza",
-    "presentCharacterIds": ["vaiva_civilian"],
+    "presentCharacterIds": [
+      "s1.atropos.couple",
+      "s1.aurelia.longshot"
+    ],
     "pinnedCharacterIds": [],
-    "mood": "charged",
+    "mood": "tense",
     "pacing": "balanced",
     "directorNudge": null
   },
   "player": {
     "id": "player",
-    "name": "Vanguard",
+    "name": "Protagonist",
     "characterId": null,
     "locationId": "central-plaza",
-    "inventory": {
-      "items": {
-        "encrypted_beacon": 1
-      },
-      "currency": {
-        "credits": 250
-      }
-    },
     "customFields": {},
-    "sections": {
-      "sec_equipment": "Arc-fiber trench coat and encrypted comm-link"
+    "sections": {},
+    "inventory": {
+      "items": {},
+      "currency": {}
     }
   }
 }

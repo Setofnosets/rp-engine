@@ -294,7 +294,7 @@ function extractEmbeddedLoreEntries(bookRaw: unknown): CharacterCardLoreEntry[] 
   return out;
 }
 
-interface ParsedStCardContext {
+export interface ParsedStCardContext {
   sourceSpec: CharacterCardSourceSpec;
   cardId: string;
   name: string;
@@ -315,7 +315,7 @@ interface ParsedStCardContext {
   portraitAssetPath: string;
 }
 
-function parseStCardContext(
+export function parseStCardContext(
   input: Buffer | string | Record<string, unknown>,
   overrideId?: string
 ): Result<ParsedStCardContext, ValidationError[]> {

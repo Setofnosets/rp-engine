@@ -595,6 +595,49 @@ describe('PR-5.2 NeoTerra Season Importer', () => {
         expect(analysis.errors).toEqual([]);
         expect(analysis.ok).toBe(true);
         expect(analysis.deadlockStatesDetected).toBe(false);
+
+        if (seasonId === 's1') {
+          const vaiva = bundle.initialEntities?.characters?.['s1.vaiva.colorgarde'];
+          expect(vaiva).toBeDefined();
+          expect(vaiva?.cardSheet).toBeDefined();
+          expect(vaiva?.cardSheet?.description).toContain('Colorgarde');
+          expect(vaiva?.cardSheet?.firstMes).toContain('Colorgarde');
+          expect(vaiva?.cardSheet?.mesExample).toContain('PetraByte');
+          expect(vaiva?.cardSheet?.portraitAssetPath).toContain('Vaiva');
+          expect(vaiva?.sections['sec_body']).toBeDefined();
+          expect(vaiva?.sections['sec_superpowers']).toBeDefined();
+
+          const atroposCouple = bundle.initialEntities?.characters?.['s1.atropos.couple'];
+          expect(atroposCouple?.cardSheet?.name).toBe('Atropos couple');
+
+          const plaza = bundle.initialEntities?.locations?.['central-plaza'];
+          expect(plaza?.geometry).toEqual({
+            x: 995,
+            y: 698,
+            districtId: 'downtown',
+            regionId: 'region:center',
+            mapRef: { layer: 'keyLocation', id: 'key:city-core' },
+          });
+          expect(plaza?.mapAssets?.imagePath).toBe('NeoTerra.png');
+          expect(plaza?.connectionsMeta?.['petrabyte-tower']?.travelModes).toEqual(['walk']);
+
+          const formRuleIds = (bundle.initialEntities?.formRules ?? []).map((r) => r.id);
+          expect(formRuleIds).toEqual(
+            expect.arrayContaining([
+              'rule.s1.vaiva.corrupted',
+              'rule.s1.aurelia.corrupted',
+              'rule.s1.tindur.corrupted',
+              'rule.s1.claire.cleansed',
+              'rule.s1.claire.cleansed.reverse',
+              'rule.s1.vaiva.blazing-prism',
+            ])
+          );
+
+          expect(Object.keys(bundle.loreFiles)).toEqual(
+            expect.arrayContaining(['lore/season-overview.md', 'lore/districts.md'])
+          );
+          expect(bundle.beats.some((b) => b.class === 'ambient' && b.lore?.startsWith('lore/lorebooks/'))).toBe(true);
+        }
       }
     }
   );

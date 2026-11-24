@@ -200,11 +200,20 @@ describe('sim-cli unit & CLI integration tests', () => {
     await writeFile(
       eventsPath,
       [
-        JSON.stringify({ type: 'turn', text: '/travel neon-docks' }),
-        JSON.stringify({ type: 'turn', text: 'I intercept the Clarity arms shipment.' }),
-        JSON.stringify({ type: 'turn', text: '/travel old-subway' }),
         JSON.stringify({ type: 'turn', text: '/travel clarity-hq' }),
-        JSON.stringify({ type: 'turn', text: 'I confront Claire Atropos and disarm the relay.' }),
+        JSON.stringify({
+          type: 'turn',
+          text: 'Colorgarde intercepts the Clarity arms shipment and brings Claire Atropos down.',
+          directorSteering: {
+            beatOverrides: [
+              { beatId: 's1.opening.arms-deal', status: 'resolved' },
+              { beatId: 's1.opening.beast-rumors', status: 'resolved' },
+              { beatId: 's1.escalation.first-conversion', status: 'resolved' },
+              { beatId: 's1.climax.claire-confrontation', status: 'resolved' },
+              { beatId: 's1.resolution.clarity-falls', status: 'resolved' },
+            ],
+          },
+        }),
       ].join('\n'),
       'utf8'
     );
@@ -212,10 +221,10 @@ describe('sim-cli unit & CLI integration tests', () => {
     await writeFile(
       assertPassPath,
       JSON.stringify({
-        flags: { hero_triumph: true, route_hero: true },
-        activeEndingId: 'hero-victory',
+        flags: { ending_s1_resolution: true },
+        activeEndingId: 's1.ending.resolution',
         endingStatus: 'epilogue',
-        sceneLocation: 'Clarity HQ',
+        sceneLocation: 'Clarity Incorporated HQ',
       }),
       'utf8'
     );
@@ -223,7 +232,7 @@ describe('sim-cli unit & CLI integration tests', () => {
     await writeFile(
       assertFailPath,
       JSON.stringify({
-        activeEndingId: 'villain-victory',
+        activeEndingId: 's1.ending.villain-victory',
       }),
       'utf8'
     );
@@ -254,7 +263,7 @@ describe('sim-cli unit & CLI integration tests', () => {
     expect(errOut).toEqual([]);
     const summary = JSON.parse(out[0] ?? '{}') as { ok?: boolean; activeEndingId?: string };
     expect(summary.ok).toBe(true);
-    expect(summary.activeEndingId).toBe('hero-victory');
+    expect(summary.activeEndingId).toBe('s1.ending.resolution');
 
     const failErr: string[] = [];
     const failCode = await runSimCli(

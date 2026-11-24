@@ -1,89 +1,880 @@
 [
   {
-    "id": "opening-arms-deal",
-    "act": "Act I",
+    "id": "s1.opening.arms-deal",
+    "act": "opening",
     "class": "gate",
-    "priority": 30,
-    "when": {
-      "clock": "turn",
-      "op": ">=",
-      "value": 1
+    "flexibility": "strict",
+    "priority": 990,
+    "roles": {
+      "lead": {
+        "default": "s1.vaiva.colorgarde"
+      }
     },
-    "until": {
+    "when": {
       "any": [
         {
-          "all": [
-            { "at": "neon-docks" },
-            { "mentions": ["intercept", "arms", "shipment"] }
-          ]
+          "at": "neon-docks"
         },
-        { "flag": "arms_deal_resolved" }
+        {
+          "at": "clarity-hq"
+        }
       ]
     },
-    "lore": "lore/clarity.md",
-    "nudge": "Intercept the Clarity arms shipment unloading at the Neon Docks.",
-    "on_resolve": [
-      { "set": { "flags.arms_deal_resolved": true } }
-    ]
+    "until": {
+      "flag": "event_arms-deal",
+      "value": true
+    },
+    "deadline": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 12
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "The Illegal Arms Deal — Deadline",
+          "summary": "Clarity ships the weapons unimpeded and gains a free escalation toward city control."
+        }
+      }
+    ],
+    "nudge": "The Illegal Arms Deal — Colorgarde interrupts one of Clarity's illegal arms deals, announcing herself as a real threat to the corporation. — Any public Clarity operation interrupted by Colorgarde counts. If Vaiva is not present, another hero or a vigilante may crash the deal instead.",
+    "once": true
   },
   {
-    "id": "beast-rumors",
-    "act": "Act I",
-    "class": "nudge",
+    "id": "s1.opening.beast-rumors",
+    "act": "opening",
+    "class": "gate",
     "flexibility": "adaptable",
-    "priority": 20,
+    "priority": 980,
+    "when": {
+      "all": [
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 3
+        },
+        {
+          "any": [
+            {
+              "at": "rust-yard"
+            },
+            {
+              "at": "bcp-facility"
+            },
+            {
+              "at": "neoterra-pd-hq"
+            }
+          ]
+        }
+      ]
+    },
+    "until": {
+      "flag": "event_bcp-rumor",
+      "value": true
+    },
+    "deadline": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 20
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Rumors of the Beast Conversion Program — Deadline",
+          "summary": "The BCP stays entirely off the heroes' radar and converts a named hero off-screen as escalation."
+        }
+      }
+    ],
+    "nudge": "Rumors of the Beast Conversion Program — The first credible rumor surfaces that missing metahumans are being experimented on rather than killed. — The rumor may come from a victim, a defecting Clarity scientist, or a police file. The source does not matter; the reveal does.",
+    "once": true
+  },
+  {
+    "id": "s1.escalation.first-conversion",
+    "act": "escalation",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 970,
+    "requires": [
+      "s1.opening.beast-rumors"
+    ],
     "when": {
       "clock": "turn",
       "op": ">=",
-      "value": 1
+      "value": 10
     },
     "until": {
-      "any": [
-        { "mentions": ["beast", "subway", "investigate"] },
-        { "flag": "beast_rumors_checked" }
-      ]
+      "form_active": {
+        "character": "s1.aurelia.longshot",
+        "form": "s1.redraw.corrupted.longshot"
+      }
     },
     "deadline": {
-      "clock": "day",
+      "clock": "turn",
       "op": ">=",
-      "value": 3
-    },
-    "deadlinePolicy": "escalate",
-    "nudge": "Investigate reports of biomechanical beasts in the Old Subway before Day 3.",
-    "on_resolve": [
-      { "set": { "flags.beast_rumors_checked": true } }
-    ],
-    "on_deadline": [
-      { "set": { "flags.beast_deadline_missed": true } }
-    ]
-  },
-  {
-    "id": "climax-confrontation",
-    "act": "Act II",
-    "class": "gate",
-    "priority": 15,
-    "requires": ["opening-arms-deal"],
-    "when": {
-      "at": "clarity-hq"
-    },
-    "until": {
-      "any": [
-        { "mentions": ["confront", "claire", "disarm"] },
-        { "flag": "climax_resolved" }
-      ]
-    },
-    "deadline": {
-      "clock": "day",
-      "op": ">=",
-      "value": 5
+      "value": 35
     },
     "deadlinePolicy": "close",
-    "nudge": "Infiltrate Clarity HQ and confront Claire Atropos before Day 5.",
-    "on_resolve": [
-      { "set": { "flags.hero_triumph": true, "flags.climax_resolved": true } }
-    ],
     "on_deadline": [
-      { "set": { "flags.villain_ascendant": true } }
-    ]
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "The First Conversion — Deadline",
+          "summary": "Clarity converts a different hero instead; the hero community loses a named ally and the threat advances a stage."
+        }
+      }
+    ],
+    "nudge": "The First Conversion — A known metahuman is broken by the BCP and reappears as an animal-themed villain serving Clarity. — Any roster hero may replace Aurelia as the first conversion. Record adaptedFrom/adaptedTo and keep the converted character's relationships.",
+    "once": true
+  },
+  {
+    "id": "s1.escalation.crystal-cat",
+    "act": "escalation",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 960,
+    "roles": {
+      "lead": {
+        "default": "s1.crystal.cat",
+        "fallbackQuery": {
+          "collection": "characters",
+          "where": {
+            "status": "active"
+          }
+        }
+      },
+      "actor_2": {
+        "default": "s1.vaiva.colorgarde",
+        "fallbackQuery": {
+          "collection": "characters",
+          "where": {
+            "status": "active"
+          }
+        }
+      }
+    },
+    "when": {
+      "all": [
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 18
+        },
+        {
+          "any": [
+            {
+              "at": "central-plaza"
+            },
+            {
+              "at": "clarity-hq"
+            },
+            {
+              "at": "sirens-styles"
+            }
+          ]
+        }
+      ]
+    },
+    "until": {
+      "flag": "event_crystal-cat-showdown",
+      "value": true
+    },
+    "deadline": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 45
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Crystal Cat Hunts Colorgarde — Deadline",
+          "summary": "Mira captures an ally instead, and Claire gains leverage over Colorgarde."
+        }
+      }
+    ],
+    "nudge": "Crystal Cat Hunts Colorgarde — Mira Shard, Claire's crystal clone, is deployed specifically to neutralize Colorgarde's light powers and humiliate her in public. — The function is a tailored counter to the protagonist. If Mira is gone, Claire builds or hires a different counter.",
+    "once": true
+  },
+  {
+    "id": "s1.climax.claire-confrontation",
+    "act": "climax",
+    "class": "gate",
+    "flexibility": "strict",
+    "priority": 950,
+    "requires": [
+      "s1.escalation.first-conversion"
+    ],
+    "roles": {
+      "lead": {
+        "default": "s1.vaiva.colorgarde"
+      },
+      "actor_2": {
+        "default": "s1.claire.atropos"
+      }
+    },
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 30
+    },
+    "until": {
+      "flag": "event_claire-confrontation",
+      "value": true
+    },
+    "deadline": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 70
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "The Confrontation with Claire — Deadline",
+          "summary": "Claire completes her endgame uncontested; the season moves to villain victory unless a later beat intervenes."
+        }
+      }
+    ],
+    "nudge": "The Confrontation with Claire — Colorgarde and Claire Atropos finally face each other with the fate of the city on the line. — The confrontation can happen anywhere Claire's plans converge. Substitutes may take Claire's place only if she is already defeated; then this beat short-circuits.",
+    "once": true
+  },
+  {
+    "id": "s1.resolution.clarity-falls",
+    "act": "resolution",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 940,
+    "requires": [
+      "s1.climax.claire-confrontation"
+    ],
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 40
+    },
+    "until": {
+      "entity": [
+        "characters",
+        "s1.claire.atropos",
+        "status"
+      ],
+      "op": "in",
+      "value": [
+        "captured",
+        "corrupted",
+        "dead",
+        "retired",
+        "lost"
+      ]
+    },
+    "deadline": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 90
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Clarity Incorporated Falls — Deadline",
+          "summary": "The final deadline passes: Claire wins completely, and the season ends in a recorded villain victory."
+        }
+      }
+    ],
+    "nudge": "Clarity Incorporated Falls — Claire is defeated and Clarity's control breaks — through capture, conversion, death, or a public collapse of the corporation. — Claire may be brainwashed into Claire Lachesis, imprisoned, killed, or forced into exile. Any terminal or converted state resolves the beat; record the divergence.",
+    "once": true
+  },
+  {
+    "id": "s1.side.docks-favor",
+    "act": "opening",
+    "class": "nudge",
+    "flexibility": "optional",
+    "priority": 975,
+    "when": {
+      "any": [
+        {
+          "at": "neon-docks"
+        },
+        {
+          "at": "rust-yard"
+        }
+      ]
+    },
+    "until": {
+      "flag": "event_docks-favor",
+      "value": true
+    },
+    "nudge": "A Favor at the Docks — A dockworker asks Colorgarde for a small, human favor: escort a witness past a Clarity checkpoint, or find a missing brother before the conversion vans do. — Any small civilian request near the docks counts. The favor may be refused without consequence.",
+    "once": true
+  },
+  {
+    "id": "s1.side.shelter-shift",
+    "act": "escalation",
+    "class": "nudge",
+    "flexibility": "optional",
+    "priority": 955,
+    "when": {
+      "all": [
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 10
+        },
+        {
+          "any": [
+            {
+              "at": "petrabyte-tower"
+            },
+            {
+              "at": "old-subway"
+            }
+          ]
+        }
+      ]
+    },
+    "until": {
+      "flag": "event_shelter-shift",
+      "value": true
+    },
+    "nudge": "A Night at the Shelter — The Petrabyte safehouse is short-handed. Spend a night helping the people Clarity has already hurt, and hear what they know. — Any safehouse, clinic, or civilian shelter works. This is a civilian-life beat, not a canon obligation.",
+    "once": true
+  },
+  {
+    "id": "s1.post.resistance.recruit",
+    "act": "escalation",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 890,
+    "route": "s1.post-victory.resistance",
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 0
+    },
+    "until": {
+      "flag": "event_post-resistance-recruit",
+      "value": true
+    },
+    "deadline": {
+      "all": [
+        {
+          "flag": "route_s1_post_resistance",
+          "value": true
+        },
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 110
+        }
+      ]
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Find the First Ally — Deadline",
+          "summary": "The victor captures a prospective ally and the cell shrinks."
+        }
+      }
+    ],
+    "nudge": "Find the First Ally — Reach the people Clarity has not converted yet: a dockworker, a defector, a hero in hiding. One ally is enough to begin. — Any ally, defector, or contact may anchor the cell.",
+    "once": true
+  },
+  {
+    "id": "s1.post.resistance.strike",
+    "act": "resolution",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 880,
+    "route": "s1.post-victory.resistance",
+    "requires": [
+      "s1.post.resistance.recruit"
+    ],
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 0
+    },
+    "until": {
+      "flag": "event_post-resistance-strike",
+      "value": true
+    },
+    "deadline": {
+      "all": [
+        {
+          "flag": "route_s1_post_resistance",
+          "value": true
+        },
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 130
+        }
+      ]
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Break the Conversion Ledger — Deadline",
+          "summary": "The regime tightens control and the resistance loses its base."
+        }
+      }
+    ],
+    "nudge": "Break the Conversion Ledger — Hit the Clarity facility that records every conversion, and prove the program can lose its paperwork. — The target may be a symbol, a prison, or a supply hub.",
+    "once": true
+  },
+  {
+    "id": "s1.post.join.break-resistance",
+    "act": "escalation",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 890,
+    "route": "s1.post-victory.join-villain",
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 0
+    },
+    "until": {
+      "flag": "event_post-resistance-cell",
+      "value": true
+    },
+    "deadline": {
+      "all": [
+        {
+          "flag": "route_s1_post_join_villain",
+          "value": true
+        },
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 110
+        }
+      ]
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Audit a Loyalty File — Deadline",
+          "summary": "The resistance recruits a named hero and gains influence."
+        }
+      }
+    ],
+    "nudge": "Audit a Loyalty File — Review a converted servant's file for a flaw the Mandate missed, and decide whether to expose or exploit it. — Any cell, safehouse, or symbol of resistance counts.",
+    "once": true
+  },
+  {
+    "id": "s1.post.join.conquer",
+    "act": "resolution",
+    "class": "gate",
+    "flexibility": "adaptable",
+    "priority": 880,
+    "route": "s1.post-victory.join-villain",
+    "requires": [
+      "s1.post.join.break-resistance"
+    ],
+    "when": {
+      "clock": "turn",
+      "op": ">=",
+      "value": 0
+    },
+    "until": {
+      "flag": "postVictoryConquest",
+      "value": true
+    },
+    "deadline": {
+      "all": [
+        {
+          "flag": "route_s1_post_join_villain",
+          "value": true
+        },
+        {
+          "clock": "turn",
+          "op": ">=",
+          "value": 130
+        }
+      ]
+    },
+    "deadlinePolicy": "close",
+    "on_deadline": [
+      {
+        "chronicle": {
+          "category": "event",
+          "title": "Secure the Waterfront — Deadline",
+          "summary": "The resistance holds the district and humiliates the victor."
+        }
+      }
+    ],
+    "nudge": "Secure the Waterfront — Take the docks for the Mandate and cut the remnant off from its last open supply route. — Use an occupied district; the exact target may change.",
+    "once": true
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.claire-atropos",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 100,
+    "when": {
+      "mentions": [
+        "Claire",
+        "Atropos",
+        "Clarity Incorporated"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/claire-atropos.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.claire-lachesis",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 200,
+    "when": {
+      "mentions": [
+        "Lachesis"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/claire-lachesis.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.vaiva",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 300,
+    "when": {
+      "mentions": [
+        "Vaiva",
+        "Petrauskaitė",
+        "Petrauskaite",
+        "Petrauskas",
+        "Colorgarde"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/vaiva.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.light-shade",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 400,
+    "when": {
+      "mentions": [
+        "Vaiva",
+        "Petrauskaitė",
+        "Petrauskaite",
+        "Petrauskas",
+        "Colorgarde"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/light-shade.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.aurelia",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 500,
+    "when": {
+      "mentions": [
+        "Aurelia",
+        "Selwind",
+        "Longshot"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/aurelia.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.redraw",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 600,
+    "when": {
+      "mentions": [
+        "Aurelia",
+        "Selwind",
+        "Longshot"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/redraw.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.tindur",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 700,
+    "when": {
+      "mentions": [
+        "Tindur",
+        "Menis",
+        "Sharkbite"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/tindur.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.blood-frenzy",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 800,
+    "when": {
+      "mentions": [
+        "Tender",
+        "Menis",
+        "Sharkbite"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/blood-frenzy.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.mira",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 900,
+    "when": {
+      "mentions": [
+        "Mira",
+        "Shard",
+        "Crystal Cat"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/mira.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.noah",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1000,
+    "when": {
+      "mentions": [
+        "Noah"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/noah.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.jacqueline",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1100,
+    "when": {
+      "mentions": [
+        "Jacqueline",
+        "Webb",
+        "Poisoness"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/jacqueline.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.toxic-weaver",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1200,
+    "when": {
+      "mentions": [
+        "Jacqueline",
+        "Webb",
+        "Poisoness"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/toxic-weaver.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.magnus",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1300,
+    "when": {
+      "mentions": [
+        "Magnus",
+        "Grim Leader",
+        "Lurking Light"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/magnus.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.abyssal-beast",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1400,
+    "when": {
+      "mentions": [
+        "Magnus",
+        "Grim Leader",
+        "Lurking Light"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/abyssal-beast.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-season1-omnilia.season-1",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 1500,
+    "when": {
+      "mentions": [
+        "Season 1",
+        "Neo Terra"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-season1-omnilia/season-1.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-threatlevel.threat-level",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 100,
+    "when": {
+      "mentions": [
+        "Threat Level"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-threatlevel/threat-level.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-timeline-toneauxiliary.key-event",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 100,
+    "when": {
+      "mentions": [
+        "Multiverse"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-timeline-toneauxiliary/key-event.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra-timeline-toneauxiliary.neo-terra-verse",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 200,
+    "when": {
+      "mentions": [
+        "Neo Terra"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra-timeline-toneauxiliary/neo-terra-verse.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra.neo-terra",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 100,
+    "when": {
+      "mentions": [
+        "Neo Terra",
+        "Colorgarde",
+        "Vaiva",
+        "Aurelia",
+        "Longshot",
+        "PetraByte",
+        "Claire",
+        "Clairity Incorporated",
+        "Atropos"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra/neo-terra.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra.petrabyte",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 200,
+    "when": {
+      "mentions": [
+        "PetraByte",
+        "Clarity",
+        "Clarie",
+        "Noah",
+        "Samael",
+        "Atropos",
+        "Gintvilas",
+        "Petrauskas",
+        "Petrauskaitė",
+        "Colorgarde",
+        "Darkgarde",
+        "Lachesis",
+        "Beast Conversion Program"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra/petrabyte.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra.metahuman",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 300,
+    "when": {
+      "mentions": [
+        "Metahuman",
+        "Metahumans",
+        "Meta",
+        "Metas",
+        "power",
+        "superpower"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra/metahuman.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra.superheroes",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 400,
+    "when": {
+      "mentions": [
+        "Superheroes",
+        "Superhero",
+        "Supervillain",
+        "Supervillains",
+        "Vigilantes"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra/superheroes.md",
+    "once": false
+  },
+  {
+    "id": "lore.neoterra.neo-terra-crisis-coalition",
+    "class": "ambient",
+    "flexibility": "optional",
+    "priority": 500,
+    "when": {
+      "mentions": [
+        "Coalition"
+      ]
+    },
+    "lore": "lore/lorebooks/neoterra/neo-terra-crisis-coalition.md",
+    "once": false
   }
 ]

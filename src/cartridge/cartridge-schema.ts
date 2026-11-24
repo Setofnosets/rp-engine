@@ -41,7 +41,13 @@ import {
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
 import { validateCharacterCardSheet } from '../state/character-card-sheet.js';
-import { type FormDefinition } from '../state/forms.js';
+import {
+  type FormDefinition,
+  type FormIndex,
+  type FormTransitionRule,
+  buildFormIndex,
+  validateFormTransitionRules,
+} from '../state/forms.js';
 import { type LocationEntity } from '../state/spatial-topology.js';
 import {
   CHARACTER_STATUSES,
@@ -86,6 +92,7 @@ export interface CartridgeInitialEntities {
   threats?: Record<string, ThreatEntity>;
   locations?: Record<string, LocationEntity>;
   forms?: readonly FormDefinition[];
+  formRules?: readonly FormTransitionRule[];
 }
 
 export interface CartridgeCombatConfig {
@@ -1197,9 +1204,11 @@ function validateInitialEntitiesSection(
     }
   }
 
+  let validFormIndex: FormIndex | undefined;
   if (rawEntities['forms'] !== undefined) {
     const forms = rawEntities['forms'];
     const formAcc = acc.scope('forms');
+    const prevErrCount = acc.errors.length;
     if (!Array.isArray(forms)) {
       formAcc.add('', 'INVALID_TYPE', 'forms must be an array');
     } else {
@@ -1236,6 +1245,20 @@ function validateInitialEntitiesSection(
           );
         }
       }
+      if (acc.errors.length === prevErrCount) {
+        validFormIndex = buildFormIndex(forms as readonly FormDefinition[]);
+      }
+    }
+  }
+
+  if (rawEntities['formRules'] !== undefined) {
+    const formRulesRes = validateFormTransitionRules(
+      rawEntities['formRules'] as readonly FormTransitionRule[],
+      validFormIndex,
+      'formRules'
+    );
+    if (!formRulesRes.ok) {
+      acc.addAll(formRulesRes.error);
     }
   }
 }

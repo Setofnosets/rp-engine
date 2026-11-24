@@ -1,15 +1,21 @@
 {
-  "factionInfluencePerDay": 1.5,
-  "mainThreatProgressPerDay": 5.0,
-  "secondaryThreatProgressPerDay": 2.0,
-  "maxFactionDeltaPerTick": 10,
+  "factionInfluencePerDay": 0.5,
+  "mainThreatProgressPerDay": 1,
+  "secondaryThreatProgressPerDay": 0.5,
+  "maxFactionDeltaPerTick": 5,
   "maxNpcMovesPerTick": 2,
   "maxDaysPerTick": 14,
   "rumorsPerTick": 2,
-  "threatStageThresholds": [25, 50, 75, 100],
+  "threatStageThresholds": [
+    25,
+    50,
+    75,
+    100
+  ],
   "rumorTemplates": [
-    "Encrypted chatter near {location}: {faction} operatives are staging.",
-    "Street feeds warn {threat} is gaining momentum around {location}.",
-    "{faction} patrols spotted sweeping {location}."
+    "Clarity patrols were seen around {location} today.",
+    "Word is {threat} is stirring near {location}.",
+    "{faction} is making its presence felt in {location}.",
+    "People in {location} are nervous about {threat}."
   ]
 }

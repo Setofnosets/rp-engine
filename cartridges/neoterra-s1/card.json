@@ -2,14 +2,14 @@
   "spec": "cartridge/0.1",
   "id": "neoterra-s1",
   "version": "1.0.0",
-  "title": "NeoTerra Season 1",
-  "author": "Referee Reference Cartridges",
-  "description": "Living-world superhero noir in NeoTerra featuring multi-form identities, Dual World Clock deadlines, off-screen faction agendas, and post-victory branching.",
+  "title": "Season 1 — Omnilia (Clarity Arc)",
+  "author": "NeoTerra Framework",
+  "description": "Clarity Incorporated controls Neo Terra from the shadows. Claire Atropos runs the Beast Conversion Program, abducting metahumans and turning them into animal-themed servants. Vaiva Petrauskaitė, the newly active Colorgarde, decides to bring the corporation down — while Claire treats the whole campaign as a delicious game.",
   "recommendedSystemPack": "stock-living-world",
   "persona": {
-    "name": "Oracle Dispatch",
-    "description": "Living-world chronicler of NeoTerra, tracking metahuman patrols, Clarity Syndicate raids, and Petrabyte corporate maneuvers.",
-    "scenario": "Rain reflects neon signs across Central Plaza on March 1, 2037 as Clarity cells mobilize across the harbor.",
-    "firstMessage": "Encrypted sirens echo toward the Neon Docks. Vaiva glances up from her comm-link across Central Plaza. \"Clarity just moved a shipment through the harbor. If we wait too long, Claire Atropos will lock down the grid.\""
+    "name": "Season 1 — Omnilia (Clarity Arc)",
+    "description": "Clarity Incorporated controls Neo Terra from the shadows. Claire Atropos runs the Beast Conversion Program, abducting metahumans and turning them into animal-themed servants. Vaiva Petrauskaitė, the newly active Colorgarde, decides to bring the corporation down — while Claire treats the whole campaign as a delicious game.\n\nCyberpunk comic-book melodrama. Villainesses are seductive, theatrical, and usually winning; heroes are earnest and outmatched. Violence and erotic villainy are genre-normal but never grimdark for its own sake.",
+    "scenario": "Clarity Incorporated controls Neo Terra from the shadows. Claire Atropos runs the Beast Conversion Program, abducting metahumans and turning them into animal-themed servants. Vaiva Petrauskaitė, the newly active Colorgarde, decides to bring the corporation down — while Claire treats the whole campaign as a delicious game.",
+    "systemPrompt": "Cyberpunk comic-book melodrama. Villainesses are seductive, theatrical, and usually winning; heroes are earnest and outmatched. Violence and erotic villainy are genre-normal but never grimdark for its own sake."
   }
 }
