@@ -1,9 +1,24 @@
 import { ValidationError, formatValidationErrors, validationError } from '../core/errors.js';
 import { Result, err, ok } from '../core/result.js';
 import { extractAndRepairJsonDetailed, validateAgainstJsonSchema } from './json-repair.js';
+import { AnthropicProvider } from './providers/anthropic-provider.js';
+import { GeminiProvider } from './providers/gemini-provider.js';
+import { OllamaProvider } from './providers/ollama-provider.js';
+import {
+  classifyCaughtProviderError,
+  classifyHttpFailure,
+  clonePartialSampler,
+  createCombinedSignal,
+  invokeFetch,
+  isPlainRecord,
+  readSseEvents,
+  resolveEffectiveSampler,
+  sleepWithAbort,
+} from './providers/provider-utils.js';
 import {
   AgentRole,
   ChatMessage,
+  ConnectionPreset,
   GatewayGenerateTextRequest,
   GatewayStructuredOutput,
   GatewayStructuredRequest,
@@ -11,8 +26,11 @@ import {
   ProviderFailure,
   ProviderKind,
   RoleConnectionConfig,
+  SamplerPreset,
   StreamChunk,
 } from './types.js';
+
+export { AnthropicProvider, GeminiProvider, OllamaProvider };
 
 /**
  * Configuration options for {@link ModelGateway}.
@@ -25,28 +43,12 @@ export interface ModelGatewayOptions {
   readonly providers?:
     | ReadonlyMap<ProviderKind, ModelProvider>
     | Partial<Record<ProviderKind, ModelProvider>>;
+  readonly connectionPresets?: readonly ConnectionPreset[];
+  readonly samplerPresets?: readonly SamplerPreset[];
   readonly maxRetries?: number;
   readonly baseRetryDelayMs?: number;
   readonly defaultMaxRepairAttempts?: number;
   readonly fetchImpl?: typeof fetch;
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isAbortError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.name === 'AbortError';
-}
-
-function isTimeoutError(error: unknown): boolean {
-  if (!(error instanceof Error)) {
-    return false;
-  }
-  return error.name === 'TimeoutError';
 }
 
 function extractTextFromChoiceContainer(choice: unknown, field: 'message' | 'delta'): string | undefined {
@@ -93,123 +95,26 @@ function extractOpenAIStreamDelta(payload: unknown): string | undefined {
   );
 }
 
-interface CombinedSignalHandle {
-  readonly signal: AbortSignal | undefined;
-  readonly isTimedOut: () => boolean;
-  readonly cleanup: () => void;
-}
-
-function createCombinedSignal(
-  callerSignal: AbortSignal | undefined,
-  timeoutMs: number | undefined
-): CombinedSignalHandle {
-  if (timeoutMs === undefined || timeoutMs <= 0) {
-    return {
-      signal: callerSignal,
-      isTimedOut: () => false,
-      cleanup: () => {},
-    };
-  }
-
-  const controller = new AbortController();
-  let timedOut = false;
-
-  const onCallerAbort = (): void => {
-    controller.abort(callerSignal?.reason);
-  };
-
-  if (callerSignal !== undefined) {
-    if (callerSignal.aborted) {
-      controller.abort(callerSignal.reason);
-    } else {
-      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
-    }
-  }
-
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort(new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError'));
-  }, timeoutMs);
-
+function cloneSamplerPreset(preset: SamplerPreset): SamplerPreset {
+  const normalized = clonePartialSampler(preset);
   return {
-    signal: controller.signal,
-    isTimedOut: () => timedOut,
-    cleanup: () => {
-      clearTimeout(timer);
-      callerSignal?.removeEventListener('abort', onCallerAbort);
-    },
+    ...normalized,
+    id: preset.id,
+    name: preset.name,
   };
 }
 
-function classifyHttpFailure(status: number, bodyText: string): ProviderFailure {
-  const retryable = status === 429 || (status >= 500 && status <= 599);
-  const code = status === 429 ? 'RATE_LIMITED' : `HTTP_${status}`;
-  const detail = bodyText.trim();
-  const message =
-    detail.length > 0 ? `Provider returned HTTP ${status}: ${detail}` : `Provider returned HTTP ${status}`;
+function cloneConnectionPreset(preset: ConnectionPreset): ConnectionPreset {
+  return { ...preset };
+}
+
+function cloneRoleConnectionConfig(
+  config: Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }
+): Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole } {
   return {
-    code,
-    message,
-    status,
-    retryable,
+    ...config,
+    ...(config.sampler !== undefined ? { sampler: clonePartialSampler(config.sampler) } : {}),
   };
-}
-
-function classifyCaughtProviderError(
-  caught: unknown,
-  callerSignal?: AbortSignal,
-  isTimedOut?: () => boolean
-): ProviderFailure {
-  if (callerSignal?.aborted || isAbortError(caught)) {
-    return {
-      code: 'ABORTED',
-      message: caught instanceof Error && caught.message.length > 0 ? caught.message : 'Request was aborted',
-      isAbort: true,
-      retryable: false,
-    };
-  }
-  if (isTimedOut?.() || isTimeoutError(caught)) {
-    return {
-      code: 'TIMEOUT',
-      message: caught instanceof Error && caught.message.length > 0 ? caught.message : 'Request timed out',
-      retryable: false,
-    };
-  }
-  return {
-    code: 'NETWORK_ERROR',
-    message: caught instanceof Error ? caught.message : String(caught),
-    retryable: true,
-  };
-}
-
-function sleepWithAbort(delayMs: number, signal?: AbortSignal): Promise<boolean> {
-  if (signal?.aborted) {
-    return Promise.resolve(false);
-  }
-  if (delayMs <= 0) {
-    return Promise.resolve().then(() => !signal?.aborted);
-  }
-  return new Promise<boolean>((resolve) => {
-    let settled = false;
-    const onAbort = (): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timer);
-      resolve(false);
-    };
-    const timer = setTimeout(() => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      signal?.removeEventListener('abort', onAbort);
-      resolve(true);
-    }, delayMs);
-
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
 }
 
 /**
@@ -221,16 +126,6 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   constructor(fetchImpl?: typeof fetch) {
     this.customFetch = fetchImpl;
-  }
-
-  private invokeFetch(url: string, init: RequestInit): Promise<Response> {
-    if (this.customFetch !== undefined) {
-      return this.customFetch(url, init);
-    }
-    if (typeof globalThis.fetch !== 'function') {
-      throw new Error('Global fetch is unavailable in the current runtime');
-    }
-    return globalThis.fetch(url, init);
   }
 
   private buildEndpointUrl(baseUrl: string): string {
@@ -257,8 +152,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     stream: boolean,
     structuredReq?: GatewayStructuredRequest
   ): Record<string, unknown> {
-    const temperature = req.temperature ?? config.temperature;
-    const maxTokens = req.maxTokens ?? config.maxTokens;
+    const sampler = resolveEffectiveSampler(config, req);
 
     const body: Record<string, unknown> = {
       model: config.model,
@@ -270,11 +164,26 @@ export class OpenAICompatibleProvider implements ModelProvider {
       stream,
     };
 
-    if (temperature !== undefined) {
-      body.temperature = temperature;
+    if (sampler.temperature !== undefined) {
+      body.temperature = sampler.temperature;
     }
-    if (maxTokens !== undefined) {
-      body.max_tokens = maxTokens;
+    if (sampler.topP !== undefined) {
+      body.top_p = sampler.topP;
+    }
+    if (sampler.frequencyPenalty !== undefined) {
+      body.frequency_penalty = sampler.frequencyPenalty;
+    }
+    if (sampler.presencePenalty !== undefined) {
+      body.presence_penalty = sampler.presencePenalty;
+    }
+    if (sampler.maxTokens !== undefined) {
+      body.max_tokens = sampler.maxTokens;
+    }
+    if (sampler.stop !== undefined && sampler.stop.length > 0) {
+      body.stop = [...sampler.stop];
+    }
+    if (sampler.seed !== undefined) {
+      body.seed = sampler.seed;
     }
 
     if (structuredReq !== undefined && config.supportsJsonSchema === true) {
@@ -302,7 +211,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
     try {
-      const response = await this.invokeFetch(this.buildEndpointUrl(config.baseUrl), {
+      const response = await invokeFetch(this.customFetch, this.buildEndpointUrl(config.baseUrl), {
         method: 'POST',
         headers: this.buildHeaders(config),
         body: JSON.stringify(this.buildRequestBody(config, req, false, structuredReq)),
@@ -366,10 +275,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }
 
     const signalHandle = createCombinedSignal(req.signal, config.timeoutMs);
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-
     try {
-      const response = await this.invokeFetch(this.buildEndpointUrl(config.baseUrl), {
+      const response = await invokeFetch(this.customFetch, this.buildEndpointUrl(config.baseUrl), {
         method: 'POST',
         headers: this.buildHeaders(config),
         body: JSON.stringify(this.buildRequestBody(config, req, true)),
@@ -382,93 +289,38 @@ export class OpenAICompatibleProvider implements ModelProvider {
         return;
       }
 
-      if (response.body === null) {
-        yield err({
-          code: 'EMPTY_RESPONSE_BODY',
-          message: 'Streaming response did not include a readable body',
-          retryable: false,
-        });
-        return;
-      }
-
-      reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let lineBuffer = '';
       let emittedDone = false;
-
-      while (true) {
-        if (req.signal?.aborted) {
-          yield err({ code: 'ABORTED', message: 'Request was aborted', isAbort: true, retryable: false });
+      for await (const frameResult of readSseEvents(response, req.signal, signalHandle.isTimedOut)) {
+        if (!frameResult.ok) {
+          yield frameResult;
           return;
         }
 
-        const { value, done } = await reader.read();
-        if (done) {
-          break;
+        const payloadText = frameResult.value.data.trim();
+        if (payloadText.length === 0) {
+          continue;
         }
-
-        lineBuffer += decoder.decode(value, { stream: true });
-        const lines = lineBuffer.split(/\r?\n/);
-        lineBuffer = lines.pop() ?? '';
-
-        for (const rawLine of lines) {
-          const line = rawLine.trim();
-          if (line.length === 0 || line.startsWith(':')) {
-            continue;
-          }
-          if (!line.startsWith('data:')) {
-            continue;
-          }
-          const payloadText = line.slice(5).trim();
-          if (payloadText === '[DONE]') {
-            emittedDone = true;
-            yield ok({ text: '', done: true });
-            return;
-          }
-
-          let parsedChunk: unknown;
-          try {
-            parsedChunk = JSON.parse(payloadText) as unknown;
-          } catch (caught) {
-            yield err({
-              code: 'INVALID_STREAM_PAYLOAD',
-              message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-              retryable: false,
-            });
-            return;
-          }
-
-          const delta = extractOpenAIStreamDelta(parsedChunk);
-          if (delta !== undefined && delta.length > 0) {
-            yield ok({ text: delta, done: false });
-          }
-        }
-      }
-
-      const trailing = (lineBuffer + decoder.decode()).trim();
-      if (trailing.startsWith('data:')) {
-        const payloadText = trailing.slice(5).trim();
         if (payloadText === '[DONE]') {
           emittedDone = true;
           yield ok({ text: '', done: true });
           return;
         }
-        if (payloadText.length > 0) {
-          let parsedChunk: unknown;
-          try {
-            parsedChunk = JSON.parse(payloadText) as unknown;
-          } catch (caught) {
-            yield err({
-              code: 'INVALID_STREAM_PAYLOAD',
-              message: `Malformed trailing SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
-              retryable: false,
-            });
-            return;
-          }
-          const delta = extractOpenAIStreamDelta(parsedChunk);
-          if (delta !== undefined && delta.length > 0) {
-            yield ok({ text: delta, done: false });
-          }
+
+        let parsedChunk: unknown;
+        try {
+          parsedChunk = JSON.parse(payloadText) as unknown;
+        } catch (caught) {
+          yield err({
+            code: 'INVALID_STREAM_PAYLOAD',
+            message: `Malformed SSE JSON chunk: ${caught instanceof Error ? caught.message : String(caught)}`,
+            retryable: false,
+          });
+          return;
+        }
+
+        const delta = extractOpenAIStreamDelta(parsedChunk);
+        if (delta !== undefined && delta.length > 0) {
+          yield ok({ text: delta, done: false });
         }
       }
 
@@ -478,23 +330,21 @@ export class OpenAICompatibleProvider implements ModelProvider {
     } catch (caught) {
       yield err(classifyCaughtProviderError(caught, req.signal, signalHandle.isTimedOut));
     } finally {
-      if (reader !== undefined) {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
       signalHandle.cleanup();
     }
   }
 }
 
 /**
- * Per-role model gateway supporting provider routing, bounded retries, streaming,
+ * Per-role model gateway supporting provider routing, presets, bounded retries, streaming,
  * and schema-validated structured JSON generation with automated repair.
  */
 export class ModelGateway {
   private readonly connections: Map<AgentRole, RoleConnectionConfig>;
   private defaultConnection: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined;
   private readonly providers: Map<ProviderKind, ModelProvider>;
+  private readonly connectionPresets: Map<string, ConnectionPreset>;
+  private readonly samplerPresets: Map<string, SamplerPreset>;
   private readonly maxRetries: number;
   private readonly baseRetryDelayMs: number;
   private readonly defaultMaxRepairAttempts: number;
@@ -504,22 +354,30 @@ export class ModelGateway {
     if (options.connections !== undefined) {
       if (options.connections instanceof Map) {
         for (const [role, config] of options.connections.entries()) {
-          this.connections.set(role, { ...config, role });
+          this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
         }
       } else {
         for (const [roleKey, config] of Object.entries(options.connections)) {
           if (config !== undefined) {
             const role = roleKey as AgentRole;
-            this.connections.set(role, { ...config, role });
+            this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
           }
         }
       }
     }
 
-    this.defaultConnection = options.defaultConnection !== undefined ? { ...options.defaultConnection } : undefined;
+    this.defaultConnection =
+      options.defaultConnection !== undefined
+        ? cloneRoleConnectionConfig(options.defaultConnection)
+        : undefined;
 
+    const openAiProvider = new OpenAICompatibleProvider(options.fetchImpl);
     this.providers = new Map<ProviderKind, ModelProvider>([
-      ['openai_compatible', new OpenAICompatibleProvider(options.fetchImpl)],
+      ['openai_compatible', openAiProvider],
+      ['openai', openAiProvider],
+      ['anthropic', new AnthropicProvider(options.fetchImpl)],
+      ['gemini', new GeminiProvider(options.fetchImpl)],
+      ['ollama', new OllamaProvider(options.fetchImpl, openAiProvider)],
     ]);
 
     if (options.providers !== undefined) {
@@ -536,9 +394,135 @@ export class ModelGateway {
       }
     }
 
+    this.connectionPresets = new Map<string, ConnectionPreset>();
+    if (options.connectionPresets !== undefined) {
+      for (const preset of options.connectionPresets) {
+        this.connectionPresets.set(preset.id, cloneConnectionPreset(preset));
+      }
+    }
+
+    this.samplerPresets = new Map<string, SamplerPreset>();
+    if (options.samplerPresets !== undefined) {
+      for (const preset of options.samplerPresets) {
+        this.samplerPresets.set(preset.id, cloneSamplerPreset(preset));
+      }
+    }
+
     this.maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.baseRetryDelayMs = Math.max(0, options.baseRetryDelayMs ?? 50);
     this.defaultMaxRepairAttempts = Math.max(0, options.defaultMaxRepairAttempts ?? 0);
+  }
+
+  /**
+   * Register or update a reusable {@link SamplerPreset}.
+   */
+  registerSamplerPreset(preset: SamplerPreset): void {
+    this.samplerPresets.set(preset.id, cloneSamplerPreset(preset));
+  }
+
+  /**
+   * Look up a registered {@link SamplerPreset} by ID.
+   */
+  getSamplerPreset(id: string): SamplerPreset | undefined {
+    const preset = this.samplerPresets.get(id);
+    return preset !== undefined ? cloneSamplerPreset(preset) : undefined;
+  }
+
+  /**
+   * Return all registered {@link SamplerPreset} definitions.
+   */
+  listSamplerPresets(): SamplerPreset[] {
+    return Array.from(this.samplerPresets.values(), cloneSamplerPreset);
+  }
+
+  /**
+   * Register or update a reusable {@link ConnectionPreset}.
+   */
+  registerConnectionPreset(preset: ConnectionPreset): void {
+    this.connectionPresets.set(preset.id, cloneConnectionPreset(preset));
+  }
+
+  /**
+   * Look up a registered {@link ConnectionPreset} by ID.
+   */
+  getConnectionPreset(id: string): ConnectionPreset | undefined {
+    const preset = this.connectionPresets.get(id);
+    return preset !== undefined ? cloneConnectionPreset(preset) : undefined;
+  }
+
+  /**
+   * Return all registered {@link ConnectionPreset} definitions.
+   */
+  listConnectionPresets(): ConnectionPreset[] {
+    return Array.from(this.connectionPresets.values(), cloneConnectionPreset);
+  }
+
+  /**
+   * Bind a registered {@link ConnectionPreset} to a specific {@link AgentRole}.
+   */
+  applyConnectionPreset(
+    role: AgentRole,
+    presetId: string,
+    env: Readonly<Record<string, string | undefined>> = typeof process !== 'undefined' ? process.env : {}
+  ): Result<RoleConnectionConfig, ValidationError[]> {
+    const preset = this.connectionPresets.get(presetId);
+    if (preset === undefined) {
+      return err([
+        validationError('presetId', 'UNKNOWN_CONNECTION_PRESET', `Unknown connection preset '${presetId}'`),
+      ]);
+    }
+
+    const resolvedApiKey =
+      preset.apiKey !== undefined && preset.apiKey.length > 0
+        ? preset.apiKey
+        : preset.apiKeyEnv !== undefined &&
+            preset.apiKeyEnv.length > 0 &&
+            Object.hasOwn(env, preset.apiKeyEnv)
+          ? env[preset.apiKeyEnv]
+          : undefined;
+
+    const config: Omit<RoleConnectionConfig, 'role'> = {
+      provider: preset.provider,
+      baseUrl: preset.baseUrl,
+      model: preset.model,
+      ...(resolvedApiKey !== undefined && resolvedApiKey.length > 0 ? { apiKey: resolvedApiKey } : {}),
+      ...(preset.samplerPresetId !== undefined ? { samplerPresetId: preset.samplerPresetId } : {}),
+      ...(preset.enablePromptCache !== undefined ? { enablePromptCache: preset.enablePromptCache } : {}),
+      ...(preset.timeoutMs !== undefined ? { timeoutMs: preset.timeoutMs } : {}),
+      ...(preset.supportsJsonSchema !== undefined ? { supportsJsonSchema: preset.supportsJsonSchema } : {}),
+    };
+
+    this.setRoleConnection(role, config);
+    return this.resolveConnection(role);
+  }
+
+  /**
+   * Attach a registered {@link SamplerPreset} to an existing {@link AgentRole} connection.
+   */
+  applySamplerPreset(role: AgentRole, samplerPresetId: string): Result<RoleConnectionConfig, ValidationError[]> {
+    const preset = this.samplerPresets.get(samplerPresetId);
+    if (preset === undefined) {
+      return err([
+        validationError(
+          'samplerPresetId',
+          'UNKNOWN_SAMPLER_PRESET',
+          `Unknown sampler preset '${samplerPresetId}'`
+        ),
+      ]);
+    }
+
+    const existing = this.connections.get(role) ?? this.defaultConnection;
+    if (existing === undefined) {
+      return err([
+        validationError('role', 'MISSING_ROLE_CONFIG', `No model connection configured for role '${role}'`),
+      ]);
+    }
+
+    this.setRoleConnection(role, {
+      ...existing,
+      samplerPresetId,
+    });
+    return this.resolveConnection(role);
   }
 
   /**
@@ -547,14 +531,14 @@ export class ModelGateway {
   setDefaultConnection(
     config: (Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }) | undefined
   ): void {
-    this.defaultConnection = config !== undefined ? { ...config } : undefined;
+    this.defaultConnection = config !== undefined ? cloneRoleConnectionConfig(config) : undefined;
   }
 
   /**
    * Set or update the connection profile for a specific {@link AgentRole} at runtime.
    */
   setRoleConnection(role: AgentRole, config: Omit<RoleConnectionConfig, 'role'>): void {
-    this.connections.set(role, { ...config, role });
+    this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
   }
 
   /**
@@ -566,13 +550,31 @@ export class ModelGateway {
   } {
     const connections: Partial<Record<AgentRole, RoleConnectionConfig>> = {};
     for (const [role, cfg] of this.connections.entries()) {
-      connections[role] = { ...cfg };
+      connections[role] = { ...cloneRoleConnectionConfig(cfg), role };
     }
     return {
       ...(this.defaultConnection !== undefined
-        ? { defaultConnection: { ...this.defaultConnection } }
+        ? { defaultConnection: cloneRoleConnectionConfig(this.defaultConnection) }
         : {}),
       connections,
+    };
+  }
+
+  private hydrateConnectionSampler(config: RoleConnectionConfig): RoleConnectionConfig {
+    const preset =
+      config.samplerPresetId !== undefined ? this.samplerPresets.get(config.samplerPresetId) : undefined;
+    if (preset === undefined && config.sampler === undefined) {
+      return { ...config };
+    }
+
+    const mergedSampler = clonePartialSampler({
+      ...(preset !== undefined ? clonePartialSampler(preset) : {}),
+      ...(config.sampler !== undefined ? clonePartialSampler(config.sampler) : {}),
+    });
+
+    return {
+      ...config,
+      sampler: mergedSampler,
     };
   }
 
@@ -582,10 +584,10 @@ export class ModelGateway {
   resolveConnection(role: AgentRole): Result<RoleConnectionConfig, ValidationError[]> {
     const specific = this.connections.get(role);
     if (specific !== undefined) {
-      return ok({ ...specific });
+      return ok(this.hydrateConnectionSampler({ ...specific, role }));
     }
     if (this.defaultConnection !== undefined) {
-      return ok({ ...this.defaultConnection, role });
+      return ok(this.hydrateConnectionSampler({ ...this.defaultConnection, role }));
     }
     return err([
       validationError('role', 'MISSING_ROLE_CONFIG', `No model connection configured for role '${role}'`),
