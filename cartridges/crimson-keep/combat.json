@@ -88,6 +88,118 @@
         }
       ],
       "tags": ["melee", "shield", "control"]
+    },
+    {
+      "id": "conjure_ember_hound",
+      "name": "Conjure Ember Hound",
+      "description": "Summons a spectral Ember Hound to fight beside the caster.",
+      "category": "skill",
+      "actionCost": "action",
+      "resourceCosts": { "stamina": 2 },
+      "cooldownTurns": 2,
+      "targeting": {
+        "shape": "self",
+        "minRange": 0,
+        "maxRange": 0,
+        "requiresLos": false
+      },
+      "hitResolution": {
+        "kind": "auto"
+      },
+      "effects": [
+        {
+          "type": "summon",
+          "summonId": "ember_hound"
+        }
+      ],
+      "tags": ["summon", "fire"]
+    },
+    {
+      "id": "crimson_ignis_field",
+      "name": "Crimson Ignis Field",
+      "description": "Ignites a radius of stone with searing crimson fire.",
+      "category": "skill",
+      "actionCost": "action",
+      "resourceCosts": { "stamina": 2 },
+      "cooldownTurns": 2,
+      "targeting": {
+        "shape": "aoe_radius",
+        "minRange": 1,
+        "maxRange": 4,
+        "radius": 1,
+        "requiresLos": true
+      },
+      "hitResolution": {
+        "kind": "auto"
+      },
+      "effects": [
+        {
+          "type": "modify_terrain",
+          "terrainSpec": {
+            "shape": "aoe_radius",
+            "radius": 1,
+            "hazard": "fire",
+            "hazardDurationRounds": 3,
+            "hazardDamageDice": "1d6"
+          }
+        }
+      ],
+      "tags": ["terrain", "fire", "aoe"]
+    },
+    {
+      "id": "blood_eclipse_avatar",
+      "name": "Blood Eclipse Avatar",
+      "description": "Channel the Crimson Keep's ancient ward to assume the Crimson Avatar form.",
+      "category": "skill",
+      "actionCost": "bonus",
+      "resourceCosts": { "stamina": 3 },
+      "cooldownTurns": 3,
+      "targeting": {
+        "shape": "self",
+        "minRange": 0,
+        "maxRange": 0,
+        "requiresLos": false
+      },
+      "hitResolution": {
+        "kind": "auto"
+      },
+      "effects": [
+        {
+          "type": "transform",
+          "formLoadoutId": "crimson_avatar"
+        }
+      ],
+      "tags": ["transform", "buff"]
     }
-  ]
+  ],
+  "summons": {
+    "ember_hound": {
+      "id": "ember_hound",
+      "name": "Ember Hound",
+      "maxHp": 18,
+      "ac": 12,
+      "speed": 6,
+      "stats": { "str": 4, "dex": 3 },
+      "abilities": ["basic_strike"],
+      "durationTurns": 3,
+      "maxActivePerCaster": 1,
+      "capPolicy": "evict_oldest",
+      "despawnOnSummonerDefeat": true,
+      "initiativePolicy": "after_summoner"
+    }
+  },
+  "formLoadouts": {
+    "crimson_avatar": {
+      "id": "crimson_avatar",
+      "displayName": "Crimson Avatar",
+      "statBonuses": { "str": 4 },
+      "acOverride": 16,
+      "speedOverride": 7,
+      "tempHpPool": 15,
+      "abilities": ["basic_strike", "halberd_sweep"],
+      "replaceAbilities": false,
+      "durationTurns": 3,
+      "revertOnZeroTempHp": true
+    }
+  }
 }
