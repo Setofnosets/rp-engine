@@ -65,4 +65,45 @@ export class RefereeBridgeClient {
   getContextBudget(sessionId: string): Promise<Record<string, unknown>>;
   importCard(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
   bindPlayer(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  getConnections(options?: {
+    redact?: boolean;
+    redactApiKeys?: boolean;
+  }): Promise<Record<string, unknown>>;
+  updateConnections(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  saveConnectionProfile(
+    name: string,
+    payload?: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
+  activateConnectionProfile(name: string): Promise<Record<string, unknown>>;
+  listPresets(): Promise<Record<string, unknown>>;
+  importPreset(payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  exportSessionPreset(
+    sessionId: string,
+    format?: 'st_chat' | 'st_text' | 'referee'
+  ): Promise<Record<string, unknown>>;
+  applyPreset(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
+  listPersonas(): Promise<Record<string, unknown>>;
+  savePersona(persona: Record<string, unknown>): Promise<Record<string, unknown>>;
+  applySessionPersona(
+    sessionId: string,
+    payload: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
+  getSettingCharacters(
+    sessionId: string,
+    filter?: {
+      locationId?: string;
+      status?: string;
+      allegiance?: string;
+      formGroup?: string;
+      presentOnly?: boolean;
+      includePlayer?: boolean;
+      query?: string;
+    }
+  ): Promise<Record<string, unknown>>;
+  getCharacterDossier(sessionId: string, charId: string): Promise<Record<string, unknown>>;
+  upsertCharacter(
+    sessionId: string,
+    payload: Record<string, unknown>
+  ): Promise<Record<string, unknown>>;
+  startCombat(sessionId: string, payload: Record<string, unknown>): Promise<Record<string, unknown>>;
 }

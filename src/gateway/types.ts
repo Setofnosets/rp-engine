@@ -14,6 +14,20 @@ export type AgentRole =
   | 'game_system_wizard';
 
 /**
+ * Canonical ordered list of all supported {@link AgentRole} identifiers.
+ */
+export const AGENT_ROLES: readonly AgentRole[] = [
+  'narrator',
+  'intent_parser',
+  'combat_agent',
+  'state_tracker',
+  'storyline_planner',
+  'cast_director',
+  'chronicle_router',
+  'game_system_wizard',
+];
+
+/**
  * Supported backend provider kinds.
  */
 export type ProviderKind =
@@ -60,16 +74,46 @@ export interface ConnectionPreset {
 }
 
 /**
+ * Canonical list of all supported {@link ProviderKind} identifiers.
+ */
+export const PROVIDER_KINDS: readonly ProviderKind[] = [
+  'openai_compatible',
+  'openai',
+  'anthropic',
+  'gemini',
+  'ollama',
+  'mock',
+];
+
+/**
+ * Sampling and generation parameters configurable per connection or overridden per request.
+ */
+export interface SamplingParameters {
+  readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly maxContextTokens?: number;
+  readonly topP?: number;
+  readonly topK?: number;
+  readonly minP?: number;
+  readonly topA?: number;
+  readonly typicalP?: number;
+  readonly tfs?: number;
+  readonly frequencyPenalty?: number;
+  readonly presencePenalty?: number;
+  readonly repetitionPenalty?: number;
+  readonly stopSequences?: readonly string[];
+  readonly seed?: number;
+}
+
+/**
  * Connection and inference configuration bound to an {@link AgentRole}.
  */
-export interface RoleConnectionConfig {
+export interface RoleConnectionConfig extends SamplingParameters {
   readonly role: AgentRole;
   readonly provider: ProviderKind;
   readonly baseUrl: string;
   readonly apiKey?: string;
   readonly model: string;
-  readonly temperature?: number;
-  readonly maxTokens?: number;
   readonly timeoutMs?: number;
   readonly supportsJsonSchema?: boolean;
   readonly sampler?: Partial<SamplerPreset>;
@@ -89,12 +133,10 @@ export interface ChatMessage {
 /**
  * Request payload for free-form or streamed text generation.
  */
-export interface GatewayGenerateTextRequest {
+export interface GatewayGenerateTextRequest extends SamplingParameters {
   readonly role: AgentRole;
   readonly messages: readonly ChatMessage[];
   readonly signal?: AbortSignal;
-  readonly temperature?: number;
-  readonly maxTokens?: number;
   readonly sampler?: Partial<SamplerPreset>;
   readonly enablePromptCache?: boolean;
 }
@@ -102,15 +144,13 @@ export interface GatewayGenerateTextRequest {
 /**
  * Request payload for schema-validated structured JSON generation.
  */
-export interface GatewayStructuredRequest {
+export interface GatewayStructuredRequest extends SamplingParameters {
   readonly role: AgentRole;
   readonly messages: readonly ChatMessage[];
   readonly schema: Record<string, unknown>;
   readonly schemaName?: string;
   readonly signal?: AbortSignal;
   readonly maxRepairAttempts?: number;
-  readonly temperature?: number;
-  readonly maxTokens?: number;
   readonly sampler?: Partial<SamplerPreset>;
   readonly enablePromptCache?: boolean;
 }

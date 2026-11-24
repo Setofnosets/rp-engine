@@ -2,17 +2,23 @@ import { describe, expect, it } from 'vitest';
 import {
   ALL_PAYLOAD_GROUP_IDS,
   type ControlRoomLayer,
+  type CustomPromptBlockSpec,
   DEFAULT_COMBAT_RULES,
   DEFAULT_TUNING_DIALS,
+  type GenerationPresetConfig,
+  applySheetPreset,
   createEmptyControlRoomLayer,
   createStockBaselineConfig,
+  removeCustomPromptBlock,
   resetSectionToBaseline,
   resolveEffectiveControlRoomConfig,
   setFieldConfirmPolicy,
+  setGenerationPreset,
   setSectionOverride,
   toggleCapability,
   toggleGameSystemModule,
   upsertCustomField,
+  upsertCustomPromptBlock,
 } from '../../src/config/control-room-config.js';
 import {
   PAYLOAD_GROUP_DEFINITIONS,
@@ -27,6 +33,7 @@ import {
   type CharacterSectionDef,
   OPTIONAL_CYBERWARE_SECTION,
   OPTIONAL_DESIRES_SECTION,
+  SHEET_PRESETS,
   cloneCharacterSection,
 } from '../../src/schema/character-sections.js';
 import {
@@ -409,13 +416,218 @@ describe('3-Layer Control Room Config', () => {
       writableByTracker: true,
     });
     expect(fieldAttempt.gameSystemOverrides).toBeUndefined();
+
+    const blockAttempt = upsertCustomPromptBlock(
+      {},
+      { id: 'prototype', name: 'Evil', role: 'system' },
+      'evil',
+      true
+    );
+    expect(blockAttempt.customPromptBlocks).toBeUndefined();
+    expect(blockAttempt.basePrompts).toBeUndefined();
+  });
+
+  it('merges generation presets, customPromptBlocks, tokenBudgets, and autoRegisterEmergentNpcs across 3 layers cleanly', () => {
+    const cartridgeLayer: ControlRoomLayer = {
+      generation: {
+        presetName: 'Cartridge Novel',
+        sourceFormat: 'st_chat_completion',
+        temperature: 0.8,
+        topP: 0.92,
+        stopSequences: ['\nUser:', '\nSystem:'],
+        stFormatTemplates: {
+          wiFormat: '[World Info: {0}]',
+          scenarioFormat: '[Scenario: {0}]',
+        },
+      },
+      customPromptBlocks: {
+        tone_guide: {
+          id: 'tone_guide',
+          name: 'Tone Guide',
+          role: 'system',
+          injectionPosition: 'relative',
+        },
+      },
+      basePrompts: {
+        tone_guide: 'Keep prose noir and atmospheric.',
+      },
+      unlockedPromptSections: {
+        tone_guide: true,
+      },
+      tokenBudgets: {
+        state: 900,
+        world: 600,
+      },
+      tuningDials: {
+        autoRegisterEmergentNpcs: true,
+      },
+    };
+
+    const userLayer: ControlRoomLayer = {
+      generation: {
+        temperature: 0.65,
+        minP: 0.05,
+        stFormatTemplates: {
+          scenarioFormat: '[Scene: {0}]',
+          continueNudgePrompt: '[Continue]',
+        },
+      },
+      customPromptBlocks: {
+        author_note: {
+          id: 'author_note',
+          name: 'Author Note',
+          role: 'system',
+          injectionPosition: 'in_chat',
+          injectionDepth: 2,
+        },
+      },
+      basePrompts: {
+        author_note: 'Focus on sensory details.',
+      },
+      unlockedPromptSections: {
+        author_note: true,
+      },
+      tokenBudgets: {
+        world: 750,
+        totalMaxTokens: 8000,
+      },
+    };
+
+    const resolved = resolveEffectiveControlRoomConfig(
+      STOCK_SLICE_OF_LIFE_PACK,
+      cartridgeLayer,
+      userLayer
+    );
+
+    expect(resolved.generation).toEqual({
+      presetName: 'Cartridge Novel',
+      sourceFormat: 'st_chat_completion',
+      temperature: 0.65,
+      topP: 0.92,
+      minP: 0.05,
+      stopSequences: ['\nUser:', '\nSystem:'],
+      stFormatTemplates: {
+        wiFormat: '[World Info: {0}]',
+        scenarioFormat: '[Scene: {0}]',
+        continueNudgePrompt: '[Continue]',
+      },
+    });
+    expect(resolved.customPromptBlocks).toEqual({
+      tone_guide: {
+        id: 'tone_guide',
+        name: 'Tone Guide',
+        role: 'system',
+        injectionPosition: 'relative',
+      },
+      author_note: {
+        id: 'author_note',
+        name: 'Author Note',
+        role: 'system',
+        injectionPosition: 'in_chat',
+        injectionDepth: 2,
+      },
+    });
+    expect(resolved.tokenBudgets).toEqual({
+      state: 900,
+      world: 750,
+      totalMaxTokens: 8000,
+    });
+    expect(resolved.tuningDials.autoRegisterEmergentNpcs).toBe(true);
+
+    // Mutate resolved output and ensure input layers are isolated
+    (resolved.generation!.stopSequences as string[]).push('MUTATED');
+    resolved.generation!.stFormatTemplates!.wiFormat = 'MUTATED';
+    resolved.customPromptBlocks!['tone_guide']!.name = 'MUTATED';
+    resolved.tokenBudgets!.state = 1;
+
+    expect(cartridgeLayer.generation?.stopSequences).toEqual(['\nUser:', '\nSystem:']);
+    expect(cartridgeLayer.generation?.stFormatTemplates?.wiFormat).toBe('[World Info: {0}]');
+    expect(cartridgeLayer.customPromptBlocks?.['tone_guide']?.name).toBe('Tone Guide');
+    expect(cartridgeLayer.tokenBudgets?.state).toBe(900);
+  });
+
+  it('pure helpers setGenerationPreset, upsertCustomPromptBlock, removeCustomPromptBlock, and applySheetPreset work immutably', () => {
+    const base = createEmptyControlRoomLayer();
+
+    // setGenerationPreset
+    const gen1: GenerationPresetConfig = {
+      presetName: 'Balanced RP',
+      sourceFormat: 'referee',
+      temperature: 0.7,
+      topK: 40,
+      stFormatTemplates: {
+        wiFormat: 'WI: {0}',
+      },
+    };
+    const l1 = setGenerationPreset(base, gen1);
+    expect(base.generation).toBeUndefined();
+    const l2 = setGenerationPreset(l1, {
+      temperature: 0.9,
+      stFormatTemplates: { outputSequence: 'Assistant:' },
+    });
+    expect(l1.generation?.temperature).toBe(0.7);
+    expect(l2.generation).toEqual({
+      presetName: 'Balanced RP',
+      sourceFormat: 'referee',
+      temperature: 0.9,
+      topK: 40,
+      stFormatTemplates: {
+        wiFormat: 'WI: {0}',
+        outputSequence: 'Assistant:',
+      },
+    });
+
+    // upsertCustomPromptBlock + removeCustomPromptBlock
+    const blockSpec: CustomPromptBlockSpec = {
+      id: 'jailbreak_style',
+      name: 'Style Guide',
+      role: 'system',
+      injectionPosition: 'in_chat',
+      injectionDepth: 4,
+    };
+    const l3 = upsertCustomPromptBlock(
+      l2,
+      blockSpec,
+      'Write in present tense.',
+      true,
+      STOCK_SLICE_OF_LIFE_PACK
+    );
+    expect(l2.customPromptBlocks).toBeUndefined();
+    expect(l3.customPromptBlocks?.['jailbreak_style']).toEqual(blockSpec);
+    expect(l3.basePrompts?.['jailbreak_style']).toBe('Write in present tense.');
+    expect(l3.unlockedPromptSections?.['jailbreak_style']).toBe(true);
+    const txIdx = l3.syspromptSectionOrder!.indexOf('transcript_window');
+    const customIdx = l3.syspromptSectionOrder!.indexOf('jailbreak_style');
+    expect(customIdx).toBeGreaterThan(-1);
+    expect(customIdx).toBeLessThan(txIdx);
+
+    const l4 = removeCustomPromptBlock(l3, 'jailbreak_style');
+    expect(l3.customPromptBlocks?.['jailbreak_style']).toBeDefined();
+    expect(l4.customPromptBlocks?.['jailbreak_style']).toBeUndefined();
+    expect(l4.basePrompts?.['jailbreak_style']).toBeUndefined();
+    expect(l4.unlockedPromptSections?.['jailbreak_style']).toBeUndefined();
+    expect(l4.syspromptSectionOrder?.includes('jailbreak_style')).toBe(false);
+
+    // applySheetPreset
+    const pcOnly = applySheetPreset(l4, 'dnd-adventurer', 'pc');
+    expect(pcOnly.pcCoreSections).toEqual(SHEET_PRESETS['dnd-adventurer'].pcCoreSections);
+    expect(pcOnly.npcCoreSections).toBeUndefined();
+
+    const both = applySheetPreset(pcOnly, 'intimate-profile');
+    expect(both.pcCoreSections?.some((s) => s.id === 'sec_desires')).toBe(true);
+    expect(both.npcCoreSections?.some((s) => s.id === 'sec_desires')).toBe(true);
+
+    // Unknown preset is a safe no-op
+    const unknown = applySheetPreset(both, 'nonexistent-preset');
+    expect(unknown).toEqual(both);
   });
 });
 
 describe('Selective Payload Loader', () => {
-  it('defines metadata for all 6 PayloadGroupIds', () => {
+  it('defines metadata for all 7 PayloadGroupIds', () => {
     const ids = PAYLOAD_GROUP_DEFINITIONS.map((d) => d.id);
     expect(ids).toEqual([...ALL_PAYLOAD_GROUP_IDS]);
+    expect(ids).toContain('generation');
   });
 
   it('applies ONLY selected groups while keeping unselected user groups untouched', () => {
@@ -542,10 +754,13 @@ describe('Selective Payload Loader', () => {
       promptSections: false,
       combatRules: false,
       tuningDials: false,
+      generation: false,
     });
 
     const tacticalBundle = createPayloadBundleFromSystemPack(STOCK_TACTICAL_RPG_PACK, {
       tuningDials: { beatPressure: 'harsh' },
+      generation: { temperature: 0.55, presetName: 'Tactical Crisp' },
+      tokenBudgets: { world: 800 },
     });
     const tacticalDiffs = getPayloadBundleGroupDiffs(tacticalBundle, freeformBaseline);
 
@@ -555,7 +770,38 @@ describe('Selective Payload Loader', () => {
     expect(tacticalDiffs.promptSections).toBe(true);
     expect(tacticalDiffs.combatRules).toBe(false);
     expect(tacticalDiffs.tuningDials).toBe(true);
+    expect(tacticalDiffs.generation).toBe(true);
 
     expect(isPayloadGroupModified('tuningDials', tacticalBundle, freeformBaseline)).toBe(true);
+    expect(isPayloadGroupModified('generation', tacticalBundle, freeformBaseline)).toBe(true);
+  });
+
+  it('selectively imports and clears the generation payload group without touching other groups', () => {
+    const currentLayer: ControlRoomLayer = {
+      tuningDials: { beatPressure: 'generous' },
+      generation: { temperature: 0.9, presetName: 'Old Preset' },
+      tokenBudgets: { state: 500 },
+    };
+    const incomingBundle = createPayloadBundleFromSystemPack(STOCK_SLICE_OF_LIFE_PACK, {
+      generation: {
+        presetName: 'Imported Preset',
+        sourceFormat: 'st_text_completion',
+        temperature: 0.6,
+        stFormatTemplates: { storyString: '{{char}}: {{description}}' },
+      },
+      tokenBudgets: { state: 1000, totalMaxTokens: 7000 },
+    });
+
+    const imported = applySelectivePayloadGroups(currentLayer, incomingBundle, ['generation']);
+    expect(imported.generation).toEqual(incomingBundle.generation);
+    expect(imported.tokenBudgets).toEqual(incomingBundle.tokenBudgets);
+    expect(imported.tuningDials).toEqual({ beatPressure: 'generous' });
+
+    // Omitting generation in incoming bundle clears it when 'generation' is selected
+    const emptyGenBundle = createPayloadBundleFromSystemPack(STOCK_FREEFORM_PACK);
+    const cleared = applySelectivePayloadGroups(imported, emptyGenBundle, ['generation']);
+    expect(cleared.generation).toBeUndefined();
+    expect(cleared.tokenBudgets).toBeUndefined();
+    expect(cleared.tuningDials).toEqual({ beatPressure: 'generous' });
   });
 });

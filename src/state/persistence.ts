@@ -2,8 +2,20 @@
 import type { Dirent } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { type ControlRoomLayer, cloneControlRoomLayer } from '../config/control-room-config.js';
+import { type UserPersonaPreset, validateUserPersonaPreset } from '../config/persona-preset.js';
 import { type ValidationError, validationError } from '../core/errors.js';
-import { type Result, err, ok } from '../core/result.js';
+import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
+import {
+  type CharacterSectionDef,
+  validateCharacterSectionList,
+} from '../schema/character-sections.js';
+import {
+  type ConfirmPolicy,
+  type GameSystemModule,
+  validateConfirmPolicy,
+  validateGameSystemModule,
+} from '../schema/tracker-module.js';
 import type { AuditEntry } from './audit-log.js';
 import { CURRENT_STATE_SCHEMA_VERSION, migrateWorldStateDocument } from './migrations.js';
 import { PATCH_SOURCES } from './patch.js';
@@ -53,7 +65,10 @@ export interface InitSaveManifestInput {
 export interface InitSaveOptions {
   worldState?: WorldState;
   beatLedger?: Record<string, unknown>;
+  combatState?: Record<string, unknown> | null;
   swipeTree?: SwipeTreeState;
+  userControlRoomLayer?: ControlRoomLayer;
+  activePersona?: UserPersonaPreset | null;
 }
 
 export interface CheckpointSnapshot {
@@ -61,6 +76,7 @@ export interface CheckpointSnapshot {
   worldState: WorldState;
   beatLedger: Record<string, unknown>;
   stateHash: string;
+  combatState?: Record<string, unknown> | null;
 }
 
 export interface LoadedSessionSave {
@@ -70,6 +86,8 @@ export interface LoadedSessionSave {
   events: EventLogRecord[];
   auditEntries: AuditEntry[];
   swipeTree: SwipeTreeState | null;
+  userControlRoomLayer?: ControlRoomLayer | null;
+  activePersona?: UserPersonaPreset | null;
   recoveredPartialLines: {
     events: boolean;
     audit: boolean;
@@ -130,6 +148,450 @@ function containsForbiddenKeys(value: unknown): boolean {
     }
   }
   return false;
+}
+
+function cloneJsonSafeValue(value: unknown, pathLabel: string): Result<unknown, ValidationError[]> {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return ok(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return err([
+        validationError(pathLabel, 'INVALID_NUMBER', `${pathLabel} must be a finite JSON-safe number`),
+      ]);
+    }
+    return ok(value === 0 ? 0 : value);
+  }
+  if (Array.isArray(value)) {
+    const arr: unknown[] = [];
+    for (let i = 0; i < value.length; i += 1) {
+      const rawItem = value[i];
+      if (rawItem === undefined) {
+        return err([
+          validationError(`${pathLabel}[${i}]`, 'INVALID_TYPE', `${pathLabel}[${i}] must be JSON-safe`),
+        ]);
+      }
+      const itemRes = cloneJsonSafeValue(rawItem, `${pathLabel}[${i}]`);
+      if (!itemRes.ok) {
+        return itemRes;
+      }
+      arr.push(itemRes.value);
+    }
+    return ok(arr);
+  }
+  if (typeof value === 'object') {
+    if (!isPlainObject(value)) {
+      return err([
+        validationError(pathLabel, 'INVALID_TYPE', `${pathLabel} must be a plain JSON-safe object`),
+      ]);
+    }
+    const out: Record<string, unknown> = {};
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (!isSafeKey(key)) {
+        return err([
+          validationError(`${pathLabel}.${key}`, 'UNSAFE_KEY', `Forbidden key "${key}" at ${pathLabel}`),
+        ]);
+      }
+      const rawChild = Object.getOwnPropertyDescriptor(value, key)?.value;
+      if (rawChild === undefined) {
+        continue;
+      }
+      const childRes = cloneJsonSafeValue(rawChild, `${pathLabel}.${key}`);
+      if (!childRes.ok) {
+        return childRes;
+      }
+      setOwn(out, key, childRes.value);
+    }
+    return ok(out);
+  }
+  return err([
+    validationError(
+      pathLabel,
+      'INVALID_TYPE',
+      `${pathLabel} must be a JSON-safe value (got ${typeof value})`
+    ),
+  ]);
+}
+
+function validateCombatStateField(
+  combatState: unknown,
+  pathLabel: string
+): Result<Record<string, unknown> | null | undefined, ValidationError[]> {
+  if (combatState === undefined) {
+    return ok(undefined);
+  }
+  if (combatState === null) {
+    return ok(null);
+  }
+  if (!isPlainObject(combatState)) {
+    return err([
+      validationError(
+        pathLabel,
+        'INVALID_TYPE',
+        `${pathLabel} must be a safe plain object, null, or undefined`
+      ),
+    ]);
+  }
+  const cloned = cloneJsonSafeValue(combatState, pathLabel);
+  if (!cloned.ok) {
+    return cloned;
+  }
+  return ok(cloned.value as Record<string, unknown>);
+}
+
+const GENERATION_NUMERIC_FIELD_KEYS = [
+  'temperature',
+  'maxTokens',
+  'maxContextTokens',
+  'topP',
+  'topK',
+  'minP',
+  'topA',
+  'typicalP',
+  'tfs',
+  'frequencyPenalty',
+  'presencePenalty',
+  'repetitionPenalty',
+  'seed',
+] as const;
+
+const TOKEN_BUDGET_FIELD_KEYS = [
+  'system',
+  'card',
+  'state',
+  'combatOutcome',
+  'plot',
+  'world',
+  'totalMaxTokens',
+] as const;
+
+function validateControlRoomLayer(
+  raw: unknown,
+  pathLabel: string
+): Result<ControlRoomLayer, ValidationError[]> {
+  if (!isPlainObject(raw)) {
+    return err([validationError(pathLabel, 'INVALID_TYPE', `${pathLabel} must be a plain object`)]);
+  }
+  if (containsForbiddenKeys(raw)) {
+    return err([
+      validationError(
+        pathLabel,
+        'UNSAFE_KEY',
+        `${pathLabel} contains forbidden prototype-polluting keys`
+      ),
+    ]);
+  }
+
+  const acc = new ErrorAccumulator(pathLabel);
+
+  const capabilities = getOwn(raw, 'capabilities');
+  if (capabilities !== undefined) {
+    if (!isPlainObject(capabilities)) {
+      acc.add('capabilities', 'INVALID_TYPE', 'capabilities must be a plain object');
+    } else {
+      for (const boolKey of ['factions', 'beats', 'relationships', 'chronicle'] as const) {
+        const val = getOwn(capabilities, boolKey);
+        if (val !== undefined && typeof val !== 'boolean') {
+          acc.add(`capabilities.${boolKey}`, 'INVALID_TYPE', `${boolKey} must be a boolean`);
+        }
+      }
+      for (const strKey of ['spatialMode', 'combatMode', 'progression', 'clocks'] as const) {
+        const val = getOwn(capabilities, strKey);
+        if (val !== undefined && typeof val !== 'string') {
+          acc.add(`capabilities.${strKey}`, 'INVALID_TYPE', `${strKey} must be a string`);
+        }
+      }
+    }
+  }
+
+  const pcCoreSections = getOwn(raw, 'pcCoreSections');
+  if (pcCoreSections !== undefined) {
+    acc.absorb(
+      validateCharacterSectionList(pcCoreSections as CharacterSectionDef[], 'pcCoreSections')
+    );
+  }
+
+  const npcCoreSections = getOwn(raw, 'npcCoreSections');
+  if (npcCoreSections !== undefined) {
+    acc.absorb(
+      validateCharacterSectionList(npcCoreSections as CharacterSectionDef[], 'npcCoreSections')
+    );
+  }
+
+  const sectionConfirmPolicies = getOwn(raw, 'sectionConfirmPolicies');
+  if (sectionConfirmPolicies !== undefined) {
+    if (!isPlainObject(sectionConfirmPolicies)) {
+      acc.add(
+        'sectionConfirmPolicies',
+        'INVALID_TYPE',
+        'sectionConfirmPolicies must be a plain object'
+      );
+    } else {
+      for (const target of ['pc', 'npc'] as const) {
+        const targetMap = getOwn(sectionConfirmPolicies, target);
+        if (targetMap !== undefined) {
+          if (!isPlainObject(targetMap)) {
+            acc.add(
+              `sectionConfirmPolicies.${target}`,
+              'INVALID_TYPE',
+              `sectionConfirmPolicies.${target} must be a plain object`
+            );
+          } else {
+            for (const secKey of Object.keys(targetMap)) {
+              const policy = getOwn(targetMap, secKey);
+              if (policy !== undefined) {
+                acc.absorb(
+                  validateConfirmPolicy(
+                    policy as ConfirmPolicy,
+                    `sectionConfirmPolicies.${target}.${secKey}`
+                  )
+                );
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const gameSystems = getOwn(raw, 'gameSystems');
+  if (gameSystems !== undefined) {
+    if (!Array.isArray(gameSystems)) {
+      acc.add('gameSystems', 'INVALID_TYPE', 'gameSystems must be an array');
+    } else {
+      for (let i = 0; i < gameSystems.length; i += 1) {
+        acc.absorb(
+          validateGameSystemModule(gameSystems[i] as GameSystemModule, `gameSystems[${i}]`)
+        );
+      }
+    }
+  }
+
+  const gameSystemOverrides = getOwn(raw, 'gameSystemOverrides');
+  if (gameSystemOverrides !== undefined) {
+    if (!isPlainObject(gameSystemOverrides)) {
+      acc.add('gameSystemOverrides', 'INVALID_TYPE', 'gameSystemOverrides must be a plain object');
+    } else {
+      for (const modId of Object.keys(gameSystemOverrides)) {
+        const modOverride = getOwn(gameSystemOverrides, modId);
+        if (modOverride !== undefined) {
+          if (!isPlainObject(modOverride)) {
+            acc.add(
+              `gameSystemOverrides.${modId}`,
+              'INVALID_TYPE',
+              'GameSystemModuleOverride must be a plain object'
+            );
+            continue;
+          }
+          const fields = getOwn(modOverride, 'fields');
+          if (fields !== undefined && !isPlainObject(fields)) {
+            acc.add(
+              `gameSystemOverrides.${modId}.fields`,
+              'INVALID_TYPE',
+              'fields must be a plain object'
+            );
+          }
+          const fieldConfirmPolicies = getOwn(modOverride, 'fieldConfirmPolicies');
+          if (fieldConfirmPolicies !== undefined && !isPlainObject(fieldConfirmPolicies)) {
+            acc.add(
+              `gameSystemOverrides.${modId}.fieldConfirmPolicies`,
+              'INVALID_TYPE',
+              'fieldConfirmPolicies must be a plain object'
+            );
+          }
+          const ui = getOwn(modOverride, 'ui');
+          if (ui !== undefined && !isPlainObject(ui)) {
+            acc.add(
+              `gameSystemOverrides.${modId}.ui`,
+              'INVALID_TYPE',
+              'ui must be a plain object'
+            );
+          }
+        }
+      }
+    }
+  }
+
+  for (const listKey of ['blockOrder', 'syspromptSectionOrder'] as const) {
+    const listVal = getOwn(raw, listKey);
+    if (listVal !== undefined) {
+      if (!Array.isArray(listVal) || !listVal.every((item) => typeof item === 'string')) {
+        acc.add(listKey, 'INVALID_TYPE', `${listKey} must be an array of strings`);
+      }
+    }
+  }
+
+  const basePrompts = getOwn(raw, 'basePrompts');
+  if (basePrompts !== undefined) {
+    if (!isPlainObject(basePrompts)) {
+      acc.add('basePrompts', 'INVALID_TYPE', 'basePrompts must be a plain object');
+    } else {
+      for (const key of Object.keys(basePrompts)) {
+        const val = getOwn(basePrompts, key);
+        if (val !== undefined && typeof val !== 'string') {
+          acc.add(`basePrompts.${key}`, 'INVALID_TYPE', `basePrompts.${key} must be a string`);
+        }
+      }
+    }
+  }
+
+  const unlockedPromptSections = getOwn(raw, 'unlockedPromptSections');
+  if (unlockedPromptSections !== undefined) {
+    if (!isPlainObject(unlockedPromptSections)) {
+      acc.add(
+        'unlockedPromptSections',
+        'INVALID_TYPE',
+        'unlockedPromptSections must be a plain object'
+      );
+    } else {
+      for (const key of Object.keys(unlockedPromptSections)) {
+        const val = getOwn(unlockedPromptSections, key);
+        if (val !== undefined && typeof val !== 'boolean') {
+          acc.add(
+            `unlockedPromptSections.${key}`,
+            'INVALID_TYPE',
+            `unlockedPromptSections.${key} must be a boolean`
+          );
+        }
+      }
+    }
+  }
+
+  const customPromptBlocks = getOwn(raw, 'customPromptBlocks');
+  if (customPromptBlocks !== undefined) {
+    if (!isPlainObject(customPromptBlocks)) {
+      acc.add('customPromptBlocks', 'INVALID_TYPE', 'customPromptBlocks must be a plain object');
+    } else {
+      for (const blockKey of Object.keys(customPromptBlocks)) {
+        const block = getOwn(customPromptBlocks, blockKey);
+        if (!isPlainObject(block)) {
+          acc.add(
+            `customPromptBlocks.${blockKey}`,
+            'INVALID_TYPE',
+            'CustomPromptBlockSpec must be a plain object'
+          );
+          continue;
+        }
+        if (typeof getOwn(block, 'id') !== 'string') {
+          acc.add(`customPromptBlocks.${blockKey}.id`, 'INVALID_TYPE', 'id must be a string');
+        }
+        if (typeof getOwn(block, 'name') !== 'string') {
+          acc.add(`customPromptBlocks.${blockKey}.name`, 'INVALID_TYPE', 'name must be a string');
+        }
+        const role = getOwn(block, 'role');
+        if (role !== 'system' && role !== 'user' && role !== 'assistant') {
+          acc.add(
+            `customPromptBlocks.${blockKey}.role`,
+            'INVALID_ENUM',
+            'role must be system, user, or assistant'
+          );
+        }
+      }
+    }
+  }
+
+  const combatRules = getOwn(raw, 'combatRules');
+  if (combatRules !== undefined) {
+    if (!isPlainObject(combatRules)) {
+      acc.add('combatRules', 'INVALID_TYPE', 'combatRules must be a plain object');
+    } else {
+      const customRules = getOwn(combatRules, 'customRules');
+      if (customRules !== undefined && !isPlainObject(customRules)) {
+        acc.add('combatRules.customRules', 'INVALID_TYPE', 'customRules must be a plain object');
+      }
+      const skillOverrides = getOwn(combatRules, 'skillOverrides');
+      if (skillOverrides !== undefined && !isPlainObject(skillOverrides)) {
+        acc.add(
+          'combatRules.skillOverrides',
+          'INVALID_TYPE',
+          'skillOverrides must be a plain object'
+        );
+      }
+    }
+  }
+
+  const tuningDials = getOwn(raw, 'tuningDials');
+  if (tuningDials !== undefined && !isPlainObject(tuningDials)) {
+    acc.add('tuningDials', 'INVALID_TYPE', 'tuningDials must be a plain object');
+  }
+
+  const generation = getOwn(raw, 'generation');
+  if (generation !== undefined) {
+    if (!isPlainObject(generation)) {
+      acc.add('generation', 'INVALID_TYPE', 'generation must be a plain object');
+    } else {
+      for (const numKey of GENERATION_NUMERIC_FIELD_KEYS) {
+        const val = getOwn(generation, numKey);
+        if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val))) {
+          acc.add(
+            `generation.${numKey}`,
+            'INVALID_NUMBER',
+            `generation.${numKey} must be a finite number`
+          );
+        }
+      }
+      const stopSequences = getOwn(generation, 'stopSequences');
+      if (
+        stopSequences !== undefined &&
+        (!Array.isArray(stopSequences) || !stopSequences.every((s) => typeof s === 'string'))
+      ) {
+        acc.add(
+          'generation.stopSequences',
+          'INVALID_TYPE',
+          'generation.stopSequences must be an array of strings'
+        );
+      }
+      const stFormatTemplates = getOwn(generation, 'stFormatTemplates');
+      if (stFormatTemplates !== undefined && !isPlainObject(stFormatTemplates)) {
+        acc.add(
+          'generation.stFormatTemplates',
+          'INVALID_TYPE',
+          'generation.stFormatTemplates must be a plain object'
+        );
+      }
+      const presetName = getOwn(generation, 'presetName');
+      if (presetName !== undefined && typeof presetName !== 'string') {
+        acc.add('generation.presetName', 'INVALID_TYPE', 'generation.presetName must be a string');
+      }
+      const sourceFormat = getOwn(generation, 'sourceFormat');
+      if (
+        sourceFormat !== undefined &&
+        sourceFormat !== 'st_chat_completion' &&
+        sourceFormat !== 'st_text_completion' &&
+        sourceFormat !== 'referee'
+      ) {
+        acc.add(
+          'generation.sourceFormat',
+          'INVALID_ENUM',
+          'generation.sourceFormat must be st_chat_completion, st_text_completion, or referee'
+        );
+      }
+    }
+  }
+
+  const tokenBudgets = getOwn(raw, 'tokenBudgets');
+  if (tokenBudgets !== undefined) {
+    if (!isPlainObject(tokenBudgets)) {
+      acc.add('tokenBudgets', 'INVALID_TYPE', 'tokenBudgets must be a plain object');
+    } else {
+      for (const budgetKey of TOKEN_BUDGET_FIELD_KEYS) {
+        const val = getOwn(tokenBudgets, budgetKey);
+        if (val !== undefined && (typeof val !== 'number' || !Number.isFinite(val))) {
+          acc.add(
+            `tokenBudgets.${budgetKey}`,
+            'INVALID_NUMBER',
+            `tokenBudgets.${budgetKey} must be a finite number`
+          );
+        }
+      }
+    }
+  }
+
+  if (acc.hasErrors()) {
+    return err([...acc.errors]);
+  }
+
+  return ok(cloneControlRoomLayer(raw as ControlRoomLayer));
 }
 
 function parseJsonSafe(rawText: string, pathLabel: string): Result<unknown, ValidationError[]> {
@@ -638,7 +1100,8 @@ export async function initSaveDirectory(
       saveDir,
       manifest.currentTurn,
       initialOptions.worldState,
-      initialOptions.beatLedger ?? {}
+      initialOptions.beatLedger ?? {},
+      initialOptions.combatState
     );
     if (!cpRes.ok) {
       return err(cpRes.error);
@@ -649,6 +1112,20 @@ export async function initSaveDirectory(
     const treeRes = await saveSwipeTreeAtomic(saveDir, initialOptions.swipeTree);
     if (!treeRes.ok) {
       return err(treeRes.error);
+    }
+  }
+
+  if (initialOptions?.userControlRoomLayer !== undefined) {
+    const crRes = await saveControlRoomLayerAtomic(saveDir, initialOptions.userControlRoomLayer);
+    if (!crRes.ok) {
+      return err(crRes.error);
+    }
+  }
+
+  if (initialOptions?.activePersona !== undefined) {
+    const personaRes = await saveActivePersonaAtomic(saveDir, initialOptions.activePersona);
+    if (!personaRes.ok) {
+      return err(personaRes.error);
     }
   }
 
@@ -663,7 +1140,8 @@ export async function saveCheckpointAtomic(
   saveDir: string,
   turn: number,
   worldState: WorldState,
-  beatLedger: Record<string, unknown> = {}
+  beatLedger: Record<string, unknown> = {},
+  combatState?: Record<string, unknown> | null
 ): Promise<Result<{ path: string; snapshot: CheckpointSnapshot }, ValidationError[]>> {
   if (typeof saveDir !== 'string' || saveDir.trim().length === 0) {
     return err([validationError('saveDir', 'REQUIRED', 'saveDir must be a non-empty string')]);
@@ -677,18 +1155,25 @@ export async function saveCheckpointAtomic(
     ]);
   }
 
+  const combatRes = validateCombatStateField(combatState, 'combatState');
+  if (!combatRes.ok) {
+    return err(combatRes.error);
+  }
+  const validatedCombatState = combatRes.value;
+
   const wsValidation = validateWorldState(worldState);
   if (!wsValidation.ok) {
     return err(wsValidation.error);
   }
 
   const validState = wsValidation.value.state;
-  const stateHash = computeStateHash(validState, beatLedger);
+  const stateHash = computeStateHash(validState, beatLedger, validatedCombatState);
   const snapshot: CheckpointSnapshot = {
     turn,
     worldState: validState,
     beatLedger,
     stateHash,
+    ...(validatedCombatState !== undefined ? { combatState: validatedCombatState } : {}),
   };
 
   const targetPath = path.join(saveDir, 'checkpoints', formatCheckpointFilename(turn));
@@ -696,6 +1181,57 @@ export async function saveCheckpointAtomic(
   await maybeUpdateManifestTurn(saveDir, turn);
 
   return ok({ path: targetPath, snapshot });
+}
+
+/**
+ * Atomically persist the session's user {@link ControlRoomLayer} to `control-room.json`
+ * via `.tmp` + `fsync` + `rename`, rejecting prototype-polluting keys or invalid structures.
+ */
+export async function saveControlRoomLayerAtomic(
+  saveDir: string,
+  layer: ControlRoomLayer
+): Promise<Result<void, ValidationError[]>> {
+  if (typeof saveDir !== 'string' || saveDir.trim().length === 0) {
+    return err([validationError('saveDir', 'REQUIRED', 'saveDir must be a non-empty string')]);
+  }
+  const validated = validateControlRoomLayer(layer, 'layer');
+  if (!validated.ok) {
+    return err(validated.error);
+  }
+  await atomicWriteJson(path.join(saveDir, 'control-room.json'), validated.value);
+  return ok(undefined);
+}
+
+/**
+ * Atomically persist the session's active {@link UserPersonaPreset} (or `null` when cleared)
+ * to `persona.json` via `.tmp` + `fsync` + `rename`.
+ */
+export async function saveActivePersonaAtomic(
+  saveDir: string,
+  persona: UserPersonaPreset | null
+): Promise<Result<void, ValidationError[]>> {
+  if (typeof saveDir !== 'string' || saveDir.trim().length === 0) {
+    return err([validationError('saveDir', 'REQUIRED', 'saveDir must be a non-empty string')]);
+  }
+  if (persona === null) {
+    await atomicWriteJson(path.join(saveDir, 'persona.json'), null);
+    return ok(undefined);
+  }
+  if (containsForbiddenKeys(persona)) {
+    return err([
+      validationError(
+        'persona',
+        'UNSAFE_KEY',
+        'UserPersonaPreset contains forbidden prototype-polluting keys'
+      ),
+    ]);
+  }
+  const validated = validateUserPersonaPreset(persona);
+  if (!validated.ok) {
+    return err(validated.error);
+  }
+  await atomicWriteJson(path.join(saveDir, 'persona.json'), validated.value);
+  return ok(undefined);
 }
 
 /**
@@ -880,6 +1416,7 @@ export async function loadSessionSave(
       const rawWorldState = getOwn(parsed.value, 'worldState');
       const rawBeatLedger = getOwn(parsed.value, 'beatLedger') ?? {};
       const stateHash = getOwn(parsed.value, 'stateHash');
+      const rawCombatState = getOwn(parsed.value, 'combatState');
 
       if (typeof turn !== 'number' || !Number.isInteger(turn) || turn < 0) {
         return err([
@@ -904,6 +1441,19 @@ export async function loadSessionSave(
           ),
         ]);
       }
+      if (
+        rawCombatState !== undefined &&
+        rawCombatState !== null &&
+        !isPlainObject(rawCombatState)
+      ) {
+        return err([
+          validationError(
+            `${fileName}.combatState`,
+            'INVALID_TYPE',
+            'Snapshot combatState must be a plain object or null'
+          ),
+        ]);
+      }
 
       const migratedWs = migrateWorldStateDocument(rawWorldState);
       if (!migratedWs.ok) {
@@ -915,6 +1465,9 @@ export async function loadSessionSave(
         worldState: migratedWs.value.worldState,
         beatLedger: rawBeatLedger,
         stateHash,
+        ...(rawCombatState !== undefined
+          ? { combatState: rawCombatState as Record<string, unknown> | null }
+          : {}),
       });
     }
   }
@@ -962,6 +1515,43 @@ export async function loadSessionSave(
     swipeTree = validatedTree.value;
   }
 
+  // Load control-room.json if present (legacy saves without it load with null)
+  let userControlRoomLayer: ControlRoomLayer | null = null;
+  const controlRoomPath = path.join(saveDir, 'control-room.json');
+  if (await fileExists(controlRoomPath)) {
+    const rawControlRoomText = await fs.readFile(controlRoomPath, 'utf8');
+    const parsedControlRoom = parseJsonSafe(rawControlRoomText, 'control-room.json');
+    if (!parsedControlRoom.ok) {
+      return err(parsedControlRoom.error);
+    }
+    const validatedControlRoom = validateControlRoomLayer(
+      parsedControlRoom.value,
+      'control-room.json'
+    );
+    if (!validatedControlRoom.ok) {
+      return err(validatedControlRoom.error);
+    }
+    userControlRoomLayer = validatedControlRoom.value;
+  }
+
+  // Load persona.json if present (legacy saves without it load with null)
+  let activePersona: UserPersonaPreset | null = null;
+  const personaPath = path.join(saveDir, 'persona.json');
+  if (await fileExists(personaPath)) {
+    const rawPersonaText = await fs.readFile(personaPath, 'utf8');
+    const parsedPersona = parseJsonSafe(rawPersonaText, 'persona.json');
+    if (!parsedPersona.ok) {
+      return err(parsedPersona.error);
+    }
+    if (parsedPersona.value !== null) {
+      const validatedPersona = validateUserPersonaPreset(parsedPersona.value);
+      if (!validatedPersona.ok) {
+        return err(validatedPersona.error);
+      }
+      activePersona = validatedPersona.value;
+    }
+  }
+
   return ok({
     manifest,
     latestCheckpoint,
@@ -969,6 +1559,8 @@ export async function loadSessionSave(
     events: eventsRes.value.records,
     auditEntries: auditRes.value.records,
     swipeTree,
+    userControlRoomLayer,
+    activePersona,
     recoveredPartialLines: {
       events: eventsRes.value.recoveredPartialLine,
       audit: auditRes.value.recoveredPartialLine,
@@ -1121,10 +1713,12 @@ export async function branchSave(
 
   let branchSnapshotState: WorldState | undefined;
   let branchBeatLedger: Record<string, unknown> = {};
+  let branchCombatState: Record<string, unknown> | null | undefined;
 
   if (baseCheckpoint.turn === atTurn) {
     branchSnapshotState = baseCheckpoint.worldState;
     branchBeatLedger = baseCheckpoint.beatLedger;
+    branchCombatState = baseCheckpoint.combatState;
   } else {
     const deltaEvents = eventsUpToTurn.filter((ev) => ev.turn > baseCheckpoint.turn);
     const replayRes = replayFromEvents(baseCheckpoint.worldState, deltaEvents, {
@@ -1135,6 +1729,7 @@ export async function branchSave(
     }
     branchSnapshotState = replayRes.value.finalState;
     branchBeatLedger = baseCheckpoint.beatLedger;
+    branchCombatState = baseCheckpoint.combatState;
   }
 
   const initRes = await initSaveDirectory(targetDir, {
@@ -1156,7 +1751,8 @@ export async function branchSave(
       targetDir,
       cp.turn,
       cp.worldState,
-      cp.beatLedger
+      cp.beatLedger,
+      cp.combatState
     );
     if (!cpSaveRes.ok) {
       return err(cpSaveRes.error);
@@ -1168,7 +1764,8 @@ export async function branchSave(
       targetDir,
       atTurn,
       branchSnapshotState,
-      branchBeatLedger
+      branchBeatLedger,
+      branchCombatState
     );
     if (!branchCpRes.ok) {
       return err(branchCpRes.error);
@@ -1192,6 +1789,20 @@ export async function branchSave(
     const treeRes = await saveSwipeTreeAtomic(targetDir, prunedTree);
     if (!treeRes.ok) {
       return err(treeRes.error);
+    }
+  }
+
+  if (loaded.userControlRoomLayer !== null && loaded.userControlRoomLayer !== undefined) {
+    const crRes = await saveControlRoomLayerAtomic(targetDir, loaded.userControlRoomLayer);
+    if (!crRes.ok) {
+      return err(crRes.error);
+    }
+  }
+
+  if (await fileExists(path.join(sourceDir, 'persona.json'))) {
+    const personaRes = await saveActivePersonaAtomic(targetDir, loaded.activePersona ?? null);
+    if (!personaRes.ok) {
+      return err(personaRes.error);
     }
   }
 

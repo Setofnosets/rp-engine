@@ -120,6 +120,26 @@ describe('PR-5.2 SillyTavern Card Importer & Lossy Exporter', () => {
     expect(bundle.card.persona.name).toBe('Elena Vance');
     expect(bundle.card.persona.description).toContain('Midnight Library');
     expect(bundle.card.persona.description).toContain('Composed, inquisitive, guarded');
+    expect(bundle.initialEntities?.characters?.['elena_vance']).toEqual({
+      id: 'elena_vance',
+      name: 'Elena Vance',
+      status: 'active',
+      presentInScene: true,
+      locationId: null,
+      formId: null,
+      formGroup: null,
+      sections: {
+        sec_personality: 'Composed, inquisitive, guarded',
+        sec_background: 'A sharp-eyed archivist at the Midnight Library.',
+      },
+      customFields: {},
+      abilities: [],
+      goals: [],
+      agenda: '',
+      allegiance: '',
+      mood: 'neutral',
+      traits: [],
+    });
     expect(bundle.beats).toHaveLength(1);
     expect(bundle.beats[0]!.class).toBe('ambient');
     expect(bundle.beats[0]!.priority).toBe(25);
@@ -178,6 +198,12 @@ describe('PR-5.2 SillyTavern Card Importer & Lossy Exporter', () => {
 
     expect(imported.value.card.persona.name).toBe('Preferred V3 Heroine');
     expect(imported.value.card.recommendedSystemPack).toBe('stock-freeform');
+    const seededHeroine = imported.value.initialEntities?.characters?.['preferred_v3_heroine'];
+    expect(seededHeroine).toBeDefined();
+    expect(seededHeroine?.presentInScene).toBe(true);
+    expect(seededHeroine?.status).toBe('active');
+    expect(seededHeroine?.sections['sec_personality']).toBeUndefined();
+    expect(seededHeroine?.sections['sec_background']).toBe('V3 description with UTF-8 accents: café.');
     expect(imported.value.beats).toHaveLength(1);
     expect(imported.value.beats[0]!.priority).toBe(10);
     expect(imported.value.beats[0]!.when).toEqual({ mentions: ['café'] });
@@ -234,6 +260,48 @@ describe('PR-5.2 SillyTavern Card Importer & Lossy Exporter', () => {
     expect(isErr(truncRes)).toBe(true);
     if (truncRes.ok) return;
     expect(truncRes.error[0]?.code).toBe('TRUNCATED_PNG_CHUNK');
+  });
+
+  it('sanitizes unsafe character slugs to safe fallback IDs and bounds oversized sec_background', () => {
+    const unsafeNameCard = {
+      name: 'constructor',
+      description: 'X'.repeat(1500),
+      personality: '   ',
+    };
+    const res = importSillyTavernCard(unsafeNameCard);
+    expect(isOk(res)).toBe(true);
+    if (!res.ok) return;
+
+    const characters = res.value.initialEntities?.characters ?? {};
+    expect(Object.hasOwn(characters, 'constructor')).toBe(false);
+    expect(Object.hasOwn(characters, '__proto__')).toBe(false);
+    expect(Object.hasOwn(characters, 'prototype')).toBe(false);
+
+    const fallbackId = res.value.card.id;
+    expect(fallbackId).toBe('imported-st-card');
+    const seeded = characters[fallbackId];
+    expect(seeded).toBeDefined();
+    expect(seeded?.id).toBe(fallbackId);
+    expect(seeded?.name).toBe('constructor');
+    expect(seeded?.presentInScene).toBe(true);
+    expect(seeded?.status).toBe('active');
+    expect(seeded?.sections['sec_personality']).toBeUndefined();
+    const bg = seeded?.sections['sec_background'];
+    expect(typeof bg).toBe('string');
+    expect((bg as string).length).toBeLessThanOrEqual(1200);
+    expect((bg as string).endsWith('...')).toBe(true);
+    expect(isOk(validateCartridgeStructure(res.value))).toBe(true);
+
+    const emptyDescCard = {
+      name: '__proto__',
+      description: '   ',
+    };
+    const protoRes = importSillyTavernCard(emptyDescCard);
+    expect(isOk(protoRes)).toBe(true);
+    if (!protoRes.ok) return;
+    const protoChars = protoRes.value.initialEntities?.characters ?? {};
+    expect(Object.hasOwn(protoChars, '__proto__')).toBe(false);
+    expect(protoChars[protoRes.value.card.id]?.sections).toEqual({});
   });
 });
 

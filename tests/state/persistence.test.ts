@@ -3,9 +3,12 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { type ControlRoomLayer } from '../../src/config/control-room-config.js';
+import { type UserPersonaPreset } from '../../src/config/persona-preset.js';
 import { nextInt } from '../../src/core/prng.js';
 import { isErr, isOk } from '../../src/core/result.js';
 import { STOCK_TACTICAL_RPG_PACK } from '../../src/schema/stock-system-packs.js';
+import { type GameSystemModule } from '../../src/schema/tracker-module.js';
 import { type AuditEntry } from '../../src/state/audit-log.js';
 import { type PatchBatch } from '../../src/state/patch.js';
 import {
@@ -16,7 +19,9 @@ import {
   formatCheckpointFilename,
   initSaveDirectory,
   loadSessionSave,
+  saveActivePersonaAtomic,
   saveCheckpointAtomic,
+  saveControlRoomLayerAtomic,
   saveSwipeTreeAtomic,
 } from '../../src/state/persistence.js';
 import { applyPatchBatch } from '../../src/state/reducer.js';
@@ -563,5 +568,351 @@ describe('Persistence, Crash Recovery, Branching & 30-Turn Replay', () => {
     expect(loaded.value.latestCheckpoint?.worldState.entities.characters['npc_1']?.name).toBe(
       'Mara'
     );
+    expect(loaded.value.latestCheckpoint?.combatState).toBeUndefined();
+    expect(loaded.value.userControlRoomLayer).toBeNull();
+    expect(loaded.value.activePersona).toBeNull();
+  });
+
+  it('persists and reloads userControlRoomLayer (generation & custom GameSystemModule), activePersona, and checkpoint combatState', async () => {
+    const saveDir = path.join(tempRoot, 'extended-session');
+    const ws0 = makeInitialSimulationState('extended-session');
+
+    const customModule: GameSystemModule = {
+      id: 'sanity_meter',
+      name: 'Sanity Meter',
+      description: 'Tracks eldritch dread.',
+      enabled: true,
+      scope: 'session',
+      target: 'player',
+      effectOwner: 'tracker',
+      cadence: 'every_turn',
+      fields: {
+        sanity: {
+          type: 'meter',
+          min: 0,
+          max: 100,
+          default: 85,
+          writableByTracker: true,
+          confirmPolicy: 'auto',
+        },
+      },
+      trackerInstruction: 'Adjust sanity when encountering eldritch phenomena.',
+      narratorRule: 'Reflect low sanity in sensory descriptions.',
+      ui: { widget: 'bar', order: 1 },
+    };
+
+    const userLayer: ControlRoomLayer = {
+      capabilities: {
+        combatMode: 'tactical_grid',
+        beats: true,
+      },
+      gameSystems: [customModule],
+      tuningDials: {
+        beatPressure: 'harsh',
+        narrativePacing: 'slow_burn',
+        cyoaEnabled: true,
+      },
+      generation: {
+        presetName: 'Gritty Noir',
+        sourceFormat: 'st_chat_completion',
+        temperature: 0.72,
+        topP: 0.92,
+        topK: 40,
+        minP: 0.05,
+        repetitionPenalty: 1.12,
+        stopSequences: ['\nUser:', '<|im_end|>'],
+        stFormatTemplates: {
+          scenarioFormat: '[Scenario: {{scenario}}]',
+        },
+      },
+    };
+
+    const activePersona: UserPersonaPreset = {
+      id: 'persona-kestrel',
+      name: 'Kestrel',
+      description: 'Ex-cartographer carrying a brass astrolabe.',
+      characterId: 'rowan',
+      sections: {
+        sec_appearance: 'Ink-stained gloves and a hooded oilcloth coat.',
+      },
+      customFields: {
+        reputation_guild: 3,
+      },
+      resources: {
+        hp: { current: 18, max: 20 },
+      },
+      progression: {
+        level: 3,
+        xp: 450,
+        className: 'Surveyor',
+      },
+    };
+
+    const initialCombatState: Record<string, unknown> = {
+      active: true,
+      round: 2,
+      turnOrder: ['rowan', 'vesper'],
+      activeActorId: 'rowan',
+      grid: { width: 8, height: 8 },
+    };
+
+    const initRes = await initSaveDirectory(
+      saveDir,
+      {
+        sessionId: 'extended-session',
+        cartridgeId: 'cart-noir',
+        systemPackId: 'tactical-rpg',
+      },
+      {
+        worldState: ws0,
+        combatState: initialCombatState,
+        userControlRoomLayer: userLayer,
+        activePersona,
+      }
+    );
+    expect(isOk(initRes)).toBe(true);
+
+    // Save a subsequent checkpoint with updated combatState and verify atomic overwrite
+    const nextCombatState: Record<string, unknown> = {
+      active: false,
+      round: 4,
+      winnerTeam: 'player',
+    };
+    const cp1Res = await saveCheckpointAtomic(saveDir, 1, ws0, { beat1: true }, nextCombatState);
+    expect(isOk(cp1Res)).toBe(true);
+    if (cp1Res.ok) {
+      expect(cp1Res.value.snapshot.combatState).toEqual(nextCombatState);
+      expect(cp1Res.value.snapshot.stateHash).toBe(
+        computeStateHash(ws0, { beat1: true }, nextCombatState)
+      );
+    }
+
+    const loadedRes = await loadSessionSave(saveDir);
+    expect(isOk(loadedRes)).toBe(true);
+    if (!loadedRes.ok) return;
+
+    expect(loadedRes.value.userControlRoomLayer).toEqual(userLayer);
+    expect(loadedRes.value.activePersona).toEqual(activePersona);
+    expect(loadedRes.value.checkpoints[0]?.combatState).toEqual(initialCombatState);
+    expect(loadedRes.value.latestCheckpoint?.turn).toBe(1);
+    expect(loadedRes.value.latestCheckpoint?.combatState).toEqual(nextCombatState);
+
+    // Clear activePersona cleanly via saveActivePersonaAtomic(dir, null) and verify reload
+    const clearRes = await saveActivePersonaAtomic(saveDir, null);
+    expect(isOk(clearRes)).toBe(true);
+
+    const updatedLayer: ControlRoomLayer = {
+      ...userLayer,
+      generation: {
+        ...userLayer.generation,
+        temperature: 0.55,
+      },
+    };
+    const updateLayerRes = await saveControlRoomLayerAtomic(saveDir, updatedLayer);
+    expect(isOk(updateLayerRes)).toBe(true);
+
+    const dirFiles = await fs.readdir(saveDir);
+    expect(dirFiles.some((f) => f.endsWith('.tmp'))).toBe(false);
+
+    const reloadedRes = await loadSessionSave(saveDir);
+    expect(isOk(reloadedRes)).toBe(true);
+    if (!reloadedRes.ok) return;
+    expect(reloadedRes.value.activePersona).toBeNull();
+    expect(reloadedRes.value.userControlRoomLayer?.generation?.temperature).toBe(0.55);
+  });
+
+  it('preserves control-room.json, persona.json, and checkpoint combatState across branchSave', async () => {
+    const sourceDir = path.join(tempRoot, 'branch-source');
+    const targetDir = path.join(tempRoot, 'branch-target');
+    const ws0 = makeInitialSimulationState('branch-source');
+
+    const userLayer: ControlRoomLayer = {
+      generation: {
+        presetName: 'Branch Preset',
+        temperature: 0.65,
+      },
+      basePrompts: {
+        system: 'Custom branch system prompt',
+      },
+      unlockedPromptSections: {
+        system: true,
+      },
+    };
+    const persona: UserPersonaPreset = {
+      id: 'persona-branch',
+      name: 'Lyra',
+      description: 'Alchemist',
+    };
+    const combat0: Record<string, unknown> = {
+      active: true,
+      round: 1,
+      combatants: { rowan: { hp: 20 } },
+    };
+
+    const initRes = await initSaveDirectory(
+      sourceDir,
+      {
+        sessionId: 'branch-source',
+        cartridgeId: 'c1',
+        systemPackId: 'p1',
+      },
+      {
+        worldState: ws0,
+        combatState: combat0,
+        userControlRoomLayer: userLayer,
+        activePersona: persona,
+      }
+    );
+    expect(isOk(initRes)).toBe(true);
+
+    const rng1 = nextInt(ws0.meta.rngState, 1, 20);
+    const batch1 = makeTurnPatchBatch(1, rng1.value);
+    const applied1 = applyPatchBatch(ws0, batch1);
+    expect(isOk(applied1)).toBe(true);
+    if (!applied1.ok) return;
+    applied1.value.nextState.meta.rngState = rng1.nextState;
+
+    await appendEventRecord(sourceDir, {
+      turn: 1,
+      batch: batch1,
+      postStateHash: computeStateHash(applied1.value.nextState),
+      rngBefore: ws0.meta.rngState,
+      rngAfter: rng1.nextState,
+    });
+    await appendAuditRecords(sourceDir, applied1.value.auditEntries);
+
+    const branchRes = await branchSave(sourceDir, 1, targetDir, 'branch-target');
+    expect(isOk(branchRes)).toBe(true);
+
+    const loadedBranch = await loadSessionSave(targetDir);
+    expect(isOk(loadedBranch)).toBe(true);
+    if (!loadedBranch.ok) return;
+
+    expect(loadedBranch.value.userControlRoomLayer).toEqual(userLayer);
+    expect(loadedBranch.value.activePersona).toEqual(persona);
+    expect(loadedBranch.value.checkpoints[0]?.combatState).toEqual(combat0);
+    expect(loadedBranch.value.latestCheckpoint?.turn).toBe(1);
+    expect(loadedBranch.value.latestCheckpoint?.combatState).toEqual(combat0);
+  });
+
+  it('loads legacy save directories without control-room.json, persona.json, or combatState cleanly', async () => {
+    const legacyDir = path.join(tempRoot, 'legacy-no-extensions');
+    const ws0 = makeInitialSimulationState('legacy-no-extensions');
+
+    await initSaveDirectory(
+      legacyDir,
+      {
+        sessionId: 'legacy-no-extensions',
+        cartridgeId: 'c-old',
+        systemPackId: 'freeform',
+      },
+      {
+        worldState: ws0,
+      }
+    );
+
+    // Ensure control-room.json and persona.json do not exist
+    await expect(fs.access(path.join(legacyDir, 'control-room.json'))).rejects.toThrow();
+    await expect(fs.access(path.join(legacyDir, 'persona.json'))).rejects.toThrow();
+
+    const loaded = await loadSessionSave(legacyDir);
+    expect(isOk(loaded)).toBe(true);
+    if (!loaded.ok) return;
+
+    expect(loaded.value.userControlRoomLayer).toBeNull();
+    expect(loaded.value.activePersona).toBeNull();
+    expect(loaded.value.latestCheckpoint?.combatState).toBeUndefined();
+
+    // Branching a legacy save should not fail or invent control-room.json / persona.json
+    const branchedLegacyDir = path.join(tempRoot, 'legacy-branched');
+    const branchRes = await branchSave(legacyDir, 0, branchedLegacyDir, 'legacy-branched');
+    expect(isOk(branchRes)).toBe(true);
+    await expect(fs.access(path.join(branchedLegacyDir, 'control-room.json'))).rejects.toThrow();
+    await expect(fs.access(path.join(branchedLegacyDir, 'persona.json'))).rejects.toThrow();
+  });
+
+  it('rejects unsafe prototype-polluting keys (__proto__) and corrupt control-room.json / persona.json', async () => {
+    const saveDir = path.join(tempRoot, 'unsafe-keys');
+    const ws0 = makeInitialSimulationState('unsafe-keys');
+
+    await initSaveDirectory(
+      saveDir,
+      {
+        sessionId: 'unsafe-keys',
+        cartridgeId: 'c1',
+        systemPackId: 'p1',
+      },
+      { worldState: ws0 }
+    );
+
+    // In-memory rejection for __proto__ via defineProperty
+    const pollutedLayer: Record<string, unknown> = {
+      generation: { temperature: 0.7 },
+    };
+    Object.defineProperty(pollutedLayer, '__proto__', {
+      value: { polluted: true },
+      enumerable: true,
+      configurable: true,
+    });
+    const saveLayerErr = await saveControlRoomLayerAtomic(
+      saveDir,
+      pollutedLayer as unknown as ControlRoomLayer
+    );
+    expect(isErr(saveLayerErr)).toBe(true);
+    if (!saveLayerErr.ok) {
+      expect(saveLayerErr.error[0]?.code).toBe('UNSAFE_KEY');
+    }
+
+    const pollutedPersona: Record<string, unknown> = {
+      id: 'p1',
+      name: 'Hero',
+      description: 'Test',
+    };
+    Object.defineProperty(pollutedPersona, '__proto__', {
+      value: { admin: true },
+      enumerable: true,
+      configurable: true,
+    });
+    const savePersonaErr = await saveActivePersonaAtomic(
+      saveDir,
+      pollutedPersona as unknown as UserPersonaPreset
+    );
+    expect(isErr(savePersonaErr)).toBe(true);
+    if (!savePersonaErr.ok) {
+      expect(savePersonaErr.error[0]?.code).toBe('UNSAFE_KEY');
+    }
+
+    // Disk rejection for __proto__ in control-room.json
+    await fs.writeFile(
+      path.join(saveDir, 'control-room.json'),
+      '{"__proto__":{"polluted":true},"generation":{"temperature":0.8}}',
+      'utf8'
+    );
+    const loadControlRoomErr = await loadSessionSave(saveDir);
+    expect(isErr(loadControlRoomErr)).toBe(true);
+    if (!loadControlRoomErr.ok) {
+      expect(loadControlRoomErr.error[0]?.code).toBe('UNSAFE_KEY');
+    }
+
+    // Remove bad control-room.json, test __proto__ in persona.json
+    await fs.rm(path.join(saveDir, 'control-room.json'));
+    await fs.writeFile(
+      path.join(saveDir, 'persona.json'),
+      '{"id":"p1","name":"Hero","description":"Desc","__proto__":{"polluted":true}}',
+      'utf8'
+    );
+    const loadPersonaErr = await loadSessionSave(saveDir);
+    expect(isErr(loadPersonaErr)).toBe(true);
+    if (!loadPersonaErr.ok) {
+      expect(loadPersonaErr.error[0]?.code).toBe('UNSAFE_KEY');
+    }
+
+    // Corrupt JSON in persona.json returns structured INVALID_JSON error
+    await fs.writeFile(path.join(saveDir, 'persona.json'), '{"id":', 'utf8');
+    const corruptPersonaErr = await loadSessionSave(saveDir);
+    expect(isErr(corruptPersonaErr)).toBe(true);
+    if (!corruptPersonaErr.ok) {
+      expect(corruptPersonaErr.error[0]?.code).toBe('INVALID_JSON');
+    }
   });
 });

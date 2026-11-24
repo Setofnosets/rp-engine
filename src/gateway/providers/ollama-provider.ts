@@ -21,9 +21,19 @@ import {
 
 const DEFAULT_OLLAMA_BASE_URL = 'http://localhost:11434';
 
-function isOpenAICompatibleOllamaUrl(baseUrl: string): boolean {
-  const normalized = baseUrl.trim().replace(/\/+$/, '');
-  return normalized.endsWith('/v1') || normalized.endsWith('/chat/completions');
+function resolveOllamaEndpoint(baseUrl: string): { readonly url: string; readonly nativeApiChat: boolean } {
+  const raw = baseUrl.trim().length > 0 ? baseUrl.trim() : DEFAULT_OLLAMA_BASE_URL;
+  const normalized = raw.replace(/\/+$/, '');
+  if (normalized.endsWith('/api/chat')) {
+    return { url: normalized, nativeApiChat: true };
+  }
+  if (normalized.endsWith('/v1/chat/completions') || normalized.endsWith('/chat/completions')) {
+    return { url: normalized, nativeApiChat: false };
+  }
+  if (normalized.endsWith('/v1')) {
+    return { url: `${normalized}/chat/completions`, nativeApiChat: false };
+  }
+  return { url: `${normalized}/v1/chat/completions`, nativeApiChat: false };
 }
 
 function extractOllamaMessageContent(payload: unknown): string | undefined {
@@ -43,20 +53,15 @@ function extractOllamaMessageContent(payload: unknown): string | undefined {
 export class OllamaProvider implements ModelProvider {
   readonly kind = 'ollama' as const;
   private readonly customFetch: typeof fetch | undefined;
-  private readonly openAiFallback: ModelProvider;
+  private readonly openAiFallback: ModelProvider | undefined;
 
-  constructor(fetchImpl: typeof fetch | undefined, openAiFallback: ModelProvider) {
+  constructor(fetchImpl?: typeof fetch, openAiFallback?: ModelProvider) {
     this.customFetch = fetchImpl;
     this.openAiFallback = openAiFallback;
   }
 
   private buildEndpointUrl(baseUrl: string): string {
-    const raw = baseUrl.trim().length > 0 ? baseUrl.trim() : DEFAULT_OLLAMA_BASE_URL;
-    const normalized = raw.replace(/\/+$/, '');
-    if (normalized.endsWith('/api/chat')) {
-      return normalized;
-    }
-    return `${normalized}/api/chat`;
+    return resolveOllamaEndpoint(baseUrl).url;
   }
 
   private buildHeaders(config: RoleConnectionConfig): Record<string, string> {
@@ -81,20 +86,35 @@ export class OllamaProvider implements ModelProvider {
     if (sampler.temperature !== undefined) {
       options.temperature = sampler.temperature;
     }
+    if (sampler.maxTokens !== undefined) {
+      options.num_predict = sampler.maxTokens;
+    }
+    if (sampler.maxContextTokens !== undefined) {
+      options.num_ctx = sampler.maxContextTokens;
+    }
     if (sampler.topP !== undefined) {
       options.top_p = sampler.topP;
     }
-    if (sampler.topK !== undefined) {
+    if (sampler.topK !== undefined && sampler.topK > 0) {
       options.top_k = sampler.topK;
     }
-    if (sampler.minP !== undefined) {
+    if (sampler.minP !== undefined && sampler.minP > 0) {
       options.min_p = sampler.minP;
+    }
+    if (sampler.typicalP !== undefined && sampler.typicalP < 1) {
+      options.typical_p = sampler.typicalP;
+    }
+    if (sampler.tfs !== undefined && sampler.tfs < 1) {
+      options.tfs_z = sampler.tfs;
+    }
+    if (sampler.frequencyPenalty !== undefined) {
+      options.frequency_penalty = sampler.frequencyPenalty;
+    }
+    if (sampler.presencePenalty !== undefined) {
+      options.presence_penalty = sampler.presencePenalty;
     }
     if (sampler.repetitionPenalty !== undefined) {
       options.repeat_penalty = sampler.repetitionPenalty;
-    }
-    if (sampler.maxTokens !== undefined) {
-      options.num_predict = sampler.maxTokens;
     }
     if (sampler.stop !== undefined && sampler.stop.length > 0) {
       options.stop = [...sampler.stop];
@@ -115,7 +135,7 @@ export class OllamaProvider implements ModelProvider {
     if (Object.keys(options).length > 0) {
       body.options = options;
     }
-    if (structuredReq !== undefined) {
+    if (structuredReq !== undefined && config.supportsJsonSchema !== false) {
       body.format = structuredReq.schema;
     }
 
@@ -177,8 +197,9 @@ export class OllamaProvider implements ModelProvider {
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): Promise<Result<string, ProviderFailure>> {
-    if (isOpenAICompatibleOllamaUrl(config.baseUrl)) {
-      return this.openAiFallback.generateText(config, req);
+    const endpoint = resolveOllamaEndpoint(config.baseUrl);
+    if (!endpoint.nativeApiChat && this.openAiFallback !== undefined) {
+      return this.openAiFallback.generateText({ ...config, baseUrl: endpoint.url }, req);
     }
     return this.executeCompletion(config, req);
   }
@@ -187,8 +208,9 @@ export class OllamaProvider implements ModelProvider {
     config: RoleConnectionConfig,
     req: GatewayStructuredRequest
   ): Promise<Result<string, ProviderFailure>> {
-    if (isOpenAICompatibleOllamaUrl(config.baseUrl)) {
-      return this.openAiFallback.generateStructuredRaw(config, req);
+    const endpoint = resolveOllamaEndpoint(config.baseUrl);
+    if (!endpoint.nativeApiChat && this.openAiFallback !== undefined) {
+      return this.openAiFallback.generateStructuredRaw({ ...config, baseUrl: endpoint.url }, req);
     }
     return this.executeCompletion(config, req, req);
   }
@@ -197,8 +219,9 @@ export class OllamaProvider implements ModelProvider {
     config: RoleConnectionConfig,
     req: GatewayGenerateTextRequest
   ): AsyncIterable<Result<StreamChunk, ProviderFailure>> {
-    if (isOpenAICompatibleOllamaUrl(config.baseUrl)) {
-      yield* this.openAiFallback.streamText(config, req);
+    const endpoint = resolveOllamaEndpoint(config.baseUrl);
+    if (!endpoint.nativeApiChat && this.openAiFallback !== undefined) {
+      yield* this.openAiFallback.streamText({ ...config, baseUrl: endpoint.url }, req);
       return;
     }
 

@@ -704,6 +704,134 @@ describe('compileActiveTrackerSchema', () => {
     expect(relProps['label']).toBeDefined();
     expect(lockedRes.fieldPolicyMap.get('relations.*.*.affinity')?.writableByTracker).toBe(false);
   });
+
+  it('includes new_characters schema and instruction only when autoRegisterEmergentNpcs is true and schema is non-null', () => {
+    const disabledRes = compileActiveTrackerSchema(STOCK_SLICE_OF_LIFE_PACK, {
+      turn: 1,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+      autoRegisterEmergentNpcs: false,
+    });
+    const disabledProps = (disabledRes.trackerJsonSchema as Record<string, unknown>)[
+      'properties'
+    ] as Record<string, unknown>;
+    expect(disabledProps['new_characters']).toBeUndefined();
+
+    // Freeform pack on normal turns still returns null even when autoRegisterEmergentNpcs is true
+    const freeformNormal = compileActiveTrackerSchema(STOCK_FREEFORM_PACK, {
+      turn: 1,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+      autoRegisterEmergentNpcs: true,
+    });
+    expect(freeformNormal.trackerJsonSchema).toBeNull();
+    expect(freeformNormal.activeTrackerInstructions).toEqual([]);
+
+    // Freeform pack with manualTrigger: true compiles scene + new_characters
+    const freeformManual = compileActiveTrackerSchema(STOCK_FREEFORM_PACK, {
+      turn: 1,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+      manualTrigger: true,
+      autoRegisterEmergentNpcs: true,
+    });
+    expect(freeformManual.trackerJsonSchema).not.toBeNull();
+    assertAllObjectsDisallowAdditionalProperties(freeformManual.trackerJsonSchema);
+    const freeformProps = (freeformManual.trackerJsonSchema as Record<string, unknown>)[
+      'properties'
+    ] as Record<string, unknown>;
+    expect(Object.keys(freeformProps)).toEqual(['scene', 'new_characters']);
+
+    // Slice of life with autoRegisterEmergentNpcs: true includes new_characters and passes strict checks
+    const enabledRes = compileActiveTrackerSchema(STOCK_SLICE_OF_LIFE_PACK, {
+      turn: 1,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+      autoRegisterEmergentNpcs: true,
+    });
+    expect(enabledRes.trackerJsonSchema).not.toBeNull();
+    assertAllObjectsDisallowAdditionalProperties(enabledRes.trackerJsonSchema);
+
+    const forbiddenPattern = /\b(hp|xp|level|class|factions|combat)\b/i;
+    expect(JSON.stringify(enabledRes.trackerJsonSchema)).not.toMatch(forbiddenPattern);
+    expect(enabledRes.activeTrackerInstructions.join('\n')).not.toMatch(forbiddenPattern);
+    expect(
+      enabledRes.activeTrackerInstructions.some((inst) => inst.includes('new_characters'))
+    ).toBe(true);
+
+    const enabledProps = (enabledRes.trackerJsonSchema as Record<string, unknown>)[
+      'properties'
+    ] as Record<string, unknown>;
+    const newCharsSchema = enabledProps['new_characters'] as Record<string, unknown>;
+    expect(newCharsSchema['type']).toBe('array');
+    const items = newCharsSchema['items'] as Record<string, unknown>;
+    expect(items['additionalProperties']).toBe(false);
+    expect(items['required']).toEqual(['id', 'name']);
+    const itemProps = items['properties'] as Record<string, unknown>;
+    expect(Object.keys(itemProps)).toEqual([
+      'id',
+      'name',
+      'mood',
+      'allegiance',
+      'traits',
+      'presentInScene',
+      'sections',
+    ]);
+    const sectionsSchema = itemProps['sections'] as Record<string, unknown>;
+    expect(sectionsSchema['type']).toBe('object');
+    expect(sectionsSchema['additionalProperties']).toBe(false);
+    const sectionProps = sectionsSchema['properties'] as Record<string, unknown>;
+    expect(sectionProps['sec_species']).toBeDefined();
+    expect(sectionProps['sec_combat_profile']).toBeUndefined();
+  });
+
+  it('omits locked or non-due NPC sections from new_characters.sections schema', () => {
+    const config = createAllDisabledConfig({
+      npcCoreSections: [
+        {
+          ...DEFAULT_NPC_SECTIONS[0]!,
+          id: 'sec_auto',
+          writableByTracker: true,
+          confirmPolicy: 'auto',
+          cadence: 'every_turn',
+        },
+        {
+          ...DEFAULT_NPC_SECTIONS[1]!,
+          id: 'sec_locked',
+          writableByTracker: false,
+          confirmPolicy: 'locked',
+          cadence: 'every_turn',
+        },
+        {
+          ...DEFAULT_NPC_SECTIONS[2]!,
+          id: 'sec_manual',
+          writableByTracker: true,
+          confirmPolicy: 'auto',
+          cadence: 'manual_only',
+        },
+      ],
+    });
+    const compiled = compileActiveTrackerSchema(config, {
+      turn: 1,
+      clockAdvancedThisTurn: false,
+      combatEndedThisTurn: false,
+      autoRegisterEmergentNpcs: true,
+    });
+    assertAllObjectsDisallowAdditionalProperties(compiled.trackerJsonSchema);
+    const rootProps = (compiled.trackerJsonSchema as Record<string, unknown>)[
+      'properties'
+    ] as Record<string, unknown>;
+    const newCharsItems = (rootProps['new_characters'] as Record<string, unknown>)[
+      'items'
+    ] as Record<string, unknown>;
+    const sectionsProps = (
+      (newCharsItems['properties'] as Record<string, unknown>)['sections'] as Record<
+        string,
+        unknown
+      >
+    )['properties'] as Record<string, unknown>;
+    expect(Object.keys(sectionsProps)).toEqual(['sec_auto']);
+  });
 });
 
 describe('Schema validators & sheet presets', () => {

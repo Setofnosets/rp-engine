@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { isErr, isOk } from '../../src/core/result.js';
 import { MockModelProvider, createMockModelGateway } from '../../src/gateway/mock-provider.js';
-import { ModelGateway, OpenAICompatibleProvider } from '../../src/gateway/model-gateway.js';
+import {
+  AnthropicProvider,
+  ModelGateway,
+  OllamaProvider,
+  OpenAICompatibleProvider,
+} from '../../src/gateway/model-gateway.js';
 import type { ChatMessage, RoleConnectionConfig, StreamChunk } from '../../src/gateway/types.js';
 
 describe('ModelGateway per-role routing and configuration', () => {
@@ -77,7 +82,7 @@ describe('ModelGateway per-role routing and configuration', () => {
           role: 'narrator',
           provider: 'mock',
           baseUrl: 'mock://unregistered',
-          model: 'claude-test',
+          model: 'unregistered-test',
         },
       },
     });
@@ -567,5 +572,448 @@ describe('OpenAICompatibleProvider with fetch', () => {
     }
     expect(streamChunks).toEqual(['Hel', 'lo!']);
     expect(fetchMock.mock.calls[2]?.[0]).toBe('https://llm.example.test/v1/chat/completions');
+  });
+
+  it('merges connection SamplingParameters with request overrides and applies threshold guards', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () =>
+        new Response(
+          JSON.stringify({ choices: [{ message: { content: 'ok' } }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+    const gateway = new ModelGateway({
+      fetchImpl: fetchMock,
+      connections: {
+        narrator: {
+          role: 'narrator',
+          provider: 'openai_compatible',
+          baseUrl: 'https://llm.example.test/v1',
+          model: 'story-70b',
+          temperature: 0.7,
+          maxTokens: 512,
+          topP: 0.9,
+          topK: 40,
+          minP: 0.05,
+          topA: 0.2,
+          typicalP: 0.95,
+          tfs: 0.9,
+          frequencyPenalty: 0.3,
+          presencePenalty: 0.2,
+          repetitionPenalty: 1.1,
+          stopSequences: ['###', 'END'],
+          seed: 42,
+        },
+      },
+    });
+
+    // 1. Connection defaults forwarded cleanly
+    const defaultRes = await gateway.generateText({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    expect(isOk(defaultRes)).toBe(true);
+
+    const body1 = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(body1).toMatchObject({
+      model: 'story-70b',
+      temperature: 0.7,
+      max_tokens: 512,
+      top_p: 0.9,
+      top_k: 40,
+      min_p: 0.05,
+      top_a: 0.2,
+      typical_p: 0.95,
+      tfs: 0.9,
+      frequency_penalty: 0.3,
+      presence_penalty: 0.2,
+      repetition_penalty: 1.1,
+      stop: ['###', 'END'],
+      seed: 42,
+    });
+
+    // 2. Request overrides take precedence and threshold guards omit disabled params (0 / 1 / [])
+    const overrideRes = await gateway.generateText({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Override' }],
+      temperature: 0.2,
+      topK: 0,
+      minP: 0,
+      topA: 0,
+      typicalP: 1,
+      tfs: 1,
+      stopSequences: [],
+      seed: 99,
+    });
+    expect(isOk(overrideRes)).toBe(true);
+
+    const body2 = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(body2.temperature).toBe(0.2);
+    expect(body2.seed).toBe(99);
+    expect(body2.top_p).toBe(0.9);
+    expect(body2).not.toHaveProperty('top_k');
+    expect(body2).not.toHaveProperty('min_p');
+    expect(body2).not.toHaveProperty('top_a');
+    expect(body2).not.toHaveProperty('typical_p');
+    expect(body2).not.toHaveProperty('tfs');
+    expect(body2).not.toHaveProperty('stop');
+  });
+});
+
+describe('OllamaProvider via ModelGateway', () => {
+  it('normalizes OpenAI-compatible /v1/chat/completions URLs and streams SSE', async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ choices: [{ message: { content: 'Ollama OpenAI reply' } }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Chunk1 "}}]}\n\n'));
+              controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Chunk2"}}]}\n\n'));
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+        )
+      );
+
+    const gateway = new ModelGateway({
+      fetchImpl: fetchMock,
+      connections: {
+        narrator: {
+          role: 'narrator',
+          provider: 'ollama',
+          baseUrl: 'http://localhost:11434',
+          model: 'llama3.1:8b',
+          temperature: 0.6,
+        },
+        intent_parser: {
+          role: 'intent_parser',
+          provider: 'ollama',
+          baseUrl: 'http://localhost:11434/v1/',
+          model: 'qwen2.5:7b',
+        },
+      },
+    });
+
+    const textRes = await gateway.generateText({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Hi' }],
+    });
+    expect(isOk(textRes)).toBe(true);
+    if (isOk(textRes)) {
+      expect(textRes.value).toBe('Ollama OpenAI reply');
+    }
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://localhost:11434/v1/chat/completions');
+
+    const chunks: string[] = [];
+    for await (const item of gateway.streamText({
+      role: 'intent_parser',
+      messages: [{ role: 'user', content: 'Stream' }],
+    })) {
+      expect(isOk(item)).toBe(true);
+      if (isOk(item) && item.value.text.length > 0) {
+        chunks.push(item.value.text);
+      }
+    }
+    expect(chunks).toEqual(['Chunk1 ', 'Chunk2']);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe('http://localhost:11434/v1/chat/completions');
+  });
+
+  it('supports native /api/chat fallback with Ollama options, format, and NDJSON streaming', async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            model: 'llama3.1',
+            message: { role: 'assistant', content: '{"ok":true}' },
+            done: true,
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode('{"message":{"role":"assistant","content":"Hel"},"done":false}\n')
+              );
+              controller.enqueue(
+                encoder.encode('{"message":{"role":"assistant","content":"lo"},"done":true}\n')
+              );
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/x-ndjson' } }
+        )
+      );
+
+    const provider = new OllamaProvider(fetchMock);
+    const gateway = new ModelGateway({
+      providers: { ollama: provider },
+      connections: {
+        narrator: {
+          role: 'narrator',
+          provider: 'ollama',
+          baseUrl: 'http://localhost:11434/api/chat/',
+          model: 'llama3.1',
+          supportsJsonSchema: true,
+          temperature: 0.5,
+          maxTokens: 300,
+          maxContextTokens: 8192,
+          topK: 30,
+          repetitionPenalty: 1.15,
+          tfs: 0.95,
+          stopSequences: ['STOP'],
+          seed: 7,
+        },
+      },
+    });
+
+    const structuredRes = await gateway.generateStructured<{ ok: boolean }>({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Check' }],
+      schema: {
+        type: 'object',
+        required: ['ok'],
+        properties: { ok: { type: 'boolean' } },
+      },
+    });
+    expect(isOk(structuredRes)).toBe(true);
+    if (isOk(structuredRes)) {
+      expect(structuredRes.value.data).toEqual({ ok: true });
+    }
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('http://localhost:11434/api/chat');
+    const nativeBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as Record<string, unknown>;
+    expect(nativeBody.options).toEqual({
+      temperature: 0.5,
+      num_predict: 300,
+      num_ctx: 8192,
+      top_k: 30,
+      tfs_z: 0.95,
+      repeat_penalty: 1.15,
+      stop: ['STOP'],
+      seed: 7,
+    });
+    expect(nativeBody.format).toEqual({
+      type: 'object',
+      required: ['ok'],
+      properties: { ok: { type: 'boolean' } },
+    });
+
+    const streamed: StreamChunk[] = [];
+    for await (const chunk of gateway.streamText({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Greet' }],
+    })) {
+      expect(isOk(chunk)).toBe(true);
+      if (isOk(chunk)) {
+        streamed.push(chunk.value);
+      }
+    }
+    expect(streamed).toEqual([
+      { text: 'Hel', done: false },
+      { text: 'lo', done: false },
+      { text: '', done: true },
+    ]);
+  });
+});
+
+describe('AnthropicProvider via ModelGateway', () => {
+  it('sends /v1/messages with x-api-key, anthropic-version, extracted system prompt, and SSE deltas', async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: 'msg_1',
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'thinking', thinking: 'internal' },
+              { type: 'text', text: 'First ' },
+              { type: 'text', text: 'reply.' },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_2"}}\n\n' +
+                    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Streamed "}}\n\n'
+                )
+              );
+              controller.enqueue(
+                encoder.encode(
+                  'event: ping\ndata: {"type":"ping"}\n\n' +
+                    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"text"}}\n\n' +
+                    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+                )
+              );
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+        )
+      );
+
+    const provider = new AnthropicProvider(fetchMock);
+    const gateway = new ModelGateway({
+      providers: { anthropic: provider },
+      connections: {
+        narrator: {
+          role: 'narrator',
+          provider: 'anthropic',
+          baseUrl: 'https://api.anthropic.com',
+          apiKey: 'sk-ant-secret',
+          model: 'claude-3-7-sonnet-latest',
+          temperature: 0.75,
+          topP: 0.92,
+          topK: 25,
+          stopSequences: ['Human:'],
+        },
+      },
+    });
+
+    const res = await gateway.generateText({
+      role: 'narrator',
+      messages: [
+        { role: 'system', content: 'You are a narrator.' },
+        { role: 'system', content: 'Stay concise.' },
+        { role: 'user', content: 'Open the door.' },
+      ],
+    });
+    expect(isOk(res)).toBe(true);
+    if (isOk(res)) {
+      expect(res.value).toBe('First reply.');
+    }
+
+    const [url, init] = fetchMock.mock.calls[0] ?? [];
+    expect(url).toBe('https://api.anthropic.com/v1/messages');
+    expect(init?.headers).toEqual({
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'x-api-key': 'sk-ant-secret',
+    });
+
+    const parsedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(parsedBody).toEqual({
+      model: 'claude-3-7-sonnet-latest',
+      max_tokens: 1024,
+      system: 'You are a narrator.\n\nStay concise.',
+      messages: [{ role: 'user', content: 'Open the door.' }],
+      stream: false,
+      temperature: 0.75,
+      top_p: 0.92,
+      top_k: 25,
+      stop_sequences: ['Human:'],
+    });
+
+    const chunks: StreamChunk[] = [];
+    for await (const item of gateway.streamText({
+      role: 'narrator',
+      messages: [{ role: 'user', content: 'Continue' }],
+      maxTokens: 2048,
+    })) {
+      expect(isOk(item)).toBe(true);
+      if (isOk(item)) {
+        chunks.push(item.value);
+      }
+    }
+    expect(chunks).toEqual([
+      { text: 'Streamed ', done: false },
+      { text: 'text', done: false },
+      { text: '', done: true },
+    ]);
+
+    const streamBody = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)) as Record<string, unknown>;
+    expect(streamBody.max_tokens).toBe(2048);
+    expect(streamBody.stream).toBe(true);
+  });
+});
+
+describe('ModelGateway role removal and snapshot redaction', () => {
+  it('supports removeRoleConnection, clearRoleConnections, and redacted/unredacted snapshots', () => {
+    const gateway = new ModelGateway({
+      defaultConnection: {
+        provider: 'openai_compatible',
+        baseUrl: 'https://default.test/v1',
+        apiKey: 'default-secret',
+        model: 'default-model',
+        temperature: 0.6,
+        topK: 40,
+        stopSequences: ['END'],
+      },
+      connections: {
+        narrator: {
+          role: 'narrator',
+          provider: 'anthropic',
+          baseUrl: 'https://api.anthropic.com',
+          apiKey: 'narrator-secret',
+          model: 'claude-sonnet',
+          maxContextTokens: 16384,
+          supportsJsonSchema: false,
+        },
+        intent_parser: {
+          role: 'intent_parser',
+          provider: 'ollama',
+          baseUrl: 'http://localhost:11434',
+          model: 'llama3',
+        },
+      },
+    });
+
+    // Backward-compatible unredacted snapshot preserves all fields including secrets
+    const unredacted = gateway.getConnectionsSnapshot();
+    expect(unredacted.defaultConnection?.apiKey).toBe('default-secret');
+    expect(unredacted.defaultConnection?.topK).toBe(40);
+    expect(unredacted.defaultConnection?.stopSequences).toEqual(['END']);
+    expect(unredacted.connections.narrator?.apiKey).toBe('narrator-secret');
+    expect(unredacted.connections.narrator?.maxContextTokens).toBe(16384);
+    expect(unredacted.connections.intent_parser?.apiKey).toBeUndefined();
+
+    // Redacted snapshot replaces non-empty apiKeys with '***' without altering internal state
+    const redacted = gateway.getConnectionsSnapshot({ redactApiKeys: true });
+    expect(redacted.defaultConnection?.apiKey).toBe('***');
+    expect(redacted.connections.narrator?.apiKey).toBe('***');
+    expect(redacted.connections.intent_parser?.apiKey).toBeUndefined();
+    expect(gateway.getConnectionsSnapshot().connections.narrator?.apiKey).toBe('narrator-secret');
+
+    // removeRoleConnection returns true when present and false when absent
+    expect(gateway.removeRoleConnection('narrator')).toBe(true);
+    expect(gateway.removeRoleConnection('narrator')).toBe(false);
+
+    // Removed role falls back to defaultConnection
+    const resolvedAfterRemove = gateway.resolveConnection('narrator');
+    expect(isOk(resolvedAfterRemove)).toBe(true);
+    if (isOk(resolvedAfterRemove)) {
+      expect(resolvedAfterRemove.value.model).toBe('default-model');
+    }
+
+    // clearRoleConnections clears remaining per-role overrides while keeping defaultConnection
+    gateway.clearRoleConnections();
+    const afterClear = gateway.getConnectionsSnapshot();
+    expect(Object.keys(afterClear.connections)).toHaveLength(0);
+    expect(afterClear.defaultConnection?.model).toBe('default-model');
   });
 });

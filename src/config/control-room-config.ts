@@ -1,5 +1,9 @@
+import type { SectionTokenBudgets } from '../context/tokenizer-budget.js';
+import type { SamplingParameters } from '../gateway/types.js';
 import {
   type CharacterSectionDef,
+  SHEET_PRESETS,
+  type SheetPresetId,
   cloneCharacterSections,
 } from '../schema/character-sections.js';
 import type { EffectiveSystemConfig } from '../schema/dynamic-schema-compiler.js';
@@ -29,7 +33,8 @@ export type PayloadGroupId =
   | 'gameSystems'
   | 'promptSections'
   | 'combatRules'
-  | 'tuningDials';
+  | 'tuningDials'
+  | 'generation';
 
 export const ALL_PAYLOAD_GROUP_IDS: readonly PayloadGroupId[] = Object.freeze([
   'capabilities',
@@ -38,6 +43,7 @@ export const ALL_PAYLOAD_GROUP_IDS: readonly PayloadGroupId[] = Object.freeze([
   'promptSections',
   'combatRules',
   'tuningDials',
+  'generation',
 ]);
 
 export interface TuningDials {
@@ -46,6 +52,38 @@ export interface TuningDials {
   cyoaEnabled: boolean;
   use24hTime: boolean;
   useDdMmYyFormat: boolean;
+  autoRegisterEmergentNpcs?: boolean;
+}
+
+export interface StFormatTemplates {
+  wiFormat?: string;
+  scenarioFormat?: string;
+  personalityFormat?: string;
+  impersonationPrompt?: string;
+  newChatPrompt?: string;
+  continueNudgePrompt?: string;
+  storyString?: string;
+  inputSequence?: string;
+  outputSequence?: string;
+}
+
+export type GenerationSourceFormat = 'st_chat_completion' | 'st_text_completion' | 'referee';
+
+export interface GenerationPresetConfig extends SamplingParameters {
+  presetName?: string;
+  sourceFormat?: GenerationSourceFormat;
+  stFormatTemplates?: StFormatTemplates;
+}
+
+export type CustomPromptBlockRole = 'system' | 'user' | 'assistant';
+export type CustomPromptBlockInjectionPosition = 'relative' | 'in_chat';
+
+export interface CustomPromptBlockSpec {
+  id: string;
+  name: string;
+  role: CustomPromptBlockRole;
+  injectionPosition?: CustomPromptBlockInjectionPosition;
+  injectionDepth?: number;
 }
 
 export interface CombatRulesConfig {
@@ -89,8 +127,11 @@ export interface ControlRoomLayer {
   syspromptSectionOrder?: string[];
   basePrompts?: Record<string, string>;
   unlockedPromptSections?: Record<string, boolean>;
+  customPromptBlocks?: Record<string, CustomPromptBlockSpec>;
   combatRules?: Partial<CombatRulesConfig>;
   tuningDials?: Partial<TuningDials>;
+  generation?: GenerationPresetConfig;
+  tokenBudgets?: Partial<SectionTokenBudgets>;
 }
 
 export interface ResolvedControlRoomConfig extends EffectiveSystemConfig {
@@ -98,8 +139,11 @@ export interface ResolvedControlRoomConfig extends EffectiveSystemConfig {
   packName: string;
   basePrompts: Record<string, string>;
   unlockedPromptSections: Record<string, boolean>;
+  customPromptBlocks?: Record<string, CustomPromptBlockSpec>;
   combatRules: CombatRulesConfig;
   tuningDials: TuningDials;
+  generation?: GenerationPresetConfig;
+  tokenBudgets?: Partial<SectionTokenBudgets>;
 }
 
 export const DEFAULT_TUNING_DIALS: Readonly<TuningDials> = Object.freeze({
@@ -127,6 +171,18 @@ const UNSAFE_RECORD_KEYS: ReadonlySet<string> = new Set([
 
 function isSafeRecordKey(key: string): boolean {
   return !UNSAFE_RECORD_KEYS.has(key);
+}
+
+function setSafeRecordEntry<T>(record: Record<string, T>, key: string, value: T): void {
+  if (!isSafeRecordKey(key)) {
+    return;
+  }
+  Object.defineProperty(record, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 }
 
 function compareStringsDeterministic(a: string, b: string): number {
@@ -358,7 +414,238 @@ export function cloneTuningDialsPartial(
   if (dials.useDdMmYyFormat !== undefined) {
     cloned.useDdMmYyFormat = dials.useDdMmYyFormat;
   }
+  if (dials.autoRegisterEmergentNpcs !== undefined) {
+    cloned.autoRegisterEmergentNpcs = dials.autoRegisterEmergentNpcs;
+  }
   return cloned;
+}
+
+const ST_FORMAT_TEMPLATE_KEYS: readonly (keyof StFormatTemplates)[] = [
+  'wiFormat',
+  'scenarioFormat',
+  'personalityFormat',
+  'impersonationPrompt',
+  'newChatPrompt',
+  'continueNudgePrompt',
+  'storyString',
+  'inputSequence',
+  'outputSequence',
+];
+
+export function cloneStFormatTemplates(
+  templates: Readonly<StFormatTemplates>
+): StFormatTemplates {
+  const cloned: StFormatTemplates = {};
+  for (const key of ST_FORMAT_TEMPLATE_KEYS) {
+    const val = templates[key];
+    if (typeof val === 'string') {
+      cloned[key] = val;
+    }
+  }
+  return cloned;
+}
+
+function mergeStFormatTemplates(
+  base?: Readonly<StFormatTemplates>,
+  patch?: Readonly<StFormatTemplates>
+): StFormatTemplates | undefined {
+  if (base === undefined && patch === undefined) {
+    return undefined;
+  }
+  const merged = base !== undefined ? cloneStFormatTemplates(base) : {};
+  if (patch !== undefined) {
+    for (const key of ST_FORMAT_TEMPLATE_KEYS) {
+      const val = patch[key];
+      if (typeof val === 'string') {
+        merged[key] = val;
+      }
+    }
+  }
+  return merged;
+}
+
+type MutableGenerationPresetConfig = {
+  -readonly [K in keyof GenerationPresetConfig]: GenerationPresetConfig[K];
+};
+
+const GENERATION_NUMERIC_KEYS: readonly (
+  | 'temperature'
+  | 'maxTokens'
+  | 'maxContextTokens'
+  | 'topP'
+  | 'topK'
+  | 'minP'
+  | 'topA'
+  | 'typicalP'
+  | 'tfs'
+  | 'frequencyPenalty'
+  | 'presencePenalty'
+  | 'repetitionPenalty'
+  | 'seed'
+)[] = [
+  'temperature',
+  'maxTokens',
+  'maxContextTokens',
+  'topP',
+  'topK',
+  'minP',
+  'topA',
+  'typicalP',
+  'tfs',
+  'frequencyPenalty',
+  'presencePenalty',
+  'repetitionPenalty',
+  'seed',
+];
+
+export function cloneGenerationPresetConfig(
+  preset: Readonly<GenerationPresetConfig>
+): GenerationPresetConfig {
+  const cloned: MutableGenerationPresetConfig = {};
+  for (const key of GENERATION_NUMERIC_KEYS) {
+    const val = preset[key];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      cloned[key] = val;
+    }
+  }
+  if (preset.stopSequences !== undefined) {
+    cloned.stopSequences = [...preset.stopSequences];
+  }
+  if (preset.presetName !== undefined) {
+    cloned.presetName = preset.presetName;
+  }
+  if (preset.sourceFormat !== undefined) {
+    cloned.sourceFormat = preset.sourceFormat;
+  }
+  if (preset.stFormatTemplates !== undefined) {
+    cloned.stFormatTemplates = cloneStFormatTemplates(preset.stFormatTemplates);
+  }
+  return cloned;
+}
+
+function mergeGenerationPresetConfig(
+  base?: Readonly<GenerationPresetConfig>,
+  patch?: Readonly<GenerationPresetConfig>
+): GenerationPresetConfig | undefined {
+  if (base === undefined && patch === undefined) {
+    return undefined;
+  }
+  const next: MutableGenerationPresetConfig =
+    base !== undefined ? cloneGenerationPresetConfig(base) : {};
+  if (patch === undefined) {
+    return next;
+  }
+  for (const key of GENERATION_NUMERIC_KEYS) {
+    const val = patch[key];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      next[key] = val;
+    }
+  }
+  if (patch.stopSequences !== undefined) {
+    next.stopSequences = [...patch.stopSequences];
+  }
+  if (patch.presetName !== undefined) {
+    next.presetName = patch.presetName;
+  }
+  if (patch.sourceFormat !== undefined) {
+    next.sourceFormat = patch.sourceFormat;
+  }
+  if (patch.stFormatTemplates !== undefined) {
+    next.stFormatTemplates = mergeStFormatTemplates(
+      next.stFormatTemplates,
+      patch.stFormatTemplates
+    );
+  }
+  return next;
+}
+
+export function cloneCustomPromptBlockSpec(
+  spec: Readonly<CustomPromptBlockSpec>
+): CustomPromptBlockSpec {
+  const cloned: CustomPromptBlockSpec = {
+    id: spec.id,
+    name: spec.name,
+    role: spec.role,
+  };
+  if (spec.injectionPosition !== undefined) {
+    cloned.injectionPosition = spec.injectionPosition;
+  }
+  if (spec.injectionDepth !== undefined) {
+    cloned.injectionDepth = spec.injectionDepth;
+  }
+  return cloned;
+}
+
+export function cloneCustomPromptBlocks(
+  blocks: Readonly<Record<string, CustomPromptBlockSpec>>
+): Record<string, CustomPromptBlockSpec> {
+  const cloned: Record<string, CustomPromptBlockSpec> = {};
+  for (const [key, spec] of Object.entries(blocks)) {
+    if (isSafeRecordKey(key) && spec !== undefined && spec !== null) {
+      setSafeRecordEntry(cloned, key, cloneCustomPromptBlockSpec(spec));
+    }
+  }
+  return cloned;
+}
+
+function mergeCustomPromptBlocks(
+  base?: Readonly<Record<string, CustomPromptBlockSpec>>,
+  patch?: Readonly<Record<string, CustomPromptBlockSpec>>
+): Record<string, CustomPromptBlockSpec> | undefined {
+  if (base === undefined && patch === undefined) {
+    return undefined;
+  }
+  const merged = base !== undefined ? cloneCustomPromptBlocks(base) : {};
+  if (patch !== undefined) {
+    for (const [key, spec] of Object.entries(patch)) {
+      if (isSafeRecordKey(key) && spec !== undefined && spec !== null) {
+        setSafeRecordEntry(merged, key, cloneCustomPromptBlockSpec(spec));
+      }
+    }
+  }
+  return merged;
+}
+
+const TOKEN_BUDGET_KEYS: readonly (keyof SectionTokenBudgets)[] = [
+  'system',
+  'card',
+  'state',
+  'combatOutcome',
+  'plot',
+  'world',
+  'totalMaxTokens',
+];
+
+export function cloneTokenBudgetsPartial(
+  budgets: Readonly<Partial<SectionTokenBudgets>>
+): Partial<SectionTokenBudgets> {
+  const cloned: Partial<SectionTokenBudgets> = {};
+  for (const key of TOKEN_BUDGET_KEYS) {
+    const val = budgets[key];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      cloned[key] = val;
+    }
+  }
+  return cloned;
+}
+
+function mergeTokenBudgets(
+  base?: Readonly<Partial<SectionTokenBudgets>>,
+  patch?: Readonly<Partial<SectionTokenBudgets>>
+): Partial<SectionTokenBudgets> | undefined {
+  if (base === undefined && patch === undefined) {
+    return undefined;
+  }
+  const merged = base !== undefined ? cloneTokenBudgetsPartial(base) : {};
+  if (patch !== undefined) {
+    for (const key of TOKEN_BUDGET_KEYS) {
+      const val = patch[key];
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        merged[key] = val;
+      }
+    }
+  }
+  return merged;
 }
 
 function cloneSectionConfirmPolicies(
@@ -406,11 +693,20 @@ export function cloneControlRoomLayer(layer: Readonly<ControlRoomLayer>): Contro
   if (layer.unlockedPromptSections !== undefined) {
     cloned.unlockedPromptSections = cloneBooleanRecord(layer.unlockedPromptSections);
   }
+  if (layer.customPromptBlocks !== undefined) {
+    cloned.customPromptBlocks = cloneCustomPromptBlocks(layer.customPromptBlocks);
+  }
   if (layer.combatRules !== undefined) {
     cloned.combatRules = cloneCombatRulesPartial(layer.combatRules);
   }
   if (layer.tuningDials !== undefined) {
     cloned.tuningDials = cloneTuningDialsPartial(layer.tuningDials);
+  }
+  if (layer.generation !== undefined) {
+    cloned.generation = cloneGenerationPresetConfig(layer.generation);
+  }
+  if (layer.tokenBudgets !== undefined) {
+    cloned.tokenBudgets = cloneTokenBudgetsPartial(layer.tokenBudgets);
   }
   return cloned;
 }
@@ -429,8 +725,17 @@ export function cloneResolvedControlRoomConfig(
     syspromptSectionOrder: [...config.syspromptSectionOrder],
     basePrompts: cloneStringRecord(config.basePrompts),
     unlockedPromptSections: cloneBooleanRecord(config.unlockedPromptSections),
+    ...(config.customPromptBlocks !== undefined
+      ? { customPromptBlocks: cloneCustomPromptBlocks(config.customPromptBlocks) }
+      : {}),
     combatRules: cloneCombatRules(config.combatRules),
     tuningDials: { ...config.tuningDials },
+    ...(config.generation !== undefined
+      ? { generation: cloneGenerationPresetConfig(config.generation) }
+      : {}),
+    ...(config.tokenBudgets !== undefined
+      ? { tokenBudgets: cloneTokenBudgetsPartial(config.tokenBudgets) }
+      : {}),
   };
 }
 
@@ -495,6 +800,9 @@ function mergeTuningDials(
   }
   if (patch.useDdMmYyFormat !== undefined) {
     next.useDdMmYyFormat = patch.useDdMmYyFormat;
+  }
+  if (patch.autoRegisterEmergentNpcs !== undefined) {
+    next.autoRegisterEmergentNpcs = patch.autoRegisterEmergentNpcs;
   }
   return next;
 }
@@ -768,6 +1076,13 @@ export function applyControlRoomLayer(
     }
   }
 
+  const mergedCustomPromptBlocks = mergeCustomPromptBlocks(
+    base.customPromptBlocks,
+    layer.customPromptBlocks
+  );
+  const mergedGeneration = mergeGenerationPresetConfig(base.generation, layer.generation);
+  const mergedTokenBudgets = mergeTokenBudgets(base.tokenBudgets, layer.tokenBudgets);
+
   return {
     packId: base.packId,
     packName: base.packName,
@@ -782,8 +1097,13 @@ export function applyControlRoomLayer(
         : [...base.syspromptSectionOrder],
     basePrompts: mergedBasePrompts,
     unlockedPromptSections: mergedUnlocked,
+    ...(mergedCustomPromptBlocks !== undefined
+      ? { customPromptBlocks: mergedCustomPromptBlocks }
+      : {}),
     combatRules: mergeCombatRules(base.combatRules, layer.combatRules),
     tuningDials: mergeTuningDials(base.tuningDials, layer.tuningDials),
+    ...(mergedGeneration !== undefined ? { generation: mergedGeneration } : {}),
+    ...(mergedTokenBudgets !== undefined ? { tokenBudgets: mergedTokenBudgets } : {}),
   };
 }
 
@@ -1127,6 +1447,135 @@ export function resetSectionToBaseline(
   }
   if (next.unlockedPromptSections !== undefined) {
     delete next.unlockedPromptSections[sectionId];
+  }
+  return next;
+}
+
+/**
+ * Pure helper: merge a partial {@link GenerationPresetConfig} into `layer.generation`.
+ */
+export function setGenerationPreset(
+  layer: Readonly<ControlRoomLayer>,
+  patch: Readonly<GenerationPresetConfig>
+): ControlRoomLayer {
+  const next = cloneControlRoomLayer(layer);
+  next.generation = mergeGenerationPresetConfig(next.generation, patch);
+  return next;
+}
+
+function insertSectionIdBeforeAnchor(order: string[], sectionId: string): string[] {
+  if (order.includes(sectionId)) {
+    return order;
+  }
+  const nextOrder = [...order];
+  const transcriptIdx = nextOrder.indexOf('transcript_window');
+  if (transcriptIdx !== -1) {
+    nextOrder.splice(transcriptIdx, 0, sectionId);
+    return nextOrder;
+  }
+  const latestInputIdx = nextOrder.indexOf('latest_input');
+  if (latestInputIdx !== -1) {
+    nextOrder.splice(latestInputIdx, 0, sectionId);
+    return nextOrder;
+  }
+  nextOrder.push(sectionId);
+  return nextOrder;
+}
+
+/**
+ * Pure helper: insert or update a custom prompt block definition, its text content,
+ * and its enabled/unlocked state on a {@link ControlRoomLayer}.
+ */
+export function upsertCustomPromptBlock(
+  layer: Readonly<ControlRoomLayer>,
+  spec: Readonly<CustomPromptBlockSpec>,
+  content: string,
+  enabled = true,
+  baseline?: Readonly<Pick<EffectiveSystemConfig, 'syspromptSectionOrder'>>
+): ControlRoomLayer {
+  const next = cloneControlRoomLayer(layer);
+  if (
+    typeof spec.id !== 'string' ||
+    !isSafeRecordKey(spec.id) ||
+    spec.id.trim().length === 0
+  ) {
+    return next;
+  }
+
+  const nextBlocks = next.customPromptBlocks ?? {};
+  setSafeRecordEntry(nextBlocks, spec.id, cloneCustomPromptBlockSpec(spec));
+  next.customPromptBlocks = nextBlocks;
+
+  const nextBasePrompts = next.basePrompts ?? {};
+  setSafeRecordEntry(nextBasePrompts, spec.id, content);
+  next.basePrompts = nextBasePrompts;
+
+  const nextUnlocked = next.unlockedPromptSections ?? {};
+  setSafeRecordEntry(nextUnlocked, spec.id, Boolean(enabled));
+  next.unlockedPromptSections = nextUnlocked;
+
+  if (next.syspromptSectionOrder === undefined && baseline?.syspromptSectionOrder !== undefined) {
+    next.syspromptSectionOrder = [...baseline.syspromptSectionOrder];
+  }
+  if (next.syspromptSectionOrder !== undefined) {
+    next.syspromptSectionOrder = insertSectionIdBeforeAnchor(next.syspromptSectionOrder, spec.id);
+  }
+
+  return next;
+}
+
+/**
+ * Pure helper: remove a custom prompt block and its associated prompt text / unlock flag
+ * (and section order entry if present) from a {@link ControlRoomLayer}.
+ */
+export function removeCustomPromptBlock(
+  layer: Readonly<ControlRoomLayer>,
+  id: string
+): ControlRoomLayer {
+  const next = cloneControlRoomLayer(layer);
+  if (typeof id !== 'string' || !isSafeRecordKey(id) || id.trim().length === 0) {
+    return next;
+  }
+
+  if (next.customPromptBlocks !== undefined) {
+    delete next.customPromptBlocks[id];
+  }
+  if (next.basePrompts !== undefined) {
+    delete next.basePrompts[id];
+  }
+  if (next.unlockedPromptSections !== undefined) {
+    delete next.unlockedPromptSections[id];
+  }
+  if (next.syspromptSectionOrder !== undefined) {
+    next.syspromptSectionOrder = next.syspromptSectionOrder.filter((entry) => entry !== id);
+  }
+  return next;
+}
+
+/**
+ * Pure helper: apply one of the built-in {@link SHEET_PRESETS} to `pcCoreSections`,
+ * `npcCoreSections`, or both on a {@link ControlRoomLayer}.
+ */
+export function applySheetPreset(
+  layer: Readonly<ControlRoomLayer>,
+  presetId: SheetPresetId | string,
+  target: 'pc' | 'npc' | 'both' = 'both'
+): ControlRoomLayer {
+  const next = cloneControlRoomLayer(layer);
+  if (typeof presetId !== 'string' || !isSafeRecordKey(presetId) || !Object.hasOwn(SHEET_PRESETS, presetId)) {
+    return next;
+  }
+
+  const preset = SHEET_PRESETS[presetId as SheetPresetId];
+  if (preset === undefined) {
+    return next;
+  }
+
+  if (target === 'pc' || target === 'both') {
+    next.pcCoreSections = cloneCharacterSections(preset.pcCoreSections);
+  }
+  if (target === 'npc' || target === 'both') {
+    next.npcCoreSections = cloneCharacterSections(preset.npcCoreSections);
   }
   return next;
 }

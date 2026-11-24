@@ -21,7 +21,7 @@ import {
 
 const DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
 const ANTHROPIC_VERSION = '2023-06-01';
-const DEFAULT_ANTHROPIC_MAX_TOKENS = 4096;
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 1024;
 
 function extractAnthropicTextContent(payload: unknown): string | undefined {
   if (!isPlainRecord(payload) || !Array.isArray(payload.content)) {
@@ -146,7 +146,7 @@ export class AnthropicProvider implements ModelProvider {
     if (sampler.topP !== undefined) {
       body.top_p = sampler.topP;
     }
-    if (sampler.topK !== undefined) {
+    if (sampler.topK !== undefined && sampler.topK > 0) {
       body.top_k = sampler.topK;
     }
     if (sampler.stop !== undefined && sampler.stop.length > 0) {

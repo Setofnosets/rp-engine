@@ -47,6 +47,7 @@ import type { TerrainTheme } from '../combat/grid-types.js';
 import { SkillRegistry } from '../combat/skill-registry.js';
 import {
   type ControlRoomLayer,
+  type GenerationPresetConfig,
   type PayloadGroupId,
   type ResolvedControlRoomConfig,
   cloneControlRoomLayer,
@@ -54,6 +55,12 @@ import {
   createEmptyControlRoomLayer,
   resolveEffectiveControlRoomConfig,
 } from '../config/control-room-config.js';
+import {
+  type UserPersonaPreset,
+  buildPlayerPatchFromPersona,
+  cloneUserPersonaPreset,
+  validateUserPersonaPreset,
+} from '../config/persona-preset.js';
 import {
   applySelectivePayloadGroups,
   createPayloadBundleFromSystemPack,
@@ -67,7 +74,7 @@ import { RefereeError, type ValidationError, validationError } from '../core/err
 import type { RngState } from '../core/prng.js';
 import { type Result, err, ok } from '../core/result.js';
 import type { ModelGateway } from '../gateway/model-gateway.js';
-import type { ChatMessage } from '../gateway/types.js';
+import type { ChatMessage, SamplingParameters } from '../gateway/types.js';
 import { executeSandboxedScript } from '../sandbox/quickjs-host.js';
 import {
   type CadenceContext,
@@ -89,16 +96,19 @@ import {
   buildFormIndex,
   buildFormRuleDependencyIndex,
 } from '../state/forms.js';
-import type { PatchBatch, PatchOperation } from '../state/patch.js';
+import type { PatchBatch, PatchOperation, PatchSource } from '../state/patch.js';
 import {
   appendAuditRecords,
   appendEventRecord,
   initSaveDirectory,
+  loadSessionSave,
+  saveActivePersonaAtomic,
   saveCheckpointAtomic,
+  saveControlRoomLayerAtomic,
   saveSwipeTreeAtomic,
 } from '../state/persistence.js';
 import { applyPatchBatch } from '../state/reducer.js';
-import type { EventLogRecord } from '../state/replay.js';
+import { type EventLogRecord, replayFromEvents } from '../state/replay.js';
 import { validateTravelTarget } from '../state/spatial-topology.js';
 import {
   type StateCheckpoint,
@@ -136,6 +146,13 @@ import {
   executeDowntime,
   executeTravel,
 } from '../world/flow-hooks.js';
+import {
+  type CharacterDossier,
+  type SettingCharacterFilter,
+  type SettingRosterInspection,
+  inspectCharacterDossier as inspectCharacterDossierHelper,
+  inspectSettingCharacters as inspectSettingCharactersHelper,
+} from '../world/character-inspector.js';
 import { type DirectorSteeringInput, applyDirectorSteering } from './director-steering.js';
 import { SessionEventBus } from './event-bus.js';
 
@@ -144,6 +161,7 @@ export interface SessionRuntimeOptions {
   readonly cartridge?: CartridgeBundle | null;
   readonly systemPack?: SystemPack;
   readonly userControlRoomLayer?: ControlRoomLayer;
+  readonly userPersona?: UserPersonaPreset | null;
   readonly gateway: ModelGateway;
   readonly seed?: string | number;
   readonly saveDir?: string | null;
@@ -459,6 +477,97 @@ function cloneOperation(op: PatchOperation): PatchOperation {
   return JSON.parse(JSON.stringify(op)) as PatchOperation;
 }
 
+function serializeCombatStateSnapshot(
+  combatState: CombatState | null
+): Record<string, unknown> | null {
+  return combatState
+    ? (cloneCombatStateSnapshot(combatState) as unknown as Record<string, unknown>)
+    : null;
+}
+
+function restoreCombatStateSnapshot(
+  raw: Record<string, unknown> | null | undefined
+): CombatState | null {
+  if (raw === null || raw === undefined || !isPlainObject(raw)) {
+    return null;
+  }
+  const active = Object.hasOwn(raw, 'active') ? Object.getOwnPropertyDescriptor(raw, 'active')?.value : undefined;
+  const mode = Object.hasOwn(raw, 'mode') ? Object.getOwnPropertyDescriptor(raw, 'mode')?.value : undefined;
+  const round = Object.hasOwn(raw, 'round') ? Object.getOwnPropertyDescriptor(raw, 'round')?.value : undefined;
+  const turnIndex = Object.hasOwn(raw, 'turnIndex')
+    ? Object.getOwnPropertyDescriptor(raw, 'turnIndex')?.value
+    : undefined;
+  const initiativeOrder = Object.hasOwn(raw, 'initiativeOrder')
+    ? Object.getOwnPropertyDescriptor(raw, 'initiativeOrder')?.value
+    : undefined;
+  const combatants = Object.hasOwn(raw, 'combatants')
+    ? Object.getOwnPropertyDescriptor(raw, 'combatants')?.value
+    : undefined;
+  const triggerCountsThisTurn = Object.hasOwn(raw, 'triggerCountsThisTurn')
+    ? Object.getOwnPropertyDescriptor(raw, 'triggerCountsThisTurn')?.value
+    : undefined;
+  if (
+    typeof active !== 'boolean' ||
+    (mode !== 'tactical_grid' && mode !== 'traditional') ||
+    typeof round !== 'number' ||
+    typeof turnIndex !== 'number' ||
+    !Array.isArray(initiativeOrder) ||
+    !isPlainObject(combatants) ||
+    !isPlainObject(triggerCountsThisTurn)
+  ) {
+    return null;
+  }
+  return cloneCombatStateSnapshot(raw as unknown as CombatState);
+}
+
+function extractNarratorSamplingParameters(
+  generation: GenerationPresetConfig | undefined
+): SamplingParameters {
+  if (generation === undefined) {
+    return {};
+  }
+  const params: Record<string, unknown> = {};
+  const numericKeys = [
+    'temperature',
+    'maxTokens',
+    'maxContextTokens',
+    'topP',
+    'topK',
+    'minP',
+    'topA',
+    'typicalP',
+    'tfs',
+    'frequencyPenalty',
+    'presencePenalty',
+    'repetitionPenalty',
+    'seed',
+  ] as const;
+  for (const key of numericKeys) {
+    const val = generation[key];
+    if (typeof val === 'number' && Number.isFinite(val)) {
+      params[key] = val;
+    }
+  }
+  if (Array.isArray(generation.stopSequences)) {
+    params['stopSequences'] = [...generation.stopSequences];
+  }
+  return params as SamplingParameters;
+}
+
+function computeNextSequenceFromIds(keys: readonly string[]): number {
+  let maxSuffix = 0;
+  for (const key of keys) {
+    const match = /-(\d+)$/.exec(key);
+    if (match?.[1] !== undefined) {
+      const parsed = Number.parseInt(match[1], 10);
+      if (Number.isFinite(parsed) && parsed > maxSuffix) {
+        maxSuffix = parsed;
+      }
+    }
+  }
+  return Math.max(maxSuffix, keys.length);
+}
+
 function resolveTranscriptEndingAt(
   tree: SwipeTreeState,
   leafMessageId: string | null,
@@ -568,6 +677,7 @@ export class SessionRuntime {
 
   private basePack: SystemPack;
   private userLayer: ControlRoomLayer;
+  private activePersona: UserPersonaPreset | null = null;
   private config: ResolvedControlRoomConfig;
   private fullCompiledSchema: CompiledTrackerSchema;
 
@@ -591,6 +701,7 @@ export class SessionRuntime {
   private readonly initialCheckpoint: StateCheckpoint;
   private readonly initialSwipeTree: SwipeTreeState;
   private saveInitialized = false;
+  private pendingDiskSave: Promise<void> = Promise.resolve();
 
   private auditSeq = 1;
   private msgSeq = 0;
@@ -661,6 +772,7 @@ export class SessionRuntime {
       clockAdvancedThisTurn: true,
       combatEndedThisTurn: true,
       manualTrigger: true,
+      autoRegisterEmergentNpcs: this.isAutoRegisterEmergentNpcsEnabled(),
     });
 
     if (options.skillRegistry !== undefined) {
@@ -695,7 +807,46 @@ export class SessionRuntime {
     this.formRuleDependencyIndex =
       this.formRules.length > 0 ? buildFormRuleDependencyIndex(this.formRules) : undefined;
 
-    const initialWorld = createWorldState(buildInitialWorldStateOptions(options, this.config));
+    let initialWorld = createWorldState(buildInitialWorldStateOptions(options, this.config));
+
+    if (options.userPersona !== undefined && options.userPersona !== null) {
+      const personaRes = validateUserPersonaPreset(options.userPersona);
+      if (!personaRes.ok) {
+        throw new RefereeError('Invalid userPersona provided to SessionRuntime', {
+          code: 'INVALID_USER_PERSONA',
+          details: personaRes.error,
+        });
+      }
+      const validatedPersona = personaRes.value;
+      const ops = buildPlayerPatchFromPersona(validatedPersona, initialWorld);
+      if (ops.length > 0) {
+        const patchRes = applyPatchBatch(
+          initialWorld,
+          {
+            eventId: 'init:user_persona',
+            source: 'user_director',
+            operations: ops,
+            reason: `Apply initial user persona "${validatedPersona.name}"`,
+          },
+          {
+            compiledSchema: this.fullCompiledSchema,
+            formIndex: this.formIndex,
+            auditSeqStart: this.auditSeq,
+          }
+        );
+        if (!patchRes.ok) {
+          throw new RefereeError('Failed to apply initial userPersona to WorldState', {
+            code: 'INVALID_USER_PERSONA',
+            details: patchRes.error,
+          });
+        }
+        initialWorld = patchRes.value.nextState;
+        this.auditSeq += patchRes.value.auditEntries.length;
+        this.auditLog.push(...patchRes.value.auditEntries);
+      }
+      this.activePersona = cloneUserPersonaPreset(validatedPersona);
+    }
+
     if (this.cartridge?.initialState?.scene?.presentCharacterIds === undefined) {
       const cast = computeLocationCast(initialWorld, this.formDefinitions);
       initialWorld.scene.presentCharacterIds = cast.presentCharacterIds;
@@ -711,11 +862,306 @@ export class SessionRuntime {
       worldState: cloneWorldState(this.state),
       beatLedger: serializedLedger,
       rngState: cloneRngState(this.state.meta.rngState),
-      stateHash: computeStateHash(this.state, serializedLedger),
+      stateHash: computeStateHash(this.state, serializedLedger, null),
+      combatState: null,
     };
     this.initialCheckpoint = cp0;
-    this.swipeTree = createSwipeTree(cp0);
-    this.initialSwipeTree = createSwipeTree(cp0);
+    let initialTree = createSwipeTree(cp0);
+    let initTreeSnapshot = createSwipeTree(cp0);
+
+    const rawFirstMessage = this.cartridge?.card.persona.firstMessage;
+    if (typeof rawFirstMessage === 'string' && rawFirstMessage.trim().length > 0) {
+      const firstMessage = rawFirstMessage.trim();
+      const greetingRes = appendMessageTurn(initialTree, {
+        messageId: 'msg-greeting-0',
+        parentMessageId: null,
+        role: 'assistant',
+        content: firstMessage,
+        checkpoint: cp0,
+        createdAtSeq: 0,
+      });
+      if (greetingRes.ok) {
+        initialTree = greetingRes.value;
+      }
+      const initGreetingRes = appendMessageTurn(initTreeSnapshot, {
+        messageId: 'msg-greeting-0',
+        parentMessageId: null,
+        role: 'assistant',
+        content: firstMessage,
+        checkpoint: cp0,
+        createdAtSeq: 0,
+      });
+      if (initGreetingRes.ok) {
+        initTreeSnapshot = initGreetingRes.value;
+      }
+    }
+
+    this.swipeTree = initialTree;
+    this.initialSwipeTree = initTreeSnapshot;
+  }
+
+  /**
+   * Reconstruct a {@link SessionRuntime} from an existing on-disk session save directory,
+   * replaying delta events beyond the latest snapshot and restoring swipe tree, Control Room
+   * overrides, active persona, and combat state.
+   */
+  static async fromSaveDirectory(
+    saveDir: string,
+    options: Omit<SessionRuntimeOptions, 'saveDir' | 'userControlRoomLayer' | 'userPersona'> & {
+      overrideUserLayer?: ControlRoomLayer;
+      overrideUserPersona?: UserPersonaPreset | null;
+    }
+  ): Promise<Result<SessionRuntime, ValidationError[]>> {
+    if (typeof saveDir !== 'string' || saveDir.trim().length === 0) {
+      return err([validationError('saveDir', 'REQUIRED', 'saveDir must be a non-empty string')]);
+    }
+    if (typeof options.sessionId !== 'string' || options.sessionId.trim().length === 0) {
+      return err([
+        validationError('sessionId', 'INVALID_SESSION_ID', 'sessionId must be a non-empty string'),
+      ]);
+    }
+
+    const loadedRes = await loadSessionSave(saveDir);
+    if (!loadedRes.ok) {
+      return err(loadedRes.error);
+    }
+    const loaded = loadedRes.value;
+
+    const cartridge = options.cartridge ?? null;
+    const expectedCartridgeId = cartridge?.card.id ?? 'freeform';
+    if (loaded.manifest.cartridgeId !== expectedCartridgeId) {
+      return err([
+        validationError(
+          'cartridge',
+          'CARTRIDGE_MISMATCH',
+          `Save manifest expects cartridge "${loaded.manifest.cartridgeId}", got "${expectedCartridgeId}"`
+        ),
+      ]);
+    }
+
+    let basePack: SystemPack;
+    if (cartridge !== null) {
+      const packRes = resolveEffectivePackForCartridge(cartridge, options.systemPack);
+      if (!packRes.ok) {
+        return err(packRes.error);
+      }
+      basePack = packRes.value;
+    } else if (options.systemPack !== undefined) {
+      const packRes = parseAndValidateSystemPack(options.systemPack);
+      if (!packRes.ok) {
+        return err(packRes.error);
+      }
+      basePack = packRes.value;
+    } else {
+      basePack = STOCK_FREEFORM_PACK;
+    }
+
+    if (basePack.id !== loaded.manifest.systemPackId) {
+      return err([
+        validationError(
+          'systemPack',
+          'SYSTEM_PACK_MISMATCH',
+          `Save manifest expects systemPack "${loaded.manifest.systemPackId}", got "${basePack.id}"`
+        ),
+      ]);
+    }
+
+    const userLayer = options.overrideUserLayer
+      ? cloneControlRoomLayer(options.overrideUserLayer)
+      : loaded.userControlRoomLayer
+        ? cloneControlRoomLayer(loaded.userControlRoomLayer)
+        : createEmptyControlRoomLayer();
+
+    const config = resolveEffectiveControlRoomConfig(
+      basePack,
+      cartridge?.systemOverrides,
+      userLayer
+    );
+    const capCheck = validateSystemCapabilities(config.capabilities, 'capabilities');
+    if (!capCheck.ok) {
+      return err(capCheck.error);
+    }
+
+    let activePersona: UserPersonaPreset | null = null;
+    if (options.overrideUserPersona !== undefined) {
+      if (options.overrideUserPersona !== null) {
+        const personaRes = validateUserPersonaPreset(options.overrideUserPersona);
+        if (!personaRes.ok) {
+          return err(personaRes.error);
+        }
+        activePersona = cloneUserPersonaPreset(personaRes.value);
+      }
+    } else if (loaded.activePersona !== undefined && loaded.activePersona !== null) {
+      activePersona = cloneUserPersonaPreset(loaded.activePersona);
+    }
+
+    if (options.skillRegistry === undefined && cartridge?.combat?.skills !== undefined) {
+      const tempRegistry = SkillRegistry.createDefaultSkillCatalog();
+      for (const skill of cartridge.combat.skills) {
+        if (tempRegistry.get(skill.id) === undefined) {
+          const regRes = tempRegistry.register(skill);
+          if (!regRes.ok) {
+            return err(regRes.error);
+          }
+        }
+      }
+    }
+
+    const beats = cartridge?.beats ?? [];
+    const formDefinitions = cartridge?.initialEntities?.forms ?? [];
+    const formIndex = formDefinitions.length > 0 ? buildFormIndex(formDefinitions) : undefined;
+    const autoRegisterEmergentNpcs =
+      config.tuningDials.autoRegisterEmergentNpcs ??
+      config.capabilities.spatialMode !== 'authored_graph';
+    const fullCompiledSchema = compileActiveTrackerSchema(config, {
+      turn: loaded.manifest.currentTurn,
+      clockAdvancedThisTurn: true,
+      combatEndedThisTurn: true,
+      manualTrigger: true,
+      autoRegisterEmergentNpcs,
+    });
+
+    const maxEventTurn = loaded.events.reduce((max, ev) => Math.max(max, ev.turn), 0);
+    let leafCheckpoint: StateCheckpoint | undefined;
+    if (loaded.swipeTree !== null && loaded.swipeTree.activeLeafMessageId !== null) {
+      const leafNode = getOwn(loaded.swipeTree.nodes, loaded.swipeTree.activeLeafMessageId);
+      const leafSwipe = leafNode?.swipes[leafNode.activeSwipeIndex];
+      if (leafSwipe !== undefined) {
+        leafCheckpoint = getOwn(loaded.swipeTree.checkpoints, leafSwipe.stateCheckpointId);
+      }
+    }
+
+    if (loaded.latestCheckpoint === null && leafCheckpoint === undefined) {
+      return err([
+        validationError(
+          'saveDir',
+          'MISSING_CHECKPOINT',
+          `Save directory "${saveDir}" contains no checkpoint to restore from`
+        ),
+      ]);
+    }
+
+    const baseAuditSeq =
+      loaded.auditEntries.reduce((max, entry) => Math.max(max, entry.timestampSeq), 0) + 1;
+    let restoredState: WorldState;
+    let restoredLedger: BeatLedgerState;
+    let restoredCombatState: CombatState | null;
+    let nextAuditSeq = baseAuditSeq;
+
+    if (
+      loaded.latestCheckpoint !== null &&
+      (leafCheckpoint === undefined ||
+        loaded.latestCheckpoint.turn > leafCheckpoint.turn ||
+        maxEventTurn > leafCheckpoint.turn)
+    ) {
+      const deltaEvents = loaded.events.filter((ev) => ev.turn > loaded.latestCheckpoint!.turn);
+      if (deltaEvents.length > 0) {
+        const replayRes = replayFromEvents(loaded.latestCheckpoint.worldState, deltaEvents, {
+          compiledSchema: fullCompiledSchema,
+          formIndex,
+          auditSeqStart: baseAuditSeq,
+        });
+        if (!replayRes.ok) {
+          return err(replayRes.error);
+        }
+        restoredState = replayRes.value.finalState;
+      } else {
+        restoredState = cloneWorldState(loaded.latestCheckpoint.worldState);
+      }
+      restoredLedger = deserializeBeatLedger(loaded.latestCheckpoint.beatLedger, beats);
+      restoredCombatState = restoreCombatStateSnapshot(loaded.latestCheckpoint.combatState);
+    } else if (leafCheckpoint !== undefined) {
+      restoredState = cloneWorldState(leafCheckpoint.worldState);
+      restoredState.meta.rngState = cloneRngState(leafCheckpoint.rngState);
+      restoredLedger = deserializeBeatLedger(leafCheckpoint.beatLedger, beats);
+      const rawCombat =
+        leafCheckpoint.combatState !== undefined
+          ? leafCheckpoint.combatState
+          : loaded.latestCheckpoint?.combatState;
+      restoredCombatState = restoreCombatStateSnapshot(rawCombat);
+    } else {
+      return err([
+        validationError(
+          'saveDir',
+          'MISSING_CHECKPOINT',
+          `Save directory "${saveDir}" contains no valid checkpoint`
+        ),
+      ]);
+    }
+
+    restoredState.capabilities = cloneSystemCapabilities(config.capabilities);
+
+    if (options.overrideUserPersona !== undefined && activePersona !== null) {
+      const ops = buildPlayerPatchFromPersona(activePersona, restoredState);
+      if (ops.length > 0) {
+        const patchRes = applyPatchBatch(
+          restoredState,
+          {
+            eventId: `resume:user_persona:t${restoredState.meta.turn}:s${nextAuditSeq}`,
+            source: 'user_director',
+            operations: ops,
+            reason: `Apply override user persona "${activePersona.name}" on resume`,
+          },
+          {
+            compiledSchema: fullCompiledSchema,
+            formIndex,
+            auditSeqStart: nextAuditSeq,
+          }
+        );
+        if (!patchRes.ok) {
+          return err(patchRes.error);
+        }
+        restoredState = patchRes.value.nextState;
+        nextAuditSeq += patchRes.value.auditEntries.length;
+      }
+    }
+
+    let restoredTree: SwipeTreeState;
+    if (loaded.swipeTree !== null) {
+      restoredTree = loaded.swipeTree;
+    } else {
+      const serializedLedger = serializeBeatLedger(restoredLedger);
+      const combatSnapshot = serializeCombatStateSnapshot(restoredCombatState);
+      const fallbackCp: StateCheckpoint = {
+        checkpointId: `cp-turn-${restoredState.meta.turn}`,
+        turn: restoredState.meta.turn,
+        worldState: cloneWorldState(restoredState),
+        beatLedger: serializedLedger,
+        rngState: cloneRngState(restoredState.meta.rngState),
+        stateHash: computeStateHash(restoredState, serializedLedger, combatSnapshot),
+        combatState: combatSnapshot,
+      };
+      restoredTree = createSwipeTree(fallbackCp);
+    }
+
+    const runtime = new SessionRuntime({
+      sessionId: options.sessionId,
+      cartridge,
+      systemPack: basePack,
+      userControlRoomLayer: userLayer,
+      gateway: options.gateway,
+      seed: options.seed,
+      saveDir,
+      skillRegistry: options.skillRegistry,
+      useBoundaryLlmAgents: options.useBoundaryLlmAgents,
+    });
+
+    runtime.userLayer = userLayer;
+    runtime.config = config;
+    runtime.fullCompiledSchema = fullCompiledSchema;
+    runtime.activePersona = activePersona;
+    runtime.state = restoredState;
+    runtime.beatLedger = restoredLedger;
+    runtime.swipeTree = restoredTree;
+    runtime.combatState = restoredCombatState;
+    runtime.auditLog.length = 0;
+    runtime.auditLog.push(...loaded.auditEntries);
+    runtime.auditSeq = nextAuditSeq;
+    runtime.msgSeq = computeNextSequenceFromIds(Object.keys(restoredTree.nodes));
+    runtime.checkpointSeq = computeNextSequenceFromIds(Object.keys(restoredTree.checkpoints));
+    runtime.saveInitialized = true;
+
+    return ok(runtime);
   }
 
   getState(): WorldState {
@@ -801,6 +1247,79 @@ export class SessionRuntime {
     return ok(cloneWorldState(this.state));
   }
 
+  getActivePersona(): UserPersonaPreset | null {
+    return this.activePersona ? cloneUserPersonaPreset(this.activePersona) : null;
+  }
+
+  /**
+   * Apply or clear the active {@link UserPersonaPreset}, updating `WorldState.player`
+   * atomically and persisting `persona.json` when disk persistence is initialized.
+   */
+  async applyUserPersona(
+    persona: UserPersonaPreset | null
+  ): Promise<Result<WorldState, ValidationError[]>> {
+    if (persona === null) {
+      if (this.saveDir !== null && this.saveInitialized) {
+        await this.pendingDiskSave;
+        const saveRes = await saveActivePersonaAtomic(this.saveDir, null);
+        if (!saveRes.ok) {
+          return err(saveRes.error);
+        }
+      }
+      this.activePersona = null;
+      return ok(cloneWorldState(this.state));
+    }
+
+    const validatedRes = validateUserPersonaPreset(persona);
+    if (!validatedRes.ok) {
+      return err(validatedRes.error);
+    }
+    const validated = validatedRes.value;
+    const ops = buildPlayerPatchFromPersona(validated, this.state);
+
+    let nextState = cloneWorldState(this.state);
+    let nextAuditSeq = this.auditSeq;
+    let newEntries: AuditEntry[] = [];
+
+    if (ops.length > 0) {
+      const batchRes = applyPatchBatch(
+        this.state,
+        {
+          eventId: `persona:apply:t${this.state.meta.turn}:s${this.auditSeq}`,
+          source: 'user_director',
+          operations: ops,
+          reason: `Apply user persona "${validated.name}"`,
+        },
+        {
+          compiledSchema: this.fullCompiledSchema,
+          formIndex: this.formIndex,
+          auditSeqStart: this.auditSeq,
+        }
+      );
+      if (!batchRes.ok) {
+        return err(batchRes.error);
+      }
+      nextState = batchRes.value.nextState;
+      nextAuditSeq += batchRes.value.auditEntries.length;
+      newEntries = batchRes.value.auditEntries;
+    }
+
+    if (this.saveDir !== null && this.saveInitialized) {
+      await this.pendingDiskSave;
+      const saveRes = await saveActivePersonaAtomic(this.saveDir, validated);
+      if (!saveRes.ok) {
+        return err(saveRes.error);
+      }
+    }
+
+    this.state = nextState;
+    this.auditSeq = nextAuditSeq;
+    this.auditLog.push(...newEntries);
+    this.activePersona = cloneUserPersonaPreset(validated);
+
+    return ok(cloneWorldState(this.state));
+  }
+
   /**
    * Bind the player to a canon character or custom persona overlay.
    */
@@ -834,6 +1353,242 @@ export class SessionRuntime {
     }
     this.state = nextState;
     return ok(cloneWorldState(this.state));
+  }
+
+  /**
+   * Update the active player profile (`activePersona` and `WorldState.player` fields) cleanly.
+   */
+  async updatePlayerProfile(patch: {
+    name?: string;
+    description?: string;
+    sections?: Record<string, string | string[]>;
+    customFields?: Record<string, unknown>;
+    characterId?: string | null;
+  }): Promise<Result<WorldState, ValidationError[]>> {
+    if (!isPlainObject(patch as unknown)) {
+      return err([
+        validationError('patch', 'INVALID_TYPE', 'Player profile patch must be a plain object'),
+      ]);
+    }
+    for (const key of Object.getOwnPropertyNames(patch)) {
+      if (!isSafeKey(key)) {
+        return err([
+          validationError(`patch.${key}`, 'UNSAFE_KEY', `Forbidden key "${key}" in profile patch`),
+        ]);
+      }
+    }
+
+    if (patch.characterId !== undefined && patch.characterId !== null) {
+      if (
+        typeof patch.characterId !== 'string' ||
+        !isSafeKey(patch.characterId) ||
+        !Object.hasOwn(this.state.entities.characters, patch.characterId)
+      ) {
+        return err([
+          validationError(
+            'characterId',
+            'UNRESOLVED_CHARACTER',
+            `Character "${String(patch.characterId)}" does not exist`
+          ),
+        ]);
+      }
+    }
+
+    const basePersona: UserPersonaPreset = this.activePersona
+      ? cloneUserPersonaPreset(this.activePersona)
+      : {
+          id: `profile-${this.sessionId}`,
+          name: this.state.player.name,
+          description: '',
+          characterId: this.state.player.characterId,
+          sections: { ...this.state.player.sections },
+          customFields: { ...this.state.player.customFields },
+        };
+
+    const nextSections: Record<string, string | string[]> = {};
+    if (basePersona.sections !== undefined) {
+      for (const [k, v] of Object.entries(basePersona.sections)) {
+        if (isSafeKey(k)) {
+          setOwn(nextSections, k, Array.isArray(v) ? [...v] : v);
+        }
+      }
+    }
+    if (patch.sections !== undefined) {
+      if (!isPlainObject(patch.sections as unknown)) {
+        return err([validationError('sections', 'INVALID_TYPE', 'sections must be a plain object')]);
+      }
+      for (const key of Object.getOwnPropertyNames(patch.sections)) {
+        if (!isSafeKey(key)) {
+          return err([
+            validationError(`sections.${key}`, 'UNSAFE_KEY', `Forbidden section key "${key}"`),
+          ]);
+        }
+        const val = Object.getOwnPropertyDescriptor(patch.sections, key)?.value;
+        if (typeof val === 'string') {
+          setOwn(nextSections, key, val);
+        } else if (Array.isArray(val) && val.every((item) => typeof item === 'string')) {
+          setOwn(nextSections, key, [...val]);
+        } else {
+          return err([
+            validationError(
+              `sections.${key}`,
+              'INVALID_TYPE',
+              `sections.${key} must be a string or string[]`
+            ),
+          ]);
+        }
+      }
+    }
+
+    const nextCustomFields: Record<string, unknown> = {};
+    if (basePersona.customFields !== undefined) {
+      for (const [k, v] of Object.entries(basePersona.customFields)) {
+        if (isSafeKey(k)) {
+          setOwn(nextCustomFields, k, v);
+        }
+      }
+    }
+    if (patch.customFields !== undefined) {
+      if (!isPlainObject(patch.customFields as unknown)) {
+        return err([
+          validationError('customFields', 'INVALID_TYPE', 'customFields must be a plain object'),
+        ]);
+      }
+      for (const key of Object.getOwnPropertyNames(patch.customFields)) {
+        if (!isSafeKey(key)) {
+          return err([
+            validationError(
+              `customFields.${key}`,
+              'UNSAFE_KEY',
+              `Forbidden customField key "${key}"`
+            ),
+          ]);
+        }
+        const val = Object.getOwnPropertyDescriptor(patch.customFields, key)?.value;
+        if (val !== undefined) {
+          setOwn(nextCustomFields, key, val);
+        }
+      }
+    }
+
+    const candidate: UserPersonaPreset = {
+      id: basePersona.id,
+      name: patch.name !== undefined ? patch.name : basePersona.name,
+      description: patch.description !== undefined ? patch.description : basePersona.description,
+      ...(patch.characterId !== undefined
+        ? { characterId: patch.characterId }
+        : basePersona.characterId !== undefined
+          ? { characterId: basePersona.characterId }
+          : {}),
+      sections: nextSections,
+      customFields: nextCustomFields,
+      ...(basePersona.resources !== undefined ? { resources: basePersona.resources } : {}),
+      ...(basePersona.progression !== undefined ? { progression: basePersona.progression } : {}),
+      ...(basePersona.updatedAt !== undefined ? { updatedAt: basePersona.updatedAt } : {}),
+    };
+
+    return this.applyUserPersona(candidate);
+  }
+
+  /**
+   * Inspect all characters in the setting with optional filtering by location, status, or query.
+   */
+  inspectSettingCharacters(filter?: SettingCharacterFilter): SettingRosterInspection {
+    return inspectSettingCharactersHelper(this.state, this.config, {
+      filter,
+      formDefinitions: this.formDefinitions,
+    });
+  }
+
+  /**
+   * Inspect the full character dossier for the player or an NPC by ID or case-insensitive name.
+   */
+  inspectCharacterDossier(idOrName: string): CharacterDossier | null {
+    return inspectCharacterDossierHelper(this.state, this.config, idOrName, {
+      formDefinitions: this.formDefinitions,
+    });
+  }
+
+  /**
+   * Atomically register or update a character in `WorldState.entities.characters` and re-sync
+   * `scene.presentCharacterIds`.
+   */
+  upsertCharacter(
+    characterId: string,
+    character: Partial<Omit<CharacterEntity, 'id'>> & { name: string },
+    source: PatchSource = 'user_director'
+  ): Result<WorldState, ValidationError[]> {
+    const batchRes = applyPatchBatch(
+      this.state,
+      {
+        eventId: `character:upsert:${characterId}:t${this.state.meta.turn}:s${this.auditSeq}`,
+        source,
+        operations: [
+          {
+            op: 'character_upsert',
+            characterId,
+            character,
+            mergeIfExists: true,
+          },
+        ],
+        reason: `Upsert character "${characterId}"`,
+      },
+      {
+        compiledSchema: this.fullCompiledSchema,
+        formIndex: this.formIndex,
+        auditSeqStart: this.auditSeq,
+      }
+    );
+    if (!batchRes.ok) {
+      return err(batchRes.error);
+    }
+
+    let nextState = batchRes.value.nextState;
+    let nextAuditSeq = this.auditSeq + batchRes.value.auditEntries.length;
+    const newAuditEntries = [...batchRes.value.auditEntries];
+
+    const cast = computeLocationCast(nextState, this.formDefinitions);
+    if (!arraysEqual(cast.presentCharacterIds, nextState.scene.presentCharacterIds)) {
+      const castRes = applyPatchBatch(
+        nextState,
+        {
+          eventId: `character:upsert:${characterId}:cast_sync:t${nextState.meta.turn}:s${nextAuditSeq}`,
+          source: 'engine',
+          operations: [
+            {
+              op: 'set',
+              path: 'scene.presentCharacterIds',
+              value: cast.presentCharacterIds,
+            },
+          ],
+          reason: `Sync scene.presentCharacterIds after character upsert "${characterId}"`,
+        },
+        {
+          compiledSchema: this.fullCompiledSchema,
+          formIndex: this.formIndex,
+          auditSeqStart: nextAuditSeq,
+        }
+      );
+      if (!castRes.ok) {
+        return err(castRes.error);
+      }
+      nextState = castRes.value.nextState;
+      nextAuditSeq += castRes.value.auditEntries.length;
+      newAuditEntries.push(...castRes.value.auditEntries);
+    }
+
+    this.state = nextState;
+    this.auditSeq = nextAuditSeq;
+    this.auditLog.push(...newAuditEntries);
+
+    return ok(cloneWorldState(this.state));
+  }
+
+  /**
+   * Wait for any queued background Control Room disk saves to complete.
+   */
+  async flushPendingSaves(): Promise<void> {
+    await this.pendingDiskSave;
   }
 
   /**
@@ -1125,7 +1880,7 @@ export class SessionRuntime {
       turnEventRecords.push({
         turn: workingState.meta.turn,
         batch,
-        postStateHash: computeStateHash(workingState, serializeBeatLedger(workingLedger)),
+        postStateHash: computeStateHash(workingState),
         rngBefore,
         rngAfter: cloneRngState(workingState.meta.rngState),
       });
@@ -1384,6 +2139,7 @@ export class SessionRuntime {
         ledger: workingLedger,
         steering: input.directorSteering,
         beats: this.beats,
+        formDefinitions: this.formDefinitions,
         reducerOptions: {
           compiledSchema: this.fullCompiledSchema,
           formIndex: this.formIndex,
@@ -1631,13 +2387,15 @@ export class SessionRuntime {
 
     // Step 9: Record user & assistant message nodes in SwipeTreeState and persist if saveDir is set.
     const userSerializedLedger = serializeBeatLedger(preResponseLedger);
+    const preResponseCombatSnapshot = serializeCombatStateSnapshot(workingCombatState);
     const userCheckpoint: StateCheckpoint = {
       checkpointId: this.allocateCheckpointId(preResponseState.meta.turn, 'user'),
       turn: preResponseState.meta.turn,
       worldState: preResponseState,
       beatLedger: userSerializedLedger,
       rngState: cloneRngState(preResponseState.meta.rngState),
-      stateHash: computeStateHash(preResponseState, userSerializedLedger),
+      stateHash: computeStateHash(preResponseState, userSerializedLedger, preResponseCombatSnapshot),
+      combatState: preResponseCombatSnapshot,
     };
 
     const treeAfterUserRes = appendMessageTurn(this.swipeTree, {
@@ -1652,13 +2410,15 @@ export class SessionRuntime {
     }
 
     const postSerializedLedger = serializeBeatLedger(workingLedger);
+    const postResponseCombatSnapshot = serializeCombatStateSnapshot(workingCombatState);
     const assistantCheckpoint: StateCheckpoint = {
       checkpointId: this.allocateCheckpointId(workingState.meta.turn, 'assistant'),
       turn: workingState.meta.turn,
       worldState: cloneWorldState(workingState),
       beatLedger: postSerializedLedger,
       rngState: cloneRngState(workingState.meta.rngState),
-      stateHash: computeStateHash(workingState, postSerializedLedger),
+      stateHash: computeStateHash(workingState, postSerializedLedger, postResponseCombatSnapshot),
+      combatState: postResponseCombatSnapshot,
     };
 
     const treeAfterAssistantRes = appendMessageTurn(treeAfterUserRes.value, {
@@ -1679,6 +2439,7 @@ export class SessionRuntime {
         turn: workingState.meta.turn,
         worldState: workingState,
         beatLedger: workingLedger,
+        combatState: postResponseCombatSnapshot,
         swipeTree: nextTree,
         eventRecords: turnEventRecords,
         auditEntries: turnAuditEntries,
@@ -1736,6 +2497,7 @@ export class SessionRuntime {
     let workingState = cloneWorldState(restoredCheckpoint.worldState);
     workingState.meta.rngState = cloneRngState(restoredCheckpoint.rngState);
     let workingLedger = deserializeBeatLedger(restoredCheckpoint.beatLedger, this.beats);
+    const workingCombatState = restoreCombatStateSnapshot(restoredCheckpoint.combatState);
     let workingAuditSeq = this.auditSeq;
 
     const turnAuditEntries: AuditEntry[] = [];
@@ -1756,6 +2518,7 @@ export class SessionRuntime {
         ledger: workingLedger,
         steering: options.directorSteering,
         beats: this.beats,
+        formDefinitions: this.formDefinitions,
         reducerOptions: {
           compiledSchema: this.fullCompiledSchema,
           formIndex: this.formIndex,
@@ -1882,13 +2645,15 @@ export class SessionRuntime {
     }
 
     const postSerializedLedger = serializeBeatLedger(workingLedger);
+    const variantCombatSnapshot = serializeCombatStateSnapshot(workingCombatState);
     const variantCheckpoint: StateCheckpoint = {
       checkpointId: this.allocateCheckpointId(workingState.meta.turn, `swipe-${nextSwipeIndex}`),
       turn: workingState.meta.turn,
       worldState: cloneWorldState(workingState),
       beatLedger: postSerializedLedger,
       rngState: cloneRngState(workingState.meta.rngState),
-      stateHash: computeStateHash(workingState, postSerializedLedger),
+      stateHash: computeStateHash(workingState, postSerializedLedger, variantCombatSnapshot),
+      combatState: variantCombatSnapshot,
     };
 
     const recordRes = recordSwipeVariant(this.swipeTree, assistantMessageId, {
@@ -1907,6 +2672,7 @@ export class SessionRuntime {
         turn: workingState.meta.turn,
         worldState: workingState,
         beatLedger: workingLedger,
+        combatState: variantCombatSnapshot,
         swipeTree: nextTree,
         eventRecords: turnEventRecords,
         auditEntries: turnAuditEntries,
@@ -1918,6 +2684,7 @@ export class SessionRuntime {
 
     this.state = workingState;
     this.beatLedger = workingLedger;
+    this.combatState = workingCombatState;
     this.swipeTree = nextTree;
     this.auditSeq = workingAuditSeq;
     this.auditLog.push(...turnAuditEntries);
@@ -2118,6 +2885,7 @@ export class SessionRuntime {
         turn: workingState.meta.turn,
         worldState: workingState,
         beatLedger: workingLedger,
+        combatState: serializeCombatStateSnapshot(this.combatState),
         swipeTree: nextTree,
         eventRecords: turnEventRecords,
         auditEntries: turnAuditEntries,
@@ -2171,6 +2939,7 @@ export class SessionRuntime {
     const restoredState = cloneWorldState(restoredCheckpoint.worldState);
     restoredState.meta.rngState = cloneRngState(restoredCheckpoint.rngState);
     const restoredLedger = deserializeBeatLedger(restoredCheckpoint.beatLedger, this.beats);
+    const restoredCombat = restoreCombatStateSnapshot(restoredCheckpoint.combatState);
 
     const node = getOwn(nextTree.nodes, assistantMessageId);
     const content = node?.swipes[swipeIndex]?.content ?? '';
@@ -2178,6 +2947,7 @@ export class SessionRuntime {
     this.swipeTree = nextTree;
     this.state = restoredState;
     this.beatLedger = restoredLedger;
+    this.combatState = restoredCombat;
     this.pendingConfirmations = [];
 
     this.eventBus.emit({
@@ -2357,9 +3127,25 @@ export class SessionRuntime {
       clockAdvancedThisTurn: true,
       combatEndedThisTurn: true,
       manualTrigger: true,
+      autoRegisterEmergentNpcs: this.isAutoRegisterEmergentNpcsEnabled(),
     });
+    this.scheduleControlRoomLayerSave();
 
     return ok(cloneResolvedControlRoomConfig(this.config));
+  }
+
+  /**
+   * Update the user Control Room override layer and await disk persistence when initialized.
+   */
+  async updateControlRoomLayer(
+    updater: (currentLayer: Readonly<ControlRoomLayer>) => ControlRoomLayer
+  ): Promise<Result<ResolvedControlRoomConfig, ValidationError[]>> {
+    const res = this.updateControlRoom(updater);
+    if (!res.ok) {
+      return res;
+    }
+    await this.pendingDiskSave;
+    return res;
   }
 
   /**
@@ -2398,9 +3184,29 @@ export class SessionRuntime {
       clockAdvancedThisTurn: true,
       combatEndedThisTurn: true,
       manualTrigger: true,
+      autoRegisterEmergentNpcs: this.isAutoRegisterEmergentNpcsEnabled(),
     });
+    this.scheduleControlRoomLayerSave();
 
     return ok(cloneResolvedControlRoomConfig(this.config));
+  }
+
+  private isAutoRegisterEmergentNpcsEnabled(): boolean {
+    return (
+      this.config.tuningDials.autoRegisterEmergentNpcs ??
+      this.config.capabilities.spatialMode !== 'authored_graph'
+    );
+  }
+
+  private scheduleControlRoomLayerSave(): void {
+    if (this.saveDir === null || !this.saveInitialized) {
+      return;
+    }
+    const dir = this.saveDir;
+    const layerSnapshot = cloneControlRoomLayer(this.userLayer);
+    this.pendingDiskSave = this.pendingDiskSave
+      .then(() => saveControlRoomLayerAtomic(dir, layerSnapshot).then(() => undefined))
+      .catch(() => undefined);
   }
 
   private getCardPersona(): {
@@ -2946,6 +3752,14 @@ export class SessionRuntime {
       state: workingState,
       config: this.config,
       cardPersona: this.getCardPersona(),
+      ...(this.activePersona !== null
+        ? {
+            userPersona: {
+              name: this.activePersona.name,
+              description: this.activePersona.description,
+            },
+          }
+        : {}),
       liveNudges: params.turnMeta.liveNudges,
       activeAmbient: params.turnMeta.activeAmbient,
       loreContents: this.cartridge?.loreFiles,
@@ -2963,10 +3777,12 @@ export class SessionRuntime {
     });
 
     // Step 7: Generate narrator reply
+    const samplingParams = extractNarratorSamplingParameters(this.config.generation);
     let narratorText = '';
     if (params.streamNarrator) {
       const chunks: string[] = [];
       for await (const chunkRes of this.gateway.streamText({
+        ...samplingParams,
         role: 'narrator',
         messages: compiledPrompt.messages,
         signal: params.signal,
@@ -2987,6 +3803,7 @@ export class SessionRuntime {
       narratorText = chunks.join('');
     } else {
       const genRes = await this.gateway.generateText({
+        ...samplingParams,
         role: 'narrator',
         messages: compiledPrompt.messages,
         signal: params.signal,
@@ -3048,7 +3865,7 @@ export class SessionRuntime {
       params.turnEventRecords.push({
         turn: workingState.meta.turn,
         batch,
-        postStateHash: computeStateHash(workingState, serializeBeatLedger(workingLedger)),
+        postStateHash: computeStateHash(workingState),
         rngBefore,
         rngAfter: cloneRngState(workingState.meta.rngState),
       });
@@ -3063,6 +3880,7 @@ export class SessionRuntime {
       turnContext,
       recentExchangeText,
       latestNarratorReply: narratorText,
+      autoRegisterEmergentNpcs: this.isAutoRegisterEmergentNpcsEnabled(),
       signal: params.signal,
     });
     params.turnWarnings.push(...trackerRes.warnings);
@@ -3172,6 +3990,7 @@ export class SessionRuntime {
     readonly turn: number;
     readonly worldState: WorldState;
     readonly beatLedger: BeatLedgerState;
+    readonly combatState: Record<string, unknown> | null;
     readonly swipeTree: SwipeTreeState;
     readonly eventRecords: readonly EventLogRecord[];
     readonly auditEntries: readonly AuditEntry[];
@@ -3179,6 +3998,8 @@ export class SessionRuntime {
     if (this.saveDir === null) {
       return ok(undefined);
     }
+
+    await this.pendingDiskSave;
 
     if (!this.saveInitialized) {
       const initRes = await initSaveDirectory(
@@ -3192,7 +4013,10 @@ export class SessionRuntime {
         {
           worldState: this.initialCheckpoint.worldState,
           beatLedger: this.initialCheckpoint.beatLedger,
+          combatState: this.initialCheckpoint.combatState ?? null,
           swipeTree: this.initialSwipeTree,
+          userControlRoomLayer: this.userLayer,
+          activePersona: this.activePersona,
         }
       );
       if (!initRes.ok) {
@@ -3225,7 +4049,8 @@ export class SessionRuntime {
         this.saveDir,
         params.turn,
         params.worldState,
-        serializeBeatLedger(params.beatLedger)
+        serializeBeatLedger(params.beatLedger),
+        params.combatState
       );
       if (!cpRes.ok) {
         return err(cpRes.error);

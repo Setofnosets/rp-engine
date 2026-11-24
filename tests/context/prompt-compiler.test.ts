@@ -7,9 +7,11 @@ import {
   toggleCapability,
   toggleGameSystemModule,
   upsertCustomField,
+  upsertCustomPromptBlock,
 } from '../../src/config/control-room-config.js';
 import {
   compileNarratorPrompt,
+  expandPromptMacros,
   validateCompilePromptInput,
 } from '../../src/context/prompt-compiler.js';
 import { renderWorldStateBlock } from '../../src/context/state-renderer.js';
@@ -1053,5 +1055,406 @@ describe('Director Nudge, [COMBAT_OUTCOME], Chronicle, CYOA, Overrides & Determi
 
     // Input WorldState remains completely unmutated
     expect(JSON.stringify(state)).toBe(stateSnapshot);
+  });
+});
+
+describe('Separate [PERSONA], Custom ST Blocks, Deterministic Macros & Config Budgets', () => {
+  it('renders [PERSONA] and [CARD] coexisting when both userPersona and cardPersona are supplied', () => {
+    const state = createWorldState({
+      capabilities: STOCK_SLICE_OF_LIFE_PACK.capabilities,
+      scene: { location: 'Starlight Conservatory' },
+    });
+    const config = resolveEffectiveControlRoomConfig(STOCK_SLICE_OF_LIFE_PACK);
+
+    const compiled = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona: {
+        name: 'Seraphina',
+        description: 'A sharp-witted botanist tending nocturnal orchids.',
+        personality: 'Analytical, curious, secretly romantic',
+        scenario: 'Late night rain taps against the glasshouse roof.',
+      },
+      userPersona: {
+        name: 'Rowan',
+        description: 'A quiet architectural photographer carrying a brass tripod.',
+      },
+      recentTranscript: [],
+      latestInput: 'I wipe rain from my lens and step inside.',
+    });
+
+    const personaText = compiled.renderedSections['persona'] ?? '';
+    const cardText = compiled.renderedSections['card'] ?? '';
+
+    expect(personaText).toBe(
+      '[PERSONA]\nName: Rowan\nA quiet architectural photographer carrying a brass tripod.'
+    );
+    expect(cardText).toContain('[CARD]');
+    expect(cardText).toContain('Name: Seraphina');
+    expect(cardText).toContain('Personality: Analytical, curious, secretly romantic');
+    expect(cardText).toContain('Scenario: Late night rain taps against the glasshouse roof.');
+
+    const sysMsg = compiled.messages[0]?.content ?? '';
+    expect(sysMsg).toContain('[PERSONA]');
+    expect(sysMsg).toContain('[CARD]');
+    expect(sysMsg.indexOf('[PERSONA]')).toBeLessThan(sysMsg.indexOf('[CARD]'));
+
+    // When card slot exists and userPersona is null/omitted, persona does NOT duplicate card
+    const withoutUserPersona = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona: {
+        name: 'Seraphina',
+        description: 'A sharp-witted botanist.',
+      },
+      userPersona: null,
+      recentTranscript: [],
+      latestInput: 'Hello.',
+    });
+    expect(withoutUserPersona.renderedSections['persona']).toBeUndefined();
+    expect(withoutUserPersona.renderedSections['card']).toContain('Seraphina');
+
+    // When card slot is absent AND userPersona is supplied, persona renders [PERSONA] (not [CARD])
+    const noCardSlotConfig = resolveEffectiveControlRoomConfig(STOCK_FREEFORM_PACK, undefined, {
+      syspromptSectionOrder: ['system', 'persona', 'state', 'transcript_window', 'latest_input'],
+    });
+    const userOnlyNoCard = compileNarratorPrompt({
+      state,
+      config: noCardSlotConfig,
+      cardPersona: { name: 'Seraphina', description: 'Botanist.' },
+      userPersona: { name: 'Rowan', description: 'Photographer.' },
+      recentTranscript: [],
+      latestInput: 'Hello.',
+    });
+    expect(userOnlyNoCard.renderedSections['persona']).toBe('[PERSONA]\nName: Rowan\nPhotographer.');
+
+    // Validate invalid userPersona shape via Result
+    const invalidUserPersona = validateCompilePromptInput({
+      state,
+      config,
+      cardPersona: { name: 'A', description: 'B' },
+      userPersona: { name: 42 as unknown as string, description: 'C' },
+      recentTranscript: [],
+      latestInput: 'Hi',
+    });
+    expect(isErr(invalidUserPersona)).toBe(true);
+  });
+
+  it('supports relative user/assistant customPromptBlocks, toggled-off blocks, and in_chat depth-0 / depth-2 splicing within token budgets', () => {
+    const state = createWorldState({
+      capabilities: STOCK_FREEFORM_PACK.capabilities,
+      scene: { location: 'Subway Platform 4' },
+      player: { name: 'Elena' },
+    });
+
+    let layer: ControlRoomLayer = {
+      syspromptSectionOrder: [
+        'system',
+        'persona',
+        'card',
+        'state',
+        'transcript_window',
+        'latest_input',
+      ],
+    };
+    layer = upsertCustomPromptBlock(
+      layer,
+      { id: 'rel_user', name: 'Relative User', role: 'user', injectionPosition: 'relative' },
+      'User preface for {{char}} and {{user}}.',
+      true
+    );
+    layer = upsertCustomPromptBlock(
+      layer,
+      {
+        id: 'rel_assistant',
+        name: 'Relative Assistant',
+        role: 'assistant',
+        injectionPosition: 'relative',
+      },
+      'Understood, pacing for {{user}}.',
+      true
+    );
+    layer = upsertCustomPromptBlock(
+      layer,
+      {
+        id: 'disabled_block',
+        name: 'Disabled Block',
+        role: 'user',
+        injectionPosition: 'relative',
+      },
+      'MUST NEVER APPEAR',
+      false
+    );
+    layer = upsertCustomPromptBlock(
+      layer,
+      {
+        id: 'inchat_d2',
+        name: 'Author Note',
+        role: 'system',
+        injectionPosition: 'in_chat',
+        injectionDepth: 2,
+      },
+      '[Author Note: Emphasize neon reflections.]',
+      true
+    );
+    layer = upsertCustomPromptBlock(
+      layer,
+      {
+        id: 'inchat_d0',
+        name: 'Post-History Instruction',
+        role: 'user',
+        injectionPosition: 'in_chat',
+        injectionDepth: 0,
+      },
+      '[Post-History for {{char}}: End with sensory detail.]',
+      true
+    );
+    layer = upsertCustomPromptBlock(
+      layer,
+      {
+        id: 'inchat_disabled',
+        name: 'Disabled In-Chat',
+        role: 'system',
+        injectionPosition: 'in_chat',
+        injectionDepth: 1,
+      },
+      'SHOULD BE SKIPPED',
+      false
+    );
+
+    const config = resolveEffectiveControlRoomConfig(STOCK_FREEFORM_PACK, undefined, layer);
+
+    const recentTranscript: ChatMessage[] = [
+      { role: 'user', content: 'Turn 1: Train pulls in.' },
+      { role: 'assistant', content: 'Turn 2: Brakes hiss along the damp rail.' },
+      { role: 'user', content: 'Turn 3: I check the ticket.' },
+      { role: 'assistant', content: 'Turn 4: The conductor nods toward car two.' },
+    ];
+
+    const compiled = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona: { name: 'Metro GM', description: 'Urban thriller.' },
+      recentTranscript,
+      latestInput: 'I board car two.',
+    });
+
+    // Disabled blocks are omitted completely
+    expect(compiled.renderedSections['disabled_block']).toBeUndefined();
+    expect(compiled.renderedSections['inchat_disabled']).toBeUndefined();
+    expect(compiled.tokenBreakdown['disabled_block']).toBe(0);
+    expect(compiled.tokenBreakdown['inchat_disabled']).toBe(0);
+    expect(compiled.messages.some((m) => m.content.includes('MUST NEVER APPEAR'))).toBe(false);
+    expect(compiled.messages.some((m) => m.content.includes('SHOULD BE SKIPPED'))).toBe(false);
+
+    // Relative user & assistant blocks flush systemBuffer and emit separate messages
+    expect(compiled.messages[0]?.role).toBe('system');
+    expect(compiled.messages[0]?.content).not.toContain('User preface');
+    expect(compiled.messages[0]?.content).not.toContain('Author Note');
+    expect(compiled.messages[0]?.content).not.toContain('Post-History');
+
+    const relUserIdx = compiled.messages.findIndex(
+      (m) => m.role === 'user' && m.content === 'User preface for Metro GM and Elena.'
+    );
+    const relAsstIdx = compiled.messages.findIndex(
+      (m) => m.role === 'assistant' && m.content === 'Understood, pacing for Elena.'
+    );
+    expect(relUserIdx).toBeGreaterThan(0);
+    expect(relAsstIdx).toBe(relUserIdx + 1);
+
+    // Fitted chat sequence is [T1, T2, T3, T4, latestInput] (length 5).
+    // depth 2 -> index 5 - 2 = 3 (right before T4 and latestInput)
+    // depth 0 -> index 5 - 0 = 5 (right after latestInput)
+    const chatTail = compiled.messages.slice(relAsstIdx + 1);
+    expect(chatTail).toEqual([
+      { role: 'user', content: 'Turn 1: Train pulls in.' },
+      { role: 'assistant', content: 'Turn 2: Brakes hiss along the damp rail.' },
+      { role: 'user', content: 'Turn 3: I check the ticket.' },
+      { role: 'system', content: '[Author Note: Emphasize neon reflections.]' },
+      { role: 'assistant', content: 'Turn 4: The conductor nods toward car two.' },
+      { role: 'user', content: 'I board car two.' },
+      { role: 'user', content: '[Post-History for Metro GM: End with sensory detail.]' },
+    ]);
+
+    // Token budgets strictly respected even with in_chat blocks under tight totalMaxTokens
+    const tightCompiled = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona: { name: 'Metro GM', description: 'Urban thriller.' },
+      recentTranscript,
+      latestInput: 'I board car two.',
+      budgets: { totalMaxTokens: 170 },
+    });
+    expect(tightCompiled.totalEstimatedTokens).toBeLessThanOrEqual(170);
+  });
+
+  it('expands prompt macros deterministically from state.clocks, personas, and stFormatTemplates', () => {
+    const state = createWorldState({
+      capabilities: STOCK_SLICE_OF_LIFE_PACK.capabilities,
+      clocks: {
+        day: 7,
+        inGameDate: '2026-10-31',
+        slot: 'night',
+      },
+      player: {
+        name: 'FallbackPlayerName',
+        characterId: 'pc_linked',
+      },
+      characters: [
+        makeCharacter('pc_linked', {
+          name: 'Corin Vale',
+        }),
+      ],
+    });
+
+    const cardPersona = {
+      name: 'Vespera',
+      description: 'An archivist guarding forbidden folios.',
+      personality: 'Stoic, dryly humorous',
+      scenario: 'A lantern flickers in the vault.',
+    };
+
+    // Direct expandPromptMacros checks (case-insensitive, unknown preserved, userPersona override)
+    const expandedWithPersona = expandPromptMacros(
+      '{{Char}} greets {{USER}} (<bot> / <user>) | Persona={{persona}} | Desc={{description}} | Scen={{scenario}} | Pers={{personality}} | Orig=[{{ORIGINAL}}] | {{date}} {{TIME}} Day {{Day}} | {{unknown_keep_me}}',
+      {
+        state,
+        cardPersona,
+        userPersona: { name: 'Marin', description: 'Lantern-bearer from the harbor.' },
+        original: 'Base Rule',
+      }
+    );
+    expect(expandedWithPersona).toBe(
+      'Vespera greets Marin (Vespera / Marin) | Persona=Lantern-bearer from the harbor. | Desc=An archivist guarding forbidden folios. | Scen=A lantern flickers in the vault. | Pers=Stoic, dryly humorous | Orig=[Base Rule] | 2026-10-31 night Day 7 | {{unknown_keep_me}}'
+    );
+
+    // Fallback order for {{user}}: linked character -> player.name -> 'Player', and date -> 'Day N' when inGameDate is null
+    const noDateState = createWorldState({
+      clocks: { day: 3, inGameDate: null, slot: 'afternoon' },
+      player: { name: 'FallbackName', characterId: 'pc_linked' },
+      characters: [makeCharacter('pc_linked', { name: 'LinkedName' })],
+    });
+    expect(
+      expandPromptMacros('{{user}} @ {{date}} {{time}} {{day}}', {
+        state: noDateState,
+        cardPersona,
+      })
+    ).toBe('LinkedName @ Day 3 afternoon 3');
+
+    const plainPlayerState = createWorldState({
+      clocks: { day: 1, inGameDate: null, slot: 'morning' },
+      player: { name: '   ', characterId: null },
+    });
+    expect(
+      expandPromptMacros('{{user}}', { state: plainPlayerState, cardPersona })
+    ).toBe('Player');
+
+    // Compilation expands unlocked {{original}}, custom sections, and stFormatTemplates
+    let layer = setSectionOverride(
+      {},
+      'system',
+      '{{original}}\nExtra: {{char}} speaks to {{user}} on {{date}} ({{time}}).'
+    );
+    layer = {
+      ...layer,
+      generation: {
+        stFormatTemplates: {
+          personalityFormat: '[{{char}} Traits: {{personality}}]',
+          scenarioFormat: '[Setting for {{user}}: {{scenario}}]',
+        },
+      },
+    };
+    const config = resolveEffectiveControlRoomConfig(STOCK_SLICE_OF_LIFE_PACK, undefined, layer);
+    const compiled = compileNarratorPrompt({
+      state,
+      config,
+      cardPersona: {
+        ...cardPersona,
+        scenario: '{{char}} unlocks the vault for {{user}}.',
+      },
+      userPersona: { name: 'Marin', description: 'Lantern-bearer.' },
+      recentTranscript: [],
+      latestInput: 'Open the ledger.',
+    });
+
+    expect(compiled.renderedSections['system']).toContain('deterministic Referee engine');
+    expect(compiled.renderedSections['system']).toContain(
+      'Extra: Vespera speaks to Marin on 2026-10-31 (night).'
+    );
+    expect(compiled.renderedSections['card']).toContain(
+      '[Vespera Traits: Stoic, dryly humorous]'
+    );
+    expect(compiled.renderedSections['card']).toContain(
+      '[Setting for Marin: Vespera unlocks the vault for Marin.]'
+    );
+  });
+
+  it('derives default budgets from generation.maxContextTokens and merges config.tokenBudgets under explicit input.budgets', () => {
+    const state = makeRichRpgAndWorldState();
+    const recentTranscript: ChatMessage[] = Array.from({ length: 16 }, (_, idx) => ({
+      role: idx % 2 === 0 ? 'user' : 'assistant',
+      content: `Turn ${idx + 1}: Detailed conversation segment spanning multiple clauses and observations for budget testing.`,
+    }));
+
+    // 1) generation.maxContextTokens without maxTokens uses 512 reserve -> 1000 - 512 = 488
+    const genOnlyConfig = resolveEffectiveControlRoomConfig(STOCK_TACTICAL_RPG_PACK, undefined, {
+      generation: { maxContextTokens: 1000 },
+    });
+    const genOnlyResult = compileNarratorPrompt({
+      state,
+      config: genOnlyConfig,
+      cardPersona: { name: 'GM', description: 'Fantasy.' },
+      recentTranscript,
+      latestInput: 'I check the map.',
+    });
+    expect(genOnlyResult.totalEstimatedTokens).toBeLessThanOrEqual(488);
+    expect(genOnlyResult.droppedItemsCount).toBeGreaterThan(0);
+
+    // 2) generation.maxContextTokens clamps at minimum 256 (e.g., 400 - 512 -> 256)
+    const clampedGenConfig = resolveEffectiveControlRoomConfig(STOCK_TACTICAL_RPG_PACK, undefined, {
+      generation: { maxContextTokens: 400, maxTokens: 300 },
+    });
+    const clampedResult = compileNarratorPrompt({
+      state,
+      config: clampedGenConfig,
+      cardPersona: { name: 'GM', description: 'Fantasy.' },
+      recentTranscript,
+      latestInput: 'I check the map.',
+    });
+    expect(clampedResult.totalEstimatedTokens).toBeLessThanOrEqual(256);
+
+    // 3) config.tokenBudgets overrides generation-derived totalMaxTokens & section caps,
+    //    and explicit input.budgets overrides config.tokenBudgets
+    const layeredBudgetConfig = resolveEffectiveControlRoomConfig(
+      STOCK_TACTICAL_RPG_PACK,
+      undefined,
+      {
+        generation: { maxContextTokens: 4096, maxTokens: 512 },
+        tokenBudgets: {
+          state: 140,
+          totalMaxTokens: 320,
+        },
+      }
+    );
+    const configBudgetResult = compileNarratorPrompt({
+      state,
+      config: layeredBudgetConfig,
+      cardPersona: { name: 'GM', description: 'Fantasy.' },
+      recentTranscript,
+      latestInput: 'I check the map.',
+    });
+    expect(configBudgetResult.tokenBreakdown['state']).toBeLessThanOrEqual(140);
+    expect(configBudgetResult.totalEstimatedTokens).toBeLessThanOrEqual(320);
+
+    const explicitOverrideResult = compileNarratorPrompt({
+      state,
+      config: layeredBudgetConfig,
+      cardPersona: { name: 'GM', description: 'Fantasy.' },
+      recentTranscript,
+      latestInput: 'I check the map.',
+      budgets: { totalMaxTokens: 210 },
+    });
+    expect(explicitOverrideResult.tokenBreakdown['state']).toBeLessThanOrEqual(140);
+    expect(explicitOverrideResult.totalEstimatedTokens).toBeLessThanOrEqual(210);
   });
 });

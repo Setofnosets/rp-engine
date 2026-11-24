@@ -428,7 +428,7 @@ describe('OllamaProvider and Gateway Presets', () => {
       id: 'ollama-qwen',
       name: 'Ollama Qwen3',
       provider: 'ollama',
-      baseUrl: 'http://localhost:11434',
+      baseUrl: 'http://localhost:11434/api/chat',
       model: 'qwen3:8b',
       samplerPresetId: 'local-creative',
     };

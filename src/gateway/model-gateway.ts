@@ -32,6 +32,12 @@ import {
 
 export { AnthropicProvider, GeminiProvider, OllamaProvider };
 
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isSafeKey(key: string): boolean {
+  return key.length > 0 && !FORBIDDEN_KEYS.has(key);
+}
+
 /**
  * Configuration options for {@link ModelGateway}.
  */
@@ -108,13 +114,19 @@ function cloneConnectionPreset(preset: ConnectionPreset): ConnectionPreset {
   return { ...preset };
 }
 
-function cloneRoleConnectionConfig(
-  config: Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }
-): Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole } {
-  return {
+function cloneRoleConnectionConfig<T extends Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole }>(
+  config: T,
+  redactApiKeys = false
+): T {
+  const copy = {
     ...config,
+    ...(config.stopSequences !== undefined ? { stopSequences: [...config.stopSequences] } : {}),
     ...(config.sampler !== undefined ? { sampler: clonePartialSampler(config.sampler) } : {}),
   };
+  if (redactApiKeys && copy.apiKey !== undefined && copy.apiKey.length > 0) {
+    return { ...copy, apiKey: '***' };
+  }
+  return copy;
 }
 
 /**
@@ -167,8 +179,26 @@ export class OpenAICompatibleProvider implements ModelProvider {
     if (sampler.temperature !== undefined) {
       body.temperature = sampler.temperature;
     }
+    if (sampler.maxTokens !== undefined) {
+      body.max_tokens = sampler.maxTokens;
+    }
     if (sampler.topP !== undefined) {
       body.top_p = sampler.topP;
+    }
+    if (sampler.topK !== undefined && sampler.topK > 0) {
+      body.top_k = sampler.topK;
+    }
+    if (sampler.minP !== undefined && sampler.minP > 0) {
+      body.min_p = sampler.minP;
+    }
+    if (sampler.topA !== undefined && sampler.topA > 0) {
+      body.top_a = sampler.topA;
+    }
+    if (sampler.typicalP !== undefined && sampler.typicalP < 1) {
+      body.typical_p = sampler.typicalP;
+    }
+    if (sampler.tfs !== undefined && sampler.tfs < 1) {
+      body.tfs = sampler.tfs;
     }
     if (sampler.frequencyPenalty !== undefined) {
       body.frequency_penalty = sampler.frequencyPenalty;
@@ -176,8 +206,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
     if (sampler.presencePenalty !== undefined) {
       body.presence_penalty = sampler.presencePenalty;
     }
-    if (sampler.maxTokens !== undefined) {
-      body.max_tokens = sampler.maxTokens;
+    if (sampler.repetitionPenalty !== undefined) {
+      body.repetition_penalty = sampler.repetitionPenalty;
     }
     if (sampler.stop !== undefined && sampler.stop.length > 0) {
       body.stop = [...sampler.stop];
@@ -354,13 +384,15 @@ export class ModelGateway {
     if (options.connections !== undefined) {
       if (options.connections instanceof Map) {
         for (const [role, config] of options.connections.entries()) {
-          this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
+          if (isSafeKey(role)) {
+            this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
+          }
         }
       } else {
         for (const [roleKey, config] of Object.entries(options.connections)) {
-          if (config !== undefined) {
+          if (config !== undefined && isSafeKey(roleKey)) {
             const role = roleKey as AgentRole;
-            this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
+            this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
           }
         }
       }
@@ -387,7 +419,7 @@ export class ModelGateway {
         }
       } else {
         for (const [kindKey, provider] of Object.entries(options.providers)) {
-          if (provider !== undefined) {
+          if (provider !== undefined && isSafeKey(kindKey)) {
             this.providers.set(kindKey as ProviderKind, provider);
           }
         }
@@ -538,23 +570,48 @@ export class ModelGateway {
    * Set or update the connection profile for a specific {@link AgentRole} at runtime.
    */
   setRoleConnection(role: AgentRole, config: Omit<RoleConnectionConfig, 'role'>): void {
-    this.connections.set(role, { ...cloneRoleConnectionConfig(config), role });
+    if (!isSafeKey(role)) {
+      return;
+    }
+    this.connections.set(role, cloneRoleConnectionConfig({ ...config, role }));
+  }
+
+  /**
+   * Remove a specific {@link AgentRole} override, returning `true` if it was present.
+   */
+  removeRoleConnection(role: AgentRole): boolean {
+    return this.connections.delete(role);
+  }
+
+  /**
+   * Remove all per-role connection overrides (preserving any default connection).
+   */
+  clearRoleConnections(): void {
+    this.connections.clear();
   }
 
   /**
    * Return a snapshot of the configured default and per-role connections.
    */
-  getConnectionsSnapshot(): {
+  getConnectionsSnapshot(options?: { readonly redactApiKeys?: boolean }): {
     readonly defaultConnection?: Omit<RoleConnectionConfig, 'role'> & { readonly role?: AgentRole };
     readonly connections: Partial<Record<AgentRole, RoleConnectionConfig>>;
   } {
+    const redact = options?.redactApiKeys === true;
     const connections: Partial<Record<AgentRole, RoleConnectionConfig>> = {};
     for (const [role, cfg] of this.connections.entries()) {
-      connections[role] = { ...cloneRoleConnectionConfig(cfg), role };
+      if (isSafeKey(role)) {
+        Object.defineProperty(connections, role, {
+          value: cloneRoleConnectionConfig(cfg, redact),
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      }
     }
     return {
       ...(this.defaultConnection !== undefined
-        ? { defaultConnection: cloneRoleConnectionConfig(this.defaultConnection) }
+        ? { defaultConnection: cloneRoleConnectionConfig(this.defaultConnection, redact) }
         : {}),
       connections,
     };
@@ -564,7 +621,7 @@ export class ModelGateway {
     const preset =
       config.samplerPresetId !== undefined ? this.samplerPresets.get(config.samplerPresetId) : undefined;
     if (preset === undefined && config.sampler === undefined) {
-      return { ...config };
+      return cloneRoleConnectionConfig(config);
     }
 
     const mergedSampler = clonePartialSampler({
@@ -573,7 +630,7 @@ export class ModelGateway {
     });
 
     return {
-      ...config,
+      ...cloneRoleConnectionConfig(config),
       sampler: mergedSampler,
     };
   }

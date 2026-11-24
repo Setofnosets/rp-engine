@@ -68,6 +68,27 @@ export {
 } from './state/forms.js';
 export { applyPatchBatch } from './state/reducer.js';
 export {
+  appendAuditRecords,
+  appendEventRecord,
+  branchSave,
+  formatCheckpointFilename,
+  initSaveDirectory,
+  loadSessionSave,
+  saveActivePersonaAtomic,
+  saveCheckpointAtomic,
+  saveControlRoomLayerAtomic,
+  saveSwipeTreeAtomic,
+} from './state/persistence.js';
+export type {
+  CheckpointSnapshot,
+  InitSaveManifestInput,
+  InitSaveOptions,
+  LoadedSessionSave,
+  SaveManifest,
+} from './state/persistence.js';
+export { replayFromEvents } from './state/replay.js';
+export type { EventLogRecord, ReplayOptions, ReplayResult } from './state/replay.js';
+export {
   activateSwipeVariant,
   appendMessageTurn,
   computeStateHash,
@@ -79,6 +100,12 @@ export {
 export {
   resolveEffectiveControlRoomConfig,
 } from './config/control-room-config.js';
+export {
+  buildPlayerPatchFromPersona,
+  cloneUserPersonaPreset,
+  validateUserPersonaPreset,
+} from './config/persona-preset.js';
+export type { UserPersonaPreset } from './config/persona-preset.js';
 export { applySelectivePayloadGroups } from './config/selective-loader.js';
 export { computeControlRoomDiffReport, getSectionImpactBadge } from './config/prompt-diff.js';
 
@@ -222,6 +249,18 @@ export {
   type SamplerPreset,
 } from './gateway/types.js';
 export { MockModelProvider, createMockModelGateway } from './gateway/mock-provider.js';
+export {
+  activateNamedProfile,
+  applyConnectionsFileToGateway,
+  deleteNamedProfile,
+  loadConnectionsFile,
+  parseConnectionsDocument,
+  saveConnectionsFile,
+  saveNamedProfile,
+  snapshotGatewayToConnectionsDoc,
+  validateConnectionsDocument,
+} from './gateway/connection-store.js';
+export type { ConnectionProfile, ConnectionsFileDocument } from './gateway/connection-store.js';
 export { GameSystemWizard } from './wizard/game-system-wizard.js';
 
 export { SessionEventBus } from './runtime/event-bus.js';
@@ -251,6 +290,22 @@ export {
   runAuditorPass,
   runDeterministicStateAudit,
 } from './agents/auditor-agent.js';
+export {
+  inspectCharacterDossier,
+  inspectSettingCharacters,
+} from './world/character-inspector.js';
+export type {
+  CharacterDossier,
+  CharacterPresenceBucket,
+  DossierCustomFieldEntry,
+  DossierSectionEntry,
+  InspectCharacterOptions,
+  InspectDossierOptions,
+  PlayerAffinitySummary,
+  SettingCharacterFilter,
+  SettingCharacterSummary,
+  SettingRosterInspection,
+} from './world/character-inspector.js';
 
 export { loadCartridgeFromDirectory } from './cartridge/loader.js';
 export {
@@ -269,8 +324,29 @@ export {
   validateCrossFileReferences,
 } from './cartridge/static-analyzer.js';
 export { importSillyTavernCard } from './cartridge/importers/st-card-importer.js';
+export { importSillyTavernPreset } from './cartridge/importers/st-preset-importer.js';
+export type {
+  SillyTavernPresetFormat,
+  SillyTavernPresetImportOptions,
+  SillyTavernPresetImportResult,
+} from './cartridge/importers/st-preset-importer.js';
+export {
+  exportToSillyTavernChatCompletionPreset,
+  exportToSillyTavernTextCompletionPreset,
+} from './cartridge/exporters/st-preset-exporter.js';
+export type { SillyTavernPresetExportOptions } from './cartridge/exporters/st-preset-exporter.js';
+export {
+  exportSystemPackToControlRoomLayer,
+  exportSystemPackToJson,
+} from './cartridge/exporters/system-pack-exporter.js';
 export { importMultihogCartridge } from './cartridge/importers/multihog-importer.js';
 export { importNeoTerraSeasonFromDirectory } from './cartridge/importers/neoterra-importer.js';
+export { RefereeDataStore, validateSafeStorageId } from './storage/data-store.js';
+export type {
+  SaveControlRoomPresetInput,
+  SavedControlRoomPreset,
+  StorageListResult,
+} from './storage/data-store.js';
 
 export { RefereeDaemon } from './server/daemon.js';
 export { DaemonRegistry } from './server/routes.js';

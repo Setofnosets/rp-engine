@@ -8,7 +8,11 @@ import {
   isSafePropertyKey,
 } from '../../clients/st-bridge/bridge-client.js';
 import {
+  SHEET_PRESET_IDS,
+  bindControlRoomModalDom,
+  buildApplySheetPresetPayload,
   buildApplyWizardModulePayload,
+  buildConnectionsUpdatePayload,
   buildControlRoomViewModel,
   buildModuleTogglePayload,
   buildPromptSectionPayload,
@@ -17,13 +21,18 @@ import {
   renderControlRoomModalHtml,
 } from '../../clients/st-bridge/control-room-modal.js';
 import { DirectorBarState, renderDirectorBarHtml } from '../../clients/st-bridge/director-bar.js';
-import { renderHudStateHtml } from '../../clients/st-bridge/hud-panel.js';
+import { renderHudPanel, renderHudStateHtml } from '../../clients/st-bridge/hud-panel.js';
 import {
   REFEREE_CONTEXT_TAG,
+  createControlRoomBridgeHandlers,
   dispose,
+  extractActiveSillyTavernPersona,
+  extractActiveSillyTavernPreset,
   getBridgeRuntime,
   initialize,
   refereeGenerateInterceptor,
+  syncActiveSillyTavernPersona,
+  syncActiveSillyTavernPreset,
 } from '../../clients/st-bridge/index.js';
 
 interface MockStMessage {
@@ -753,5 +762,585 @@ describe('PR-6.2: SillyTavern Bridge Extension (referee-st-bridge)', () => {
     expect(html).toContain('The &lt;script&gt;Daily&lt;/script&gt;');
     expect(html).toContain('&lt;b&gt;Alert&lt;/b&gt;');
     expect(html).not.toContain('<script>');
+  });
+
+  it('8. Wave 5 RefereeBridgeClient methods hit exact URLs, HTTP methods, query params, and payloads', async () => {
+    interface RecordedCall {
+      url: string;
+      method: string;
+      body: unknown;
+    }
+    const calls: RecordedCall[] = [];
+    const spyFetch: typeof globalThis.fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? 'GET';
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+      calls.push({ url, method, body });
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    const client = new RefereeBridgeClient({ baseUrl: 'http://127.0.0.1:4120/', fetchImpl: spyFetch });
+
+    await client.getConnections();
+    await client.getConnections({ redact: true });
+    await client.updateConnections({
+      defaultConnection: {
+        provider: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434',
+        model: 'llama3.1:8b',
+        temperature: 0.7,
+        maxTokens: 512,
+      },
+    });
+    await client.saveConnectionProfile('Local Ollama', {
+      defaultConnection: { provider: 'ollama', baseUrl: 'http://127.0.0.1:11434', model: 'llama3.1:8b' },
+      activate: true,
+    });
+    await client.activateConnectionProfile('Local Ollama');
+
+    await client.listPresets();
+    await client.importPreset({ preset: { temperature: 0.8 }, sessionId: 'sess/1' });
+    await client.exportSessionPreset('sess/1', 'st_chat');
+    await client.applyPreset('sess/1', { sheetPresetId: 'dnd-adventurer' });
+
+    await client.listPersonas();
+    await client.savePersona({ id: 'hero-1', name: 'Aria', description: 'Scout' });
+    await client.applySessionPersona('sess/1', { personaId: 'hero-1' });
+
+    await client.getSettingCharacters('sess/1', {
+      locationId: 'tavern',
+      status: 'active',
+      allegiance: 'guild',
+      formGroup: 'lycan',
+      presentOnly: true,
+      includePlayer: false,
+      query: 'aria',
+    });
+    await client.getCharacterDossier('sess/1', 'npc/elena');
+    await client.upsertCharacter('sess/1', { characterId: 'npc_2', name: 'Marcus' });
+    await client.startCombat('sess/1', {
+      participants: [{ id: 'player', name: 'Aria', team: 'ally', hp: 20, maxHp: 20 }],
+    });
+
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'GET http://127.0.0.1:4120/api/connections',
+      'GET http://127.0.0.1:4120/api/connections?redact=true',
+      'PUT http://127.0.0.1:4120/api/connections',
+      'POST http://127.0.0.1:4120/api/connections/profiles',
+      'POST http://127.0.0.1:4120/api/connections/profiles/Local%20Ollama/activate',
+      'GET http://127.0.0.1:4120/api/presets',
+      'POST http://127.0.0.1:4120/api/presets/import',
+      'GET http://127.0.0.1:4120/api/sessions/sess%2F1/preset/export?format=st_chat',
+      'POST http://127.0.0.1:4120/api/sessions/sess%2F1/control-room/apply-preset',
+      'GET http://127.0.0.1:4120/api/personas',
+      'POST http://127.0.0.1:4120/api/personas',
+      'PUT http://127.0.0.1:4120/api/sessions/sess%2F1/persona',
+      'GET http://127.0.0.1:4120/api/sessions/sess%2F1/characters?locationId=tavern&status=active&allegiance=guild&formGroup=lycan&presentOnly=true&includePlayer=false&query=aria',
+      'GET http://127.0.0.1:4120/api/sessions/sess%2F1/characters/npc%2Felena',
+      'POST http://127.0.0.1:4120/api/sessions/sess%2F1/characters',
+      'POST http://127.0.0.1:4120/api/sessions/sess%2F1/combat/start',
+    ]);
+
+    expect(calls[3]?.body).toMatchObject({ name: 'Local Ollama', activate: true });
+    expect(calls[8]?.body).toEqual({ sheetPresetId: 'dnd-adventurer' });
+    expect(calls[14]?.body).toEqual({ characterId: 'npc_2', name: 'Marcus' });
+
+    // Prototype pollution guards on IDs / profile names
+    await expect(client.activateConnectionProfile('__proto__')).rejects.toBeInstanceOf(RefereeBridgeError);
+    await expect(client.getCharacterDossier('sess-1', 'constructor')).rejects.toBeInstanceOf(
+      RefereeBridgeError
+    );
+  });
+
+  it('8. extractActiveSillyTavernPreset & extractActiveSillyTavernPersona normalize ST contexts and sync with live daemon', async () => {
+    const { url } = await bootTestDaemon();
+    const client = new RefereeBridgeClient({ baseUrl: url });
+
+    // Chat Completion ST context (including oai_settings fallback and unsafe key filtering)
+    const chatCtx = {
+      name1: 'Lyra Thorne',
+      powerUserSettings: {
+        persona_description: 'Clockwork navigator from the upper spires.',
+      },
+      oai_settings: {
+        preset_name: 'Storyteller Chat',
+        temperature: 0.82,
+        openai_max_tokens: 450,
+        openai_max_context: 12000,
+        top_p: 0.92,
+        prompts: [
+          { identifier: 'main', name: 'Main Prompt', role: 'system', content: 'Narrate vividly.' },
+          { identifier: 'personaDescription', marker: true },
+          { identifier: 'charDescription', marker: true },
+          { identifier: 'chatHistory', marker: true },
+        ],
+        prompt_order: [
+          {
+            character_id: 100001,
+            order: [
+              { identifier: 'main', enabled: true },
+              { identifier: 'personaDescription', enabled: true },
+              { identifier: 'charDescription', enabled: true },
+              { identifier: 'chatHistory', enabled: true },
+            ],
+          },
+        ],
+      },
+    };
+
+    const chatPreset = extractActiveSillyTavernPreset(chatCtx);
+    expect(chatPreset).not.toBeNull();
+    expect(chatPreset?.['name']).toBe('Storyteller Chat');
+    expect(chatPreset?.['temperature']).toBe(0.82);
+    expect(chatPreset?.['openai_max_tokens']).toBe(450);
+    expect(chatPreset?.['openai_max_context']).toBe(12000);
+    expect(Array.isArray(chatPreset?.['prompts'])).toBe(true);
+
+    const persona = extractActiveSillyTavernPersona(chatCtx);
+    expect(persona).toEqual({
+      id: 'st-lyra-thorne',
+      name: 'Lyra Thorne',
+      description: 'Clockwork navigator from the upper spires.',
+    });
+
+    // Text Completion ST context fallback when Chat Completion settings are absent
+    const textCtx = {
+      textgenerationwebui_settings: {
+        preset_name: 'Kobold Classic',
+        temp: 0.65,
+        amount_gen: 320,
+        max_context: 8192,
+        rep_pen: 1.12,
+        story_string: '{{system}}\n{{persona}}\n{{description}}',
+        input_sequence: '### Instruction:',
+        output_sequence: '### Response:',
+      },
+    };
+    const textPreset = extractActiveSillyTavernPreset(textCtx);
+    expect(textPreset).not.toBeNull();
+    expect(textPreset?.['name']).toBe('Kobold Classic');
+    expect(textPreset?.['temp']).toBe(0.65);
+    expect(textPreset?.['amount_gen']).toBe(320);
+    expect(textPreset?.['rep_pen']).toBe(1.12);
+    expect(textPreset?.['story_string']).toBe('{{system}}\n{{persona}}\n{{description}}');
+
+    // Default persona fallback when fields are missing
+    expect(extractActiveSillyTavernPersona({})).toEqual({
+      id: 'st-player',
+      name: 'Player',
+      description: '',
+    });
+    expect(extractActiveSillyTavernPreset(null)).toBeNull();
+
+    // Sync active ST preset & persona into a live daemon session
+    const stCtx = createMockStContext() as MockStContext & Record<string, unknown>;
+    stCtx['name1'] = chatCtx.name1;
+    stCtx['powerUserSettings'] = chatCtx.powerUserSettings;
+    stCtx['chatCompletionSettings'] = chatCtx.oai_settings;
+    (globalThis as Record<string, unknown>)['SillyTavern'] = {
+      getContext: () => stCtx,
+    };
+
+    await client.createSession({
+      sessionId: 'st-sync-live',
+      systemPackId: 'stock-slice-of-life',
+      seed: 'sync-seed',
+    });
+    stCtx.chatMetadata['referee'] = { refereeSessionId: 'st-sync-live' };
+    initialize({ client });
+
+    const presetSyncRes = (await syncActiveSillyTavernPreset({ ctx: stCtx })) as {
+      ok: boolean;
+      format: string;
+      generation: { temperature?: number; presetName?: string };
+    };
+    expect(presetSyncRes.ok).toBe(true);
+    expect(presetSyncRes.format).toBe('st_chat_completion');
+    expect(presetSyncRes.generation.temperature).toBe(0.82);
+
+    const personaSyncRes = (await syncActiveSillyTavernPersona({
+      ctx: stCtx,
+      savePreset: true,
+    })) as {
+      ok: boolean;
+      activePersona: { id: string; name: string; description: string };
+    };
+    expect(personaSyncRes.ok).toBe(true);
+    expect(personaSyncRes.activePersona.name).toBe('Lyra Thorne');
+
+    const compiled = (await client.compilePrompt('st-sync-live', {
+      latestInput: 'I check the brass astrolabe.',
+    })) as { ok: boolean; compiledPrompt: { messages: Array<{ content: string }> } };
+    expect(compiled.ok).toBe(true);
+    const joined = compiled.compiledPrompt.messages.map((m) => m.content).join('\n');
+    expect(joined).toContain('[PERSONA]');
+    expect(joined).toContain('Lyra Thorne');
+    expect(joined).toContain('Clockwork navigator from the upper spires.');
+  });
+
+  it('9. hud-panel.js renders active combatant from initiativeOrder[turnIndex] and Setting Roster widget', () => {
+    const html = renderHudPanel(
+      {
+        config: {
+          packId: 'stock-tactical-rpg',
+          packName: 'Tactical RPG',
+          capabilities: { clocks: 'full_sim', combatMode: 'tactical', factions: false, beats: false },
+          gameSystems: [],
+        },
+        combatState: {
+          round: 2,
+          turnIndex: 1,
+          initiativeOrder: ['player', 'bandit_captain'],
+        },
+        state: {
+          meta: { turn: 4 },
+          clocks: { day: 1, slot: 'evening', turn: 4, storyTurn: 4, held: false },
+          scene: {
+            location: 'Old Bridge',
+            mood: 'tense',
+            presentCharacterIds: ['elena'],
+            pinnedCharacterIds: ['elena'],
+          },
+          entities: {
+            characters: {
+              elena: { name: 'Elena <Vance>', status: 'active', presentInScene: true, mood: 'alert' },
+              marcus: {
+                name: 'Marcus',
+                status: 'active',
+                presentInScene: false,
+                locationId: 'watchtower',
+              },
+              ghost: {
+                name: 'Fallen <Scout>',
+                status: 'dead',
+                presentInScene: false,
+                locationId: 'ravine',
+              },
+            },
+            locations: {
+              watchtower: { name: 'North Watchtower' },
+              ravine: { name: '<Ravine>' },
+            },
+            factions: {},
+            threats: {},
+          },
+        },
+      },
+      {
+        settingRoster: {
+          characters: [
+            {
+              id: 'elena',
+              name: 'Elena <Vance>',
+              status: 'active',
+              presentInScene: true,
+              isPinned: true,
+              mood: 'alert',
+              allegianceName: 'Archive',
+            },
+            {
+              id: 'marcus',
+              name: 'Marcus',
+              status: 'active',
+              presentInScene: false,
+              isPinned: false,
+              locationName: 'North Watchtower',
+            },
+            {
+              id: 'ghost',
+              name: 'Fallen <Scout>',
+              status: 'dead',
+              presentInScene: false,
+              isPinned: false,
+              locationName: '<Ravine>',
+            },
+          ],
+        },
+      }
+    );
+
+    // Active combatant computed from initiativeOrder[turnIndex]
+    expect(html).toContain('data-widget="combat-panel"');
+    expect(html).toContain('Round <strong>2</strong> · Active: <strong>bandit_captain</strong>');
+
+    // Setting Roster widget renders present ([HERE] / [PINNED]) vs off-screen (@ location / status)
+    expect(html).toContain('data-widget="setting-roster"');
+    expect(html).toContain('Setting Roster (1 here · 2 off-screen)');
+    expect(html).toContain('[HERE]');
+    expect(html).toContain('[PINNED]');
+    expect(html).toContain('Elena &lt;Vance&gt;');
+    expect(html).toContain('@ North Watchtower');
+    expect(html).toContain('@ &lt;Ravine&gt;');
+    expect(html).toContain('[dead]');
+    expect(html).not.toContain('<Vance>');
+    expect(html).not.toContain('<Ravine>');
+
+    // Also works when settingRoster is omitted (derived directly from state.entities.characters)
+    const derivedHtml = renderHudStateHtml({
+      config: { packId: 'stock-freeform', capabilities: {} },
+      state: {
+        meta: { turn: 1 },
+        scene: { location: 'Square', mood: 'calm', presentCharacterIds: ['elena'], pinnedCharacterIds: [] },
+        entities: {
+          characters: {
+            elena: { name: 'Elena', status: 'active', presentInScene: true },
+            bryn: { name: 'Bryn', status: 'active', presentInScene: false, locationId: 'dock' },
+          },
+          locations: { dock: { name: 'Harbor Dock' } },
+        },
+      },
+    });
+    expect(derivedHtml).toContain('data-widget="setting-roster"');
+    expect(derivedHtml).toContain('[HERE]');
+    expect(derivedHtml).toContain('@ Harbor Dock');
+  });
+
+  it('10. control-room-modal.js exposes and triggers ST Preset sync, ST Persona sync, Sheet Preset, and Backend Connections updates', async () => {
+    const { url } = await bootTestDaemon();
+    const client = new RefereeBridgeClient({ baseUrl: url });
+
+    await client.createSession({
+      sessionId: 'st-modal-wave5',
+      systemPackId: 'stock-tactical-rpg',
+      seed: 'modal-seed',
+    });
+
+    const initialState = await client.getSessionState('st-modal-wave5');
+    const initialConnections = await client.getConnections({ redact: true });
+
+    const vm = buildControlRoomViewModel({
+      sessionId: 'st-modal-wave5',
+      sessionState: initialState,
+      connections: initialConnections,
+    });
+
+    const html = renderControlRoomModalHtml(vm);
+    expect(html).toContain('data-cr-action="sync-st-preset"');
+    expect(html).toContain('data-cr-action="sync-st-persona"');
+    expect(html).toContain('data-cr-input="sheet-preset"');
+    expect(html).toContain('data-cr-action="apply-sheet-preset"');
+    for (const presetId of SHEET_PRESET_IDS) {
+      expect(html).toContain(presetId);
+    }
+    expect(html).toContain('data-cr-panel="connections"');
+    expect(html).toContain('data-conn-input="provider"');
+    expect(html).toContain('data-conn-input="baseUrl"');
+    expect(html).toContain('data-conn-input="model"');
+    expect(html).toContain('data-conn-input="temperature"');
+    expect(html).toContain('data-conn-input="maxTokens"');
+    expect(html).toContain('data-cr-action="update-connections"');
+    expect(html).toContain('data-cr-action="save-connection-profile"');
+
+    // Verify payload builders
+    expect(buildApplySheetPresetPayload('superhero-dossier', 'pc')).toEqual({
+      sheetPresetId: 'superhero-dossier',
+      target: 'pc',
+    });
+    expect(
+      buildConnectionsUpdatePayload({
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-3-5-sonnet-latest',
+        temperature: '0.6',
+        maxTokens: '1024',
+      })
+    ).toEqual({
+      defaultConnection: {
+        provider: 'anthropic',
+        baseUrl: 'https://api.anthropic.com',
+        model: 'claude-3-5-sonnet-latest',
+        temperature: 0.6,
+        maxTokens: 1024,
+      },
+    });
+
+    // Mock lightweight DOM container to test bindControlRoomModalDom end-to-end against live daemon
+    const fieldValues: Record<string, string> = {
+      '[data-cr-input="sheet-preset"]': 'dnd-adventurer',
+      '[data-conn-input="provider"]': 'ollama',
+      '[data-conn-input="baseUrl"]': 'http://127.0.0.1:11434',
+      '[data-conn-input="model"]': 'mistral:7b',
+      '[data-conn-input="temperature"]': '0.75',
+      '[data-conn-input="maxTokens"]': '700',
+      '[data-conn-input="profileName"]': 'LocalMistral',
+    };
+    const clickListeners: Array<(ev: unknown) => void> = [];
+    const mockContainer = {
+      innerHTML: '',
+      querySelector(selector: string) {
+        if (Object.hasOwn(fieldValues, selector)) {
+          return { value: fieldValues[selector] };
+        }
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      },
+      addEventListener(type: string, fn: (ev: unknown) => void) {
+        if (type === 'click') clickListeners.push(fn);
+      },
+      removeEventListener(type: string, fn: (ev: unknown) => void) {
+        if (type === 'click') {
+          const idx = clickListeners.indexOf(fn);
+          if (idx >= 0) clickListeners.splice(idx, 1);
+        }
+      },
+    };
+
+    const stCtx = {
+      name1: 'Kaelen',
+      powerUserSettings: { persona_description: 'Wandering cartographer.' },
+      chatCompletionSettings: {
+        preset_name: 'Modal Chat Preset',
+        temperature: 0.9,
+        openai_max_tokens: 600,
+        openai_max_context: 8192,
+      },
+    };
+
+    const completedActions: Array<{ action: string; res: unknown }> = [];
+    let pendingWaiters: Array<() => void> = [];
+    const waitForAction = (expectedAction: string) =>
+      new Promise<void>((resolve) => {
+        const check = () => {
+          if (completedActions.some((a) => a.action === expectedAction)) {
+            resolve();
+          } else {
+            pendingWaiters.push(check);
+          }
+        };
+        check();
+      });
+
+    const baseHandlers = createControlRoomBridgeHandlers({
+      client,
+      sessionId: 'st-modal-wave5',
+      ctx: stCtx,
+    });
+    const unbind = bindControlRoomModalDom(mockContainer as unknown as Record<string, unknown>, vm, {
+      ...baseHandlers,
+      onResult: (res: unknown, action: string) => {
+        completedActions.push({ action, res });
+        const waiters = pendingWaiters;
+        pendingWaiters = [];
+        for (const w of waiters) w();
+      },
+    });
+
+    const triggerAction = (action: string) => {
+      const event = {
+        target: {
+          closest(sel: string) {
+            if (sel === '[data-cr-action]') {
+              return { getAttribute: (attr: string) => (attr === 'data-cr-action' ? action : null) };
+            }
+            return null;
+          },
+        },
+      };
+      for (const listener of clickListeners) {
+        listener(event);
+      }
+    };
+
+    // 1) Sync ST Preset
+    const p1 = waitForAction('sync-st-preset');
+    triggerAction('sync-st-preset');
+    await p1;
+
+    // 2) Sync ST Persona
+    const p2 = waitForAction('sync-st-persona');
+    triggerAction('sync-st-persona');
+    await p2;
+
+    // 3) Apply Sheet Preset
+    const p3 = waitForAction('apply-sheet-preset');
+    triggerAction('apply-sheet-preset');
+    await p3;
+
+    // 4) Update Backend Connections & Save Profile
+    const p4 = waitForAction('update-connections');
+    triggerAction('update-connections');
+    await p4;
+
+    const p5 = waitForAction('save-connection-profile');
+    triggerAction('save-connection-profile');
+    await p5;
+
+    unbind();
+    expect(clickListeners).toHaveLength(0);
+
+    // Verify all mutations landed in live daemon
+    const updatedState = (await client.getSessionState('st-modal-wave5')) as {
+      config: {
+        generation: { presetName?: string; temperature?: number };
+        pcCoreSections: Array<{ id: string }>;
+      };
+      state: { player: { name: string } };
+    };
+    expect(updatedState.config.generation.presetName).toBe('Modal Chat Preset');
+    expect(updatedState.config.generation.temperature).toBe(0.9);
+    expect(updatedState.state.player.name).toBe('Kaelen');
+    expect(updatedState.config.pcCoreSections.some((s) => s.id === 'sec_combat_profile')).toBe(
+      true
+    );
+
+    const connSnap = (await client.getConnections()) as {
+      defaultConnection: { provider: string; baseUrl: string; model: string; temperature: number; maxTokens: number };
+      activeProfile: string | null;
+      profiles: Record<string, unknown>;
+    };
+    expect(connSnap.defaultConnection.provider).toBe('ollama');
+    expect(connSnap.defaultConnection.baseUrl).toBe('http://127.0.0.1:11434');
+    expect(connSnap.defaultConnection.model).toBe('mistral:7b');
+    expect(connSnap.defaultConnection.temperature).toBe(0.75);
+    expect(connSnap.defaultConnection.maxTokens).toBe(700);
+    expect(connSnap.activeProfile).toBe('LocalMistral');
+    expect(Object.hasOwn(connSnap.profiles, 'LocalMistral')).toBe(true);
+
+    // Live daemon Wave 5 endpoints round-trip for characters & combat start
+    await client.upsertCharacter('st-modal-wave5', {
+      characterId: 'guard_1',
+      name: 'Captain Rowan',
+      presentInScene: true,
+      mood: 'vigilant',
+    });
+    const rosterRes = (await client.getSettingCharacters('st-modal-wave5', {
+      includePlayer: false,
+      query: 'Rowan',
+    })) as {
+      ok: boolean;
+      characters: Array<{ id: string; name: string }>;
+    };
+    expect(rosterRes.ok).toBe(true);
+    expect(rosterRes.characters.some((c) => c.id === 'guard_1')).toBe(true);
+
+    const dossierRes = (await client.getCharacterDossier('st-modal-wave5', 'guard_1')) as {
+      ok: boolean;
+      dossier: { summary: { name: string } };
+    };
+    expect(dossierRes.ok).toBe(true);
+    expect(dossierRes.dossier.summary.name).toBe('Captain Rowan');
+
+    const combatRes = (await client.startCombat('st-modal-wave5', {
+      participants: [
+        { id: 'player', name: 'Kaelen', team: 'ally', hp: 20, maxHp: 20 },
+        { id: 'guard_1', name: 'Captain Rowan', team: 'enemy', hp: 18, maxHp: 18 },
+      ],
+    })) as { ok: boolean; combatState: { initiativeOrder: string[]; turnIndex: number } };
+    expect(combatRes.ok).toBe(true);
+    expect(combatRes.combatState.initiativeOrder.length).toBe(2);
+
+    const exportedPreset = (await client.exportSessionPreset('st-modal-wave5', 'st_chat')) as {
+      ok: boolean;
+      format: string;
+      preset: { temperature?: number };
+    };
+    expect(exportedPreset.ok).toBe(true);
+    expect(exportedPreset.format).toBe('st_chat');
+    expect(exportedPreset.preset.temperature).toBe(0.9);
   });
 });

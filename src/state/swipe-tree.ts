@@ -10,6 +10,7 @@ export interface StateCheckpoint {
   beatLedger: Record<string, unknown>;
   rngState: RngState;
   stateHash: string;
+  combatState?: Record<string, unknown> | null;
 }
 
 export interface SwipeVariant {
@@ -180,16 +181,21 @@ function fnv1a64Hex(input: string): string {
 
 /**
  * Compute a pure deterministic 64-bit FNV-1a hash over canonical sorted-key JSON
- * of `worldState` and optional `beatLedger`.
+ * of `worldState`, optional `beatLedger`, and optional `combatState` (included only
+ * when non-null and defined to preserve backward-compatible hashes).
  */
 export function computeStateHash(
   worldState: WorldState,
-  beatLedger?: Record<string, unknown>
+  beatLedger?: Record<string, unknown>,
+  combatState?: Record<string, unknown> | null
 ): string {
-  const canonicalPayload = {
+  const canonicalPayload: Record<string, unknown> = {
     beatLedger: beatLedger ?? {},
     worldState,
   };
+  if (combatState !== undefined && combatState !== null) {
+    canonicalPayload['combatState'] = combatState;
+  }
   const canonicalJson = canonicalSerializeValue(canonicalPayload, new WeakSet<object>());
   return fnv1a64Hex(canonicalJson);
 }
@@ -288,6 +294,90 @@ function isValidRngState(value: unknown): value is RngState {
   return false;
 }
 
+function cloneJsonSafeValue(value: unknown, path: string): Result<unknown, ValidationError[]> {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    return ok(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return err([
+        validationError(path, 'INVALID_NUMBER', `${path} must be a finite JSON-safe number`),
+      ]);
+    }
+    return ok(value === 0 ? 0 : value);
+  }
+  if (Array.isArray(value)) {
+    const arr: unknown[] = [];
+    for (let i = 0; i < value.length; i += 1) {
+      const rawItem = value[i];
+      if (rawItem === undefined) {
+        return err([
+          validationError(`${path}[${i}]`, 'INVALID_TYPE', `${path}[${i}] must be JSON-safe`),
+        ]);
+      }
+      const itemRes = cloneJsonSafeValue(rawItem, `${path}[${i}]`);
+      if (!itemRes.ok) {
+        return itemRes;
+      }
+      arr.push(itemRes.value);
+    }
+    return ok(arr);
+  }
+  if (typeof value === 'object') {
+    if (!isPlainObject(value)) {
+      return err([
+        validationError(path, 'INVALID_TYPE', `${path} must be a plain JSON-safe object`),
+      ]);
+    }
+    const out: Record<string, unknown> = {};
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (!isSafeKey(key)) {
+        return err([
+          validationError(`${path}.${key}`, 'UNSAFE_KEY', `Forbidden key "${key}" at ${path}`),
+        ]);
+      }
+      const rawChild = Object.getOwnPropertyDescriptor(value, key)?.value;
+      if (rawChild === undefined) {
+        continue;
+      }
+      const childRes = cloneJsonSafeValue(rawChild, `${path}.${key}`);
+      if (!childRes.ok) {
+        return childRes;
+      }
+      setOwn(out, key, childRes.value);
+    }
+    return ok(out);
+  }
+  return err([
+    validationError(path, 'INVALID_TYPE', `${path} must be a JSON-safe value (got ${typeof value})`),
+  ]);
+}
+
+function cloneCombatStateField(
+  combatState: unknown
+): Result<Record<string, unknown> | null | undefined, ValidationError[]> {
+  if (combatState === undefined) {
+    return ok(undefined);
+  }
+  if (combatState === null) {
+    return ok(null);
+  }
+  if (!isPlainObject(combatState)) {
+    return err([
+      validationError(
+        'checkpoint.combatState',
+        'INVALID_TYPE',
+        'checkpoint.combatState must be a plain object, null, or undefined'
+      ),
+    ]);
+  }
+  const clonedRes = cloneJsonSafeValue(combatState, 'checkpoint.combatState');
+  if (!clonedRes.ok) {
+    return clonedRes;
+  }
+  return ok(clonedRes.value as Record<string, unknown>);
+}
+
 function cloneStateCheckpoint(checkpoint: StateCheckpoint): Result<StateCheckpoint, ValidationError[]> {
   if (!isPlainObject(checkpoint)) {
     return err([validationError('checkpoint', 'INVALID_TYPE', 'checkpoint must be a plain object')]);
@@ -340,19 +430,29 @@ function cloneStateCheckpoint(checkpoint: StateCheckpoint): Result<StateCheckpoi
     return clonedLedger;
   }
 
+  const clonedCombatRes = cloneCombatStateField(checkpoint.combatState);
+  if (!clonedCombatRes.ok) {
+    return clonedCombatRes;
+  }
+
   const wsValidation = validateWorldState(checkpoint.worldState);
   if (!wsValidation.ok) {
     return err(wsValidation.error);
   }
 
-  return ok({
+  const clonedCheckpoint: StateCheckpoint = {
     checkpointId: checkpoint.checkpointId,
     turn: checkpoint.turn,
     worldState: wsValidation.value.state,
     beatLedger: clonedLedger.value as Record<string, unknown>,
     rngState: cloneRngState(checkpoint.rngState),
     stateHash: checkpoint.stateHash,
-  });
+  };
+  if (clonedCombatRes.value !== undefined) {
+    clonedCheckpoint.combatState = clonedCombatRes.value;
+  }
+
+  return ok(clonedCheckpoint);
 }
 
 function cloneNode(node: TranscriptMessageNode): TranscriptMessageNode {

@@ -8,8 +8,20 @@ import type { CartridgeBundle } from '../../src/cartridge/cartridge-schema.js';
 import type { CombatantState } from '../../src/combat/action-validator.js';
 import type { SkillDefinition } from '../../src/combat/skill-registry.js';
 import { SkillRegistry } from '../../src/combat/skill-registry.js';
+import type { UserPersonaPreset } from '../../src/config/persona-preset.js';
 import { isErr, isOk } from '../../src/core/result.js';
 import { createMockModelGateway } from '../../src/gateway/mock-provider.js';
+import {
+  RefereeDataStore,
+  SessionRuntime as BarrelSessionRuntime,
+  exportSystemPackToJson,
+  exportToSillyTavernChatCompletionPreset,
+  importSillyTavernPreset,
+  inspectSettingCharacters as barrelInspectSettingCharacters,
+  loadConnectionsFile,
+  replayFromEvents,
+  validateUserPersonaPreset,
+} from '../../src/index.js';
 import { applyDirectorSteering } from '../../src/runtime/director-steering.js';
 import type { SessionRuntimeEvent } from '../../src/runtime/event-bus.js';
 import { SessionRuntime } from '../../src/runtime/session-runtime.js';
@@ -20,6 +32,7 @@ import {
   STOCK_TACTICAL_RPG_PACK,
 } from '../../src/schema/stock-system-packs.js';
 import { loadSessionSave } from '../../src/state/persistence.js';
+import { getLinearTranscript } from '../../src/state/swipe-tree.js';
 import { type CharacterEntity, createWorldState } from '../../src/state/world-state.js';
 
 const tempDirs: string[] = [];
@@ -968,6 +981,7 @@ describe('PR-4.5: SessionRuntime, Swipe Rollback & Director Steering', () => {
     expect(switched.value.capabilities.relationships).toBe(true);
     expect(switched.value.tuningDials.narrativePacing).toBe('slow_burn');
     expect(runtime.getState().capabilities.relationships).toBe(true);
+    await runtime.flushPendingSaves();
   });
 
   it('Rejects invalid authored travel targets and rolls back cleanly without mutating runtime state', async () => {
@@ -1289,5 +1303,692 @@ describe('PR-4.5: SessionRuntime, Swipe Rollback & Director Steering', () => {
 
     const rejRes = rtConfirm.confirmPendingPatches('reject_all');
     expect(isOk(rejRes)).toBe(true);
+  });
+});
+
+describe('PR-7.11: M7 SessionRuntime Integration & Barrel Exports', () => {
+  it('exports M7 modules and persistence/replay helpers cleanly from src/index.ts', () => {
+    expect(BarrelSessionRuntime).toBe(SessionRuntime);
+    expect(typeof RefereeDataStore).toBe('function');
+    expect(typeof loadConnectionsFile).toBe('function');
+    expect(typeof validateUserPersonaPreset).toBe('function');
+    expect(typeof barrelInspectSettingCharacters).toBe('function');
+    expect(typeof importSillyTavernPreset).toBe('function');
+    expect(typeof exportToSillyTavernChatCompletionPreset).toBe('function');
+    expect(typeof exportSystemPackToJson).toBe('function');
+    expect(typeof replayFromEvents).toBe('function');
+  });
+
+  it('seeds ST card firstMessage at Turn 0 and excludes it from duplicate seeding on resume', async () => {
+    const saveDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rp-m7-greeting-'));
+    tempDirs.push(saveDir);
+
+    const cartridge = makeBaseCartridge({
+      card: {
+        spec: 'cartridge/0.1',
+        id: 'greeting-card',
+        version: '1.0.0',
+        title: 'Lantern Greeting',
+        description: 'Greeting test',
+        recommendedSystemPack: 'stock-freeform',
+        persona: {
+          name: 'Claire',
+          description: 'Warm barista.',
+          firstMessage: '  She slides a steaming mug across the counter. "Welcome in."  ',
+        },
+      },
+    });
+
+    const gateway = createMockModelGateway({
+      narrator: ['Good morning! What can I get you?', 'Coming right up!'],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'greeting-sess-1',
+      cartridge,
+      systemPack: STOCK_FREEFORM_PACK,
+      gateway,
+      saveDir,
+      seed: 'greeting-seed',
+    });
+
+    const initialTranscript = getLinearTranscript(runtime.getSwipeTree());
+    expect(initialTranscript).toEqual([
+      {
+        messageId: 'msg-greeting-0',
+        role: 'assistant',
+        content: 'She slides a steaming mug across the counter. "Welcome in."',
+        swipeIndex: 0,
+      },
+    ]);
+
+    const turn1 = await runtime.executeTurn({ text: 'Morning Claire!' });
+    expect(isOk(turn1)).toBe(true);
+    if (!turn1.ok) return;
+
+    // Turn 1 prompt includes Turn 0 greeting in recentTranscript
+    const transcriptMsgs = turn1.value.compiledPrompt.messages.filter(
+      (m) => m.role === 'assistant' && m.content.includes('steaming mug')
+    );
+    expect(transcriptMsgs).toHaveLength(1);
+    expect(turn1.value.userMessageId).not.toBe('msg-greeting-0');
+
+    // Resume from disk -> greeting node is preserved once (not duplicated)
+    const resumedRes = await SessionRuntime.fromSaveDirectory(saveDir, {
+      sessionId: 'greeting-sess-1',
+      cartridge,
+      systemPack: STOCK_FREEFORM_PACK,
+      gateway,
+      seed: 'greeting-seed',
+    });
+    expect(isOk(resumedRes)).toBe(true);
+    if (!resumedRes.ok) return;
+
+    const resumedTranscript = getLinearTranscript(resumedRes.value.getSwipeTree());
+    expect(resumedTranscript.map((m) => m.messageId)).toEqual([
+      'msg-greeting-0',
+      turn1.value.userMessageId,
+      turn1.value.assistantMessageId,
+    ]);
+  });
+
+  it('applies initial userPersona, supports applyUserPersona & updatePlayerProfile, and injects [PERSONA] alongside [CARD]', async () => {
+    const saveDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rp-m7-persona-'));
+    tempDirs.push(saveDir);
+
+    const initialPersona: UserPersonaPreset = {
+      id: 'persona-rowan',
+      name: 'Rowan',
+      description: 'An observant lantern-bearer from the northern marsh.',
+      sections: { sec_appearance: 'Oilskin cloak and brass compass' },
+      customFields: { origin_region: 'Northern Marsh' },
+    };
+
+    const gateway = createMockModelGateway({
+      narrator: [
+        'Elena glances at your oilskin cloak.',
+        'Elena nods toward Aria.',
+        'Elena speaks to Aria without a persona card.',
+      ],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'persona-sess-1',
+      cartridge: makeBaseCartridge({
+        card: {
+          spec: 'cartridge/0.1',
+          id: 'persona-card',
+          version: '1.0.0',
+          title: 'Persona Test',
+          description: 'Persona test',
+          recommendedSystemPack: 'stock-freeform',
+          persona: { name: 'Elena', description: 'Sharp-witted archivist.' },
+        },
+      }),
+      systemPack: STOCK_FREEFORM_PACK,
+      userPersona: initialPersona,
+      gateway,
+      saveDir,
+      seed: 'persona-seed',
+    });
+
+    // Turn 0 already reflects initial persona
+    expect(runtime.getState().player.name).toBe('Rowan');
+    expect(runtime.getState().player.sections['sec_appearance']).toBe('Oilskin cloak and brass compass');
+    expect(runtime.getState().player.customFields['origin_region']).toBe('Northern Marsh');
+    expect(runtime.getActivePersona()?.name).toBe('Rowan');
+
+    const turn1 = await runtime.executeTurn({ text: 'Hello Elena.' });
+    expect(isOk(turn1)).toBe(true);
+    if (!turn1.ok) return;
+    expect(turn1.value.compiledPrompt.renderedSections['persona']).toContain('[PERSONA]');
+    expect(turn1.value.compiledPrompt.renderedSections['persona']).toContain('Rowan');
+    expect(turn1.value.compiledPrompt.renderedSections['persona']).toContain('lantern-bearer');
+    expect(turn1.value.compiledPrompt.renderedSections['card']).toContain('[CARD]');
+
+    // updatePlayerProfile updates activePersona + WorldState.player + persona.json on disk
+    const updRes = await runtime.updatePlayerProfile({
+      name: 'Aria',
+      description: 'A seasoned cartographer.',
+      sections: { sec_personality: 'Calm under pressure' },
+      customFields: { compass_bearing: 'North' },
+    });
+    expect(isOk(updRes)).toBe(true);
+    if (!updRes.ok) return;
+    expect(updRes.value.player.name).toBe('Aria');
+    expect(updRes.value.player.sections['sec_personality']).toBe('Calm under pressure');
+    expect(updRes.value.player.sections['sec_appearance']).toBe('Oilskin cloak and brass compass');
+    expect(runtime.getActivePersona()?.name).toBe('Aria');
+
+    const loadedWithPersona = await loadSessionSave(saveDir);
+    expect(isOk(loadedWithPersona)).toBe(true);
+    if (loadedWithPersona.ok) {
+      expect(loadedWithPersona.value.activePersona?.name).toBe('Aria');
+    }
+
+    const turn2 = await runtime.executeTurn({ text: 'Check the map.' });
+    expect(isOk(turn2)).toBe(true);
+    if (!turn2.ok) return;
+    expect(turn2.value.compiledPrompt.renderedSections['persona']).toContain('Aria');
+    expect(turn2.value.compiledPrompt.renderedSections['persona']).toContain('cartographer');
+
+    // Clearing persona removes [PERSONA] and persists null
+    const clearRes = await runtime.applyUserPersona(null);
+    expect(isOk(clearRes)).toBe(true);
+    expect(runtime.getActivePersona()).toBeNull();
+
+    const loadedCleared = await loadSessionSave(saveDir);
+    expect(isOk(loadedCleared)).toBe(true);
+    if (loadedCleared.ok) {
+      expect(loadedCleared.value.activePersona).toBeNull();
+    }
+
+    const turn3 = await runtime.executeTurn({ text: 'Continue onward.' });
+    expect(isOk(turn3)).toBe(true);
+    if (!turn3.ok) return;
+    expect(turn3.value.compiledPrompt.renderedSections['persona']).toBeUndefined();
+
+    // Rejects prototype-polluting keys in updatePlayerProfile
+    const badProfile = await runtime.updatePlayerProfile(
+      JSON.parse('{"__proto__":{"polluted":true}}') as { name?: string }
+    );
+    expect(isErr(badProfile)).toBe(true);
+  });
+
+  it('forwards config.generation sampling parameters to narrator generateText and streamText', async () => {
+    const capturedRequests: Array<Record<string, unknown>> = [];
+    const gateway = createMockModelGateway({
+      narrator: [
+        (ctx) => {
+          capturedRequests.push(ctx.request as unknown as Record<string, unknown>);
+          return { kind: 'text', text: 'First reply.' };
+        },
+        (ctx) => {
+          capturedRequests.push(ctx.request as unknown as Record<string, unknown>);
+          return { kind: 'stream', chunks: ['Streamed ', 'reply.'] };
+        },
+      ],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'sampling-sess-1',
+      systemPack: STOCK_FREEFORM_PACK,
+      userControlRoomLayer: {
+        generation: {
+          presetName: 'Noir Sampling',
+          sourceFormat: 'st_chat_completion',
+          temperature: 0.72,
+          maxTokens: 320,
+          maxContextTokens: 4096,
+          topP: 0.91,
+          topK: 40,
+          minP: 0.05,
+          topA: 0.2,
+          typicalP: 0.95,
+          tfs: 0.9,
+          frequencyPenalty: 0.15,
+          presencePenalty: 0.1,
+          repetitionPenalty: 1.08,
+          stopSequences: ['\nUser:', '###'],
+          seed: 777,
+        },
+      },
+      gateway,
+      seed: 'sampling-seed',
+    });
+
+    const t1 = await runtime.executeTurn({ text: 'Speak.' });
+    expect(isOk(t1)).toBe(true);
+    const t2 = await runtime.executeTurn({ text: 'Whisper.', streamNarrator: true });
+    expect(isOk(t2)).toBe(true);
+
+    expect(capturedRequests).toHaveLength(2);
+    for (const req of capturedRequests) {
+      expect(req['role']).toBe('narrator');
+      expect(req['temperature']).toBe(0.72);
+      expect(req['maxTokens']).toBe(320);
+      expect(req['maxContextTokens']).toBe(4096);
+      expect(req['topP']).toBe(0.91);
+      expect(req['topK']).toBe(40);
+      expect(req['minP']).toBe(0.05);
+      expect(req['topA']).toBe(0.2);
+      expect(req['typicalP']).toBe(0.95);
+      expect(req['tfs']).toBe(0.9);
+      expect(req['frequencyPenalty']).toBe(0.15);
+      expect(req['presencePenalty']).toBe(0.1);
+      expect(req['repetitionPenalty']).toBe(1.08);
+      expect(req['stopSequences']).toEqual(['\nUser:', '###']);
+      expect(req['seed']).toBe(777);
+    }
+  });
+
+  it('supports inspectSettingCharacters, inspectCharacterDossier, upsertCharacter, and emergent NPC auto-registration', async () => {
+    const gateway = createMockModelGateway({
+      narrator: 'A hooded courier slips into the cafe and sets down a sealed envelope.',
+      state_tracker: {
+        kind: 'json',
+        value: {
+          scene: {
+            mood: 'intriguing',
+          },
+          new_characters: [
+            {
+              id: 'npc_courier',
+              name: 'Julian Vance',
+              mood: 'guarded',
+              allegiance: 'guild',
+              traits: ['observant'],
+              presentInScene: true,
+              sections: {
+                sec_equipment: 'Rain-soaked trench coat',
+              },
+            },
+          ],
+        },
+      },
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'inspector-emergent-sess',
+      cartridge: makeBaseCartridge({
+        card: {
+          spec: 'cartridge/0.1',
+          id: 'inspector-card',
+          version: '1.0.0',
+          title: 'Cafe Roster',
+          description: 'Roster test',
+          recommendedSystemPack: 'stock-slice-of-life',
+          persona: { name: 'Claire', description: 'Barista' },
+        },
+        initialEntities: {
+          characters: {
+            npc_claire: makeCharacter({ id: 'npc_claire', name: 'Claire', presentInScene: true }),
+          },
+        },
+      }),
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway,
+      seed: 'emergent-seed',
+    });
+
+    // Upsert a character manually and inspect roster + dossier
+    const upsertRes = runtime.upsertCharacter('npc_baron', {
+      name: 'Baron Corvus',
+      mood: 'scheming',
+      presentInScene: false,
+      traits: ['cunning'],
+    });
+    expect(isOk(upsertRes)).toBe(true);
+
+    const rosterBefore = runtime.inspectSettingCharacters({ presentOnly: true });
+    expect(rosterBefore.characters.some((c) => c.id === 'npc_claire')).toBe(true);
+    expect(rosterBefore.characters.some((c) => c.id === 'npc_baron')).toBe(false);
+
+    const baronDossier = runtime.inspectCharacterDossier('Baron Corvus');
+    expect(baronDossier).not.toBeNull();
+    expect(baronDossier?.summary.id).toBe('npc_baron');
+    expect(baronDossier?.agency.traits).toEqual(['cunning']);
+
+    // Turn 1: tracker auto-registers emergent NPC Julian Vance because spatialMode !== 'authored_graph'
+    const turn1 = await runtime.executeTurn({ text: 'Watch the door.' });
+    expect(isOk(turn1)).toBe(true);
+    if (!turn1.ok) return;
+
+    const registeredCourier = turn1.value.state.entities.characters['npc_courier'];
+    expect(registeredCourier).toBeDefined();
+    expect(registeredCourier?.name).toBe('Julian Vance');
+    expect(registeredCourier?.sections['sec_equipment']).toBe('Rain-soaked trench coat');
+    expect(turn1.value.state.scene.presentCharacterIds).toContain('npc_courier');
+
+    const courierDossier = runtime.inspectCharacterDossier('julian vance');
+    expect(courierDossier?.summary.id).toBe('npc_courier');
+    expect(courierDossier?.summary.presentInScene).toBe(true);
+  });
+
+  it('snapshots combatState across checkpoints and restores combatState & clock hold on switchSwipe and regenerateTurn', async () => {
+    const cartridge = makeBaseCartridge({
+      card: {
+        spec: 'cartridge/0.1',
+        id: 'combat-swipe-card',
+        version: '1.0.0',
+        title: 'Combat Rollback',
+        description: 'Combat swipe rollback test',
+        recommendedSystemPack: 'stock-tactical-rpg',
+        persona: { name: 'Chronicler', description: 'RPG narrator' },
+      },
+      initialState: {
+        player: {
+          id: 'player',
+          name: 'Kael',
+          characterId: 'hero_1',
+          locationId: 'arena',
+          progression: { level: 1, xp: 0 },
+          resources: { hp: { current: 30, max: 30 } },
+          inventory: { items: {}, currency: {} },
+          customFields: {},
+          sections: {},
+        },
+        scene: {
+          location: 'Arena',
+          locationId: 'arena',
+          presentCharacterIds: ['raider_1'],
+          pinnedCharacterIds: [],
+          mood: 'calm',
+          pacing: 'balanced',
+          directorNudge: null,
+        },
+      },
+      initialEntities: {
+        characters: {
+          hero_1: makeCharacter({ id: 'hero_1', name: 'Kael', locationId: 'arena' }),
+          raider_1: makeCharacter({
+            id: 'raider_1',
+            name: 'Raider',
+            locationId: 'arena',
+            allegiance: 'enemy',
+          }),
+        },
+        locations: {
+          arena: {
+            id: 'arena',
+            name: 'Arena',
+            kind: 'arena',
+            status: 'normal',
+            controllingFactionId: null,
+            connectedLocations: [],
+            discovered: true,
+            tags: [],
+            notes: '',
+          },
+        },
+      },
+    });
+
+    const gateway = createMockModelGateway({
+      narrator: [
+        'Turn 1 peaceful.',
+        'Turn 2 clash!',
+        'Turn 2 alternate clash!',
+      ],
+      state_tracker: [
+        { kind: 'json', value: { scene: { mood: 'calm' } } },
+        { kind: 'json', value: { scene: { mood: 'fierce' } } },
+        { kind: 'json', value: { scene: { mood: 'tense' } } },
+      ],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'combat-swipe-sess',
+      cartridge,
+      systemPack: STOCK_TACTICAL_RPG_PACK,
+      gateway,
+      seed: 'combat-swipe-seed',
+    });
+
+    // Turn 1: No combat yet
+    const turn1 = await runtime.executeTurn({ text: 'Inspect the arena.' });
+    expect(isOk(turn1)).toBe(true);
+    if (!turn1.ok) return;
+    expect(turn1.value.combatState).toBeNull();
+    expect(turn1.value.state.clocks.held).toBe(false);
+
+    // Start combat before Turn 2
+    const startRes = runtime.startCombat([
+      makeCombatant({
+        id: 'hero_1',
+        name: 'Kael',
+        team: 'ally',
+        stats: { str: 4, dex: 2, initiative: 100 },
+      }),
+      makeCombatant({
+        id: 'raider_1',
+        name: 'Raider',
+        team: 'enemy',
+        stats: { str: 2, dex: 1, initiative: 1 },
+      }),
+    ]);
+    expect(isOk(startRes)).toBe(true);
+
+    const turn2 = await runtime.executeTurn({
+      text: 'Raise shield!',
+      combatActions: [{ type: 'defend' }],
+    });
+    expect(isOk(turn2)).toBe(true);
+    if (!turn2.ok) return;
+    expect(turn2.value.combatState?.active).toBe(true);
+    expect(turn2.value.state.clocks.held).toBe(true);
+
+    // Regenerate Turn 2 -> preserves combatState & clock hold from Turn 2's pre-response checkpoint
+    const regen2 = await runtime.regenerateTurn(turn2.value.assistantMessageId);
+    expect(isOk(regen2)).toBe(true);
+    if (!regen2.ok) return;
+    expect(regen2.value.combatState?.active).toBe(true);
+    expect(regen2.value.state.clocks.held).toBe(true);
+    expect(runtime.getCombatState()?.active).toBe(true);
+
+    // Switch swipe back to Turn 1 (pre-combat) -> restores combatState === null & clocks.held === false!
+    const sw1 = runtime.switchSwipe(turn1.value.assistantMessageId, 0);
+    expect(isOk(sw1)).toBe(true);
+    if (!sw1.ok) return;
+    expect(runtime.getCombatState()).toBeNull();
+    expect(sw1.value.state.clocks.held).toBe(false);
+
+    // Switch forward to Turn 2 swipe 1 -> restores active combatState & clocks.held === true!
+    const sw2 = runtime.switchSwipe(turn2.value.assistantMessageId, 1);
+    expect(isOk(sw2)).toBe(true);
+    if (!sw2.ok) return;
+    expect(runtime.getCombatState()?.active).toBe(true);
+    expect(sw2.value.state.clocks.held).toBe(true);
+  });
+
+  it('round-trips full SessionRuntime state via fromSaveDirectory (state, userLayer, activePersona, swipeTree, combatState, and continuing turns)', async () => {
+    const saveDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rp-m7-resume-'));
+    tempDirs.push(saveDir);
+
+    const persona: UserPersonaPreset = {
+      id: 'persona-kael',
+      name: 'Kael',
+      description: 'Vanguard scout.',
+    };
+
+    const cartridge = makeBaseCartridge({
+      card: {
+        spec: 'cartridge/0.1',
+        id: 'resume-rpg-card',
+        version: '1.0.0',
+        title: 'Resume Campaign',
+        description: 'Full resume round-trip',
+        recommendedSystemPack: 'stock-tactical-rpg',
+        persona: { name: 'Chronicler', description: 'RPG narrator' },
+      },
+      initialState: {
+        player: {
+          id: 'player',
+          name: 'The Player',
+          characterId: 'hero_1',
+          locationId: 'courtyard',
+          progression: { level: 1, xp: 0 },
+          resources: { hp: { current: 30, max: 30 } },
+          inventory: { items: {}, currency: {} },
+          customFields: {},
+          sections: {},
+        },
+        scene: {
+          location: 'Courtyard',
+          locationId: 'courtyard',
+          presentCharacterIds: ['raider_1'],
+          pinnedCharacterIds: [],
+          mood: 'tense',
+          pacing: 'balanced',
+          directorNudge: null,
+        },
+      },
+      initialEntities: {
+        characters: {
+          hero_1: makeCharacter({ id: 'hero_1', name: 'Kael', locationId: 'courtyard' }),
+          raider_1: makeCharacter({
+            id: 'raider_1',
+            name: 'Raider',
+            locationId: 'courtyard',
+            allegiance: 'enemy',
+          }),
+        },
+        locations: {
+          courtyard: {
+            id: 'courtyard',
+            name: 'Courtyard',
+            kind: 'courtyard',
+            status: 'normal',
+            controllingFactionId: null,
+            connectedLocations: [],
+            discovered: true,
+            tags: [],
+            notes: '',
+          },
+        },
+      },
+    });
+
+    const gateway = createMockModelGateway({
+      narrator: ['Turn 1 clash!', 'Turn 2 resumed clash!'],
+      state_tracker: [
+        { kind: 'json', value: { scene: { mood: 'fierce' } } },
+        { kind: 'json', value: { scene: { mood: 'victorious' } } },
+      ],
+    });
+
+    const runtime = new SessionRuntime({
+      sessionId: 'resume-sess-1',
+      cartridge,
+      systemPack: STOCK_TACTICAL_RPG_PACK,
+      userControlRoomLayer: {
+        tuningDials: { narrativePacing: 'slow_burn' },
+      },
+      userPersona: persona,
+      gateway,
+      saveDir,
+      seed: 'resume-seed',
+    });
+
+    const startRes = runtime.startCombat([
+      makeCombatant({
+        id: 'hero_1',
+        name: 'Kael',
+        team: 'ally',
+        stats: { str: 4, dex: 2, initiative: 100 },
+      }),
+      makeCombatant({
+        id: 'raider_1',
+        name: 'Raider',
+        team: 'enemy',
+        stats: { str: 2, dex: 1, initiative: 1 },
+      }),
+    ]);
+    expect(isOk(startRes)).toBe(true);
+
+    const turn1 = await runtime.executeTurn({
+      text: 'Hold the line!',
+      combatActions: [{ type: 'defend' }],
+    });
+    expect(isOk(turn1)).toBe(true);
+    if (!turn1.ok) return;
+
+    // Update control room layer after saveInitialized = true and ensure it persists to disk
+    const crUpdate = await runtime.updateControlRoomLayer((layer) => ({
+      ...layer,
+      tuningDials: { ...layer.tuningDials, cyoaEnabled: true },
+    }));
+    expect(isOk(crUpdate)).toBe(true);
+
+    // Mismatched cartridge must fail cleanly
+    const mismatchCartridge = await SessionRuntime.fromSaveDirectory(saveDir, {
+      sessionId: 'resume-sess-1',
+      cartridge: makeBaseCartridge({
+        card: {
+          spec: 'cartridge/0.1',
+          id: 'wrong-card',
+          version: '1.0.0',
+          title: 'Wrong',
+          description: 'Wrong',
+          persona: { name: 'X', description: 'Y' },
+        },
+      }),
+      gateway,
+    });
+    expect(isErr(mismatchCartridge)).toBe(true);
+
+    // Resume from save directory
+    const resumedRes = await SessionRuntime.fromSaveDirectory(saveDir, {
+      sessionId: 'resume-sess-1',
+      cartridge,
+      systemPack: STOCK_TACTICAL_RPG_PACK,
+      gateway,
+      seed: 'resume-seed',
+    });
+    expect(isOk(resumedRes)).toBe(true);
+    if (!resumedRes.ok) return;
+
+    const resumed = resumedRes.value;
+    expect(resumed.getState().meta.turn).toBe(1);
+    expect(resumed.getState().player.name).toBe('Kael');
+    expect(resumed.getState().scene.mood).toBe('fierce');
+    expect(resumed.getActivePersona()?.name).toBe('Kael');
+    expect(resumed.getConfig().tuningDials.narrativePacing).toBe('slow_burn');
+    expect(resumed.getConfig().tuningDials.cyoaEnabled).toBe(true);
+    expect(resumed.getCombatState()?.active).toBe(true);
+    expect(resumed.getSwipeTree().activeLeafMessageId).toBe(turn1.value.assistantMessageId);
+
+    // Continuing turns after resume produces unique messageIds & updates disk cleanly
+    const turn2 = await resumed.executeTurn({
+      text: 'Press the advantage!',
+      combatActions: [{ type: 'defend' }],
+    });
+    expect(isOk(turn2)).toBe(true);
+    if (!turn2.ok) return;
+
+    expect(turn2.value.turn).toBe(2);
+    expect(turn2.value.userMessageId).not.toBe(turn1.value.userMessageId);
+    expect(turn2.value.assistantMessageId).not.toBe(turn1.value.assistantMessageId);
+    expect(turn2.value.state.scene.mood).toBe('victorious');
+
+    const reloadedSave = await loadSessionSave(saveDir);
+    expect(isOk(reloadedSave)).toBe(true);
+    if (reloadedSave.ok) {
+      expect(reloadedSave.value.manifest.currentTurn).toBe(2);
+      expect(getLinearTranscript(reloadedSave.value.swipeTree!)).toHaveLength(4);
+    }
+
+    // Verify replay-based resume when swipeTree is absent (e.g. legacy/checkpoint+events save)
+    const replayOnlyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'rp-m7-replay-resume-'));
+    tempDirs.push(replayOnlyDir);
+    const replayGateway = createMockModelGateway({
+      narrator: ['Replay turn 1.', 'Replay turn 2.'],
+      state_tracker: [
+        { kind: 'json', value: { scene: { mood: 'curious' } } },
+        { kind: 'json', value: { scene: { mood: 'determined' } } },
+      ],
+    });
+    const replayRt = new SessionRuntime({
+      sessionId: 'replay-sess-1',
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway: replayGateway,
+      saveDir: replayOnlyDir,
+      seed: 'replay-seed',
+    });
+    expect(isOk(await replayRt.executeTurn({ text: 'Turn 1' }))).toBe(true);
+    expect(isOk(await replayRt.executeTurn({ text: 'Turn 2' }))).toBe(true);
+    await fs.rm(path.join(replayOnlyDir, 'swipe-tree.json'), { force: true });
+
+    const replayResumed = await SessionRuntime.fromSaveDirectory(replayOnlyDir, {
+      sessionId: 'replay-sess-1',
+      systemPack: STOCK_SLICE_OF_LIFE_PACK,
+      gateway: replayGateway,
+      seed: 'replay-seed',
+    });
+    expect(isOk(replayResumed)).toBe(true);
+    if (replayResumed.ok) {
+      expect(replayResumed.value.getState().meta.turn).toBe(2);
+      expect(replayResumed.value.getState().scene.mood).toBe('determined');
+    }
   });
 });

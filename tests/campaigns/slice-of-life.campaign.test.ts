@@ -10,13 +10,23 @@ import { isOk } from '../../src/core/result.js';
 const CARTRIDGE_DIR = path.resolve(process.cwd(), 'cartridges', 'slice-of-life-cafe');
 
 describe('Campaign Regression: Slice-of-Life Cafe (Tier 0)', () => {
-  it('loads Tier 0 cartridge with zero entities.json, zero combat.json, and zero map, passing static validation', async () => {
+  it('loads Tier 0 cartridge with Maya roster, zero combat.json, and zero map, passing static validation', async () => {
     const loadRes = await loadCartridgeFromDirectory(CARTRIDGE_DIR);
     expect(isOk(loadRes)).toBe(true);
     if (!loadRes.ok) return;
 
     expect(loadRes.value.card.recommendedSystemPack).toBe('stock-slice-of-life');
-    expect(loadRes.value.initialEntities).toBeUndefined();
+    const maya = loadRes.value.initialEntities?.characters?.['maya'];
+    expect(maya).toBeDefined();
+    expect(maya?.id).toBe('maya');
+    expect(maya?.name).toBe('Maya');
+    expect(maya?.status).toBe('active');
+    expect(maya?.presentInScene).toBe(true);
+    expect(maya?.mood).toBe('warm');
+    expect(maya?.sections['sec_equipment']).toBeTruthy();
+    expect(maya?.sections['sec_personality']).toBeTruthy();
+    expect(maya?.sections['sec_background']).toBeTruthy();
+    expect(loadRes.value.initialEntities?.locations).toBeUndefined();
     expect(loadRes.value.combat).toBeUndefined();
     expect(loadRes.value.loreFiles['lore/menu.md']).toContain('Double Espresso');
 
@@ -88,7 +98,11 @@ describe('Campaign Regression: Slice-of-Life Cafe (Tier 0)', () => {
     expect(finalState.capabilities.progression).toBe('disabled');
     expect(finalState.capabilities.factions).toBe(false);
 
-    // Clothing & scene location updated cleanly
+    // Maya entity loaded and present in scene alongside clean clothing & location updates
+    expect(finalState.entities.characters['maya']).toBeDefined();
+    expect(finalState.entities.characters['maya']?.name).toBe('Maya');
+    expect(finalState.entities.characters['maya']?.presentInScene).toBe(true);
+    expect(finalState.scene.presentCharacterIds).toContain('maya');
     expect(finalState.scene.location).toBe('Window Booth');
     expect(finalState.scene.locationId).toBeNull();
     expect(finalState.player.sections['sec_equipment']).toBe('Cream cardigan over linen shirt');

@@ -13,6 +13,11 @@ import {
 } from '../cartridge/cartridge-schema.js';
 import { importMultihogCartridge } from '../cartridge/importers/multihog-importer.js';
 import { importSillyTavernCard } from '../cartridge/importers/st-card-importer.js';
+import { importSillyTavernPreset } from '../cartridge/importers/st-preset-importer.js';
+import {
+  exportToSillyTavernChatCompletionPreset,
+  exportToSillyTavernTextCompletionPreset,
+} from '../cartridge/exporters/st-preset-exporter.js';
 import { parseAndValidateSystemPack } from '../cartridge/system-pack-schema.js';
 import {
   computeReachableTilesPreview,
@@ -23,12 +28,22 @@ import {
   type ControlRoomLayer,
   type GameSystemModuleOverride,
   type PayloadGroupId,
+  applySheetPreset,
   cloneCapabilitiesPartial,
   cloneCombatRulesPartial,
   cloneControlRoomLayer,
+  cloneCustomPromptBlocks,
   cloneGameSystemModuleOverride,
+  cloneGenerationPresetConfig,
+  cloneResolvedControlRoomConfig,
+  cloneTokenBudgetsPartial,
   cloneTuningDialsPartial,
 } from '../config/control-room-config.js';
+import {
+  type UserPersonaPreset,
+  cloneUserPersonaPreset,
+  validateUserPersonaPreset,
+} from '../config/persona-preset.js';
 import { computeControlRoomDiffReport } from '../config/prompt-diff.js';
 import {
   type CardPersonaInput,
@@ -42,18 +57,32 @@ import {
 } from '../context/tokenizer-budget.js';
 import { RefereeError, type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
+import {
+  type ConnectionProfile,
+  type ConnectionsFileDocument,
+  activateNamedProfile,
+  applyConnectionsFileToGateway,
+  deleteNamedProfile,
+  loadConnectionsFile,
+  saveConnectionsFile,
+  saveNamedProfile,
+  snapshotGatewayToConnectionsDoc,
+} from '../gateway/connection-store.js';
 import { ModelGateway } from '../gateway/model-gateway.js';
-import type {
-  AgentRole,
-  ChatMessage,
-  GatewayGenerateTextRequest,
-  GatewayStructuredOutput,
-  GatewayStructuredRequest,
-  RoleConnectionConfig,
-  StreamChunk,
+import {
+  AGENT_ROLES,
+  type AgentRole,
+  type ChatMessage,
+  type GatewayGenerateTextRequest,
+  type GatewayStructuredOutput,
+  type GatewayStructuredRequest,
+  PROVIDER_KINDS,
+  type ProviderKind,
+  type RoleConnectionConfig,
+  type StreamChunk,
 } from '../gateway/types.js';
 import { type DirectorSteeringInput, applyDirectorSteering } from '../runtime/director-steering.js';
-import { SessionRuntime } from '../runtime/session-runtime.js';
+import { SessionRuntime, type StartCombatOptions } from '../runtime/session-runtime.js';
 import { cloneCharacterSections } from '../schema/character-sections.js';
 import { cloneSystemPack } from '../schema/dynamic-schema-compiler.js';
 import {
@@ -66,17 +95,25 @@ import { type AuditLogFilter, createAuditLog, queryAuditLog } from '../state/aud
 import { PATCH_SOURCES, type PatchSource } from '../state/patch.js';
 import {
   type SessionLineage,
+  branchSave,
   cloneSessionStack,
   deleteSavedSession,
   listSavedSessions,
   loadSessionSave,
 } from '../state/persistence.js';
 import { getLinearTranscript } from '../state/swipe-tree.js';
-import type { CharacterEntity } from '../state/world-state.js';
+import { CHARACTER_STATUSES, type CharacterEntity, type CharacterStatus } from '../state/world-state.js';
+import {
+  RefereeDataStore,
+  type SaveControlRoomPresetInput,
+  type SavedControlRoomPreset,
+  validateSafeStorageId,
+} from '../storage/data-store.js';
 import {
   GameSystemWizard,
   type WizardGenerateRequest,
 } from '../wizard/game-system-wizard.js';
+import type { SettingCharacterFilter } from '../world/character-inspector.js';
 import type {
   DowntimeActivity,
   DowntimeOptions,
@@ -100,7 +137,27 @@ const VALID_PAYLOAD_GROUPS: ReadonlySet<string> = new Set([
   'promptSections',
   'combatRules',
   'tuningDials',
+  'generation',
 ]);
+const VALID_AGENT_ROLES: ReadonlySet<string> = new Set(AGENT_ROLES);
+const VALID_PROVIDER_KINDS: ReadonlySet<string> = new Set(PROVIDER_KINDS);
+const VALID_CHARACTER_STATUSES: ReadonlySet<string> = new Set(CHARACTER_STATUSES);
+const NUMERIC_SAMPLING_FIELDS = [
+  'timeoutMs',
+  'temperature',
+  'maxTokens',
+  'maxContextTokens',
+  'topP',
+  'topK',
+  'minP',
+  'topA',
+  'typicalP',
+  'tfs',
+  'frequencyPenalty',
+  'presencePenalty',
+  'repetitionPenalty',
+  'seed',
+] as const;
 
 function isSafeKey(key: string): boolean {
   return key.length > 0 && !FORBIDDEN_KEYS.has(key);
@@ -253,37 +310,124 @@ export interface DaemonRegistryOptions {
   readonly gateway?: ModelGateway;
   readonly sseHub?: SessionSseHub;
   readonly dataDir?: string;
+  readonly connectionsPath?: string;
 }
 
 /**
  * Central in-memory registry for daemon sessions, system packs, cartridges,
- * imported character cards, model gateway, Game System Wizard, SSE hub, and per-session async mutexes.
+ * imported character cards, presets, personas, model gateway, Game System Wizard,
+ * SSE hub, and per-session async mutexes.
  */
 export class DaemonRegistry {
   readonly sessions = new Map<string, SessionRuntime>();
   readonly systemPacks = new Map<string, SystemPack>();
   readonly cartridges = new Map<string, CartridgeBundle>();
   readonly cards = new Map<string, ImportedCardRecord>();
+  readonly presets = new Map<string, SavedControlRoomPreset>();
+  readonly personas = new Map<string, UserPersonaPreset>();
   readonly gateway: ModelGateway;
   readonly wizard: GameSystemWizard;
   readonly sseHub: SessionSseHub;
   readonly dataDir: string | undefined;
+  readonly connectionsPath: string | undefined;
+  readonly dataStore: RefereeDataStore | undefined;
+
+  connectionsDoc: ConnectionsFileDocument = { version: 1 };
 
   private readonly sessionQueues = new Map<string, Promise<void>>();
   private readonly sessionMeta = new Map<string, SessionRecordMeta>();
   private sessionSeq = 0;
+  private initialized = false;
 
   constructor(options: DaemonRegistryOptions = {}) {
     this.gateway = options.gateway ?? new ModelGateway();
     this.wizard = new GameSystemWizard(this.gateway);
     this.sseHub = options.sseHub ?? new SessionSseHub();
     this.dataDir = options.dataDir;
+    this.connectionsPath = options.connectionsPath;
+    if (this.dataDir !== undefined) {
+      this.dataStore = new RefereeDataStore(this.dataDir);
+    }
 
     for (const [packId, pack] of Object.entries(STOCK_SYSTEM_PACKS)) {
       if (isSafeKey(packId)) {
         this.systemPacks.set(packId, cloneSystemPack(pack));
       }
     }
+  }
+
+  /**
+   * Initialize the underlying {@link RefereeDataStore} (when configured), load saved
+   * connections, and hydrate presets, personas, custom system packs, and cartridges.
+   */
+  async init(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    if (this.dataStore !== undefined) {
+      const initRes = await this.dataStore.init();
+      if (!initRes.ok) {
+        throw new RefereeError('Failed to initialize RefereeDataStore', {
+          code: 'DATA_STORE_INIT_FAILED',
+          details: initRes.error,
+        });
+      }
+    }
+
+    const connRes =
+      this.connectionsPath !== undefined
+        ? await loadConnectionsFile(this.connectionsPath)
+        : this.dataStore !== undefined
+          ? await this.dataStore.loadConnections()
+          : undefined;
+
+    if (connRes !== undefined && connRes.ok) {
+      this.connectionsDoc = connRes.value;
+      const snap = this.gateway.getConnectionsSnapshot();
+      const hasCallerConnections =
+        snap.defaultConnection !== undefined || Object.keys(snap.connections).length > 0;
+      if (!hasCallerConnections) {
+        applyConnectionsFileToGateway(this.gateway, connRes.value);
+      }
+    }
+
+    if (this.dataStore !== undefined) {
+      const [presetsRes, personasRes, packsRes, cartsRes] = await Promise.all([
+        this.dataStore.listPresets(),
+        this.dataStore.listPersonas(),
+        this.dataStore.listSystemPacks(),
+        this.dataStore.listCartridges(),
+      ]);
+
+      for (const preset of presetsRes.items) {
+        this.presets.set(preset.id, preset);
+      }
+      for (const persona of personasRes.items) {
+        this.personas.set(persona.id, cloneUserPersonaPreset(persona));
+      }
+      for (const pack of packsRes.items) {
+        this.systemPacks.set(pack.id, cloneSystemPack(pack));
+      }
+      for (const cart of cartsRes.items) {
+        this.cartridges.set(cart.card.id, cart);
+      }
+    }
+
+    this.initialized = true;
+  }
+
+  /**
+   * Persist `this.connectionsDoc` to `connectionsPath` or `dataStore` when configured.
+   */
+  async persistConnectionsDoc(): Promise<Result<void, ValidationError[]>> {
+    if (this.connectionsPath !== undefined) {
+      return saveConnectionsFile(this.connectionsPath, this.connectionsDoc);
+    }
+    if (this.dataStore !== undefined) {
+      return this.dataStore.saveConnections(this.connectionsDoc);
+    }
+    return ok();
   }
 
   /**
@@ -765,6 +909,9 @@ function mergeControlRoomLayers(
       incoming.unlockedPromptSections
     );
   }
+  if (incoming.customPromptBlocks !== undefined) {
+    next.customPromptBlocks = cloneCustomPromptBlocks(incoming.customPromptBlocks);
+  }
   if (incoming.combatRules !== undefined) {
     const patchRules = cloneCombatRulesPartial(incoming.combatRules);
     next.combatRules = {
@@ -781,6 +928,26 @@ function mergeControlRoomLayers(
     next.tuningDials = {
       ...(next.tuningDials ?? {}),
       ...cloneTuningDialsPartial(incoming.tuningDials),
+    };
+  }
+  if (incoming.generation !== undefined) {
+    next.generation = cloneGenerationPresetConfig({
+      ...(next.generation ?? {}),
+      ...incoming.generation,
+      ...(incoming.generation.stFormatTemplates !== undefined || next.generation?.stFormatTemplates !== undefined
+        ? {
+            stFormatTemplates: {
+              ...(next.generation?.stFormatTemplates ?? {}),
+              ...(incoming.generation.stFormatTemplates ?? {}),
+            },
+          }
+        : {}),
+    });
+  }
+  if (incoming.tokenBudgets !== undefined) {
+    next.tokenBudgets = {
+      ...(next.tokenBudgets ?? {}),
+      ...cloneTokenBudgetsPartial(incoming.tokenBudgets),
     };
   }
 
@@ -840,12 +1007,30 @@ async function handleSystemPacksPost(
     sendErrors(res, 400, parsed.error);
     return;
   }
-  const stored = cloneSystemPack(parsed.value);
+  let stored = cloneSystemPack(parsed.value);
+  if (registry.dataStore !== undefined) {
+    const saveRes = await registry.dataStore.saveSystemPack(stored);
+    if (!saveRes.ok) {
+      sendErrors(res, 400, saveRes.error);
+      return;
+    }
+    stored = cloneSystemPack(saveRes.value);
+  }
   registry.systemPacks.set(stored.id, stored);
   sendJson(res, 201, {
     ok: true,
     systemPack: cloneSystemPack(stored),
   });
+}
+
+async function persistCartridgeIfConfigured(
+  registry: DaemonRegistry,
+  bundle: CartridgeBundle
+): Promise<Result<CartridgeBundle, ValidationError[]>> {
+  if (registry.dataStore === undefined) {
+    return ok(bundle);
+  }
+  return registry.dataStore.saveCartridgeBundle(bundle);
 }
 
 async function handleCartridgeImport(
@@ -859,12 +1044,17 @@ async function handleCartridgeImport(
       sendErrors(res, 400, stRes.error);
       return;
     }
-    registry.cartridges.set(stRes.value.card.id, stRes.value);
+    const saveRes = await persistCartridgeIfConfigured(registry, stRes.value);
+    if (!saveRes.ok) {
+      sendErrors(res, 400, saveRes.error);
+      return;
+    }
+    registry.cartridges.set(saveRes.value.card.id, saveRes.value);
     sendJson(res, 201, {
       ok: true,
       kind: 'st_card',
-      cartridgeId: stRes.value.card.id,
-      cartridge: stRes.value,
+      cartridgeId: saveRes.value.card.id,
+      cartridge: saveRes.value,
     });
     return;
   }
@@ -899,20 +1089,29 @@ async function handleCartridgeImport(
     }
 
     const { systemPack, combatOverrides, warnings } = multihogRes.value;
-    registry.systemPacks.set(systemPack.id, cloneSystemPack(systemPack));
+    let storedPack = cloneSystemPack(systemPack);
+    if (registry.dataStore !== undefined) {
+      const packSaveRes = await registry.dataStore.saveSystemPack(storedPack);
+      if (!packSaveRes.ok) {
+        sendErrors(res, 400, packSaveRes.error);
+        return;
+      }
+      storedPack = cloneSystemPack(packSaveRes.value);
+    }
+    registry.systemPacks.set(storedPack.id, storedPack);
 
     const bundleCandidate: CartridgeBundle = {
       rootDir: null,
       card: {
         spec: 'cartridge/0.1',
-        id: systemPack.id,
+        id: storedPack.id,
         version: '1.0.0',
-        title: systemPack.name,
-        description: systemPack.description,
-        recommendedSystemPack: systemPack.id,
+        title: storedPack.name,
+        description: storedPack.description,
+        recommendedSystemPack: storedPack.id,
         persona: {
-          name: systemPack.name,
-          description: systemPack.description,
+          name: storedPack.name,
+          description: storedPack.description,
         },
       },
       ...(combatOverrides !== undefined ? { combat: combatOverrides } : {}),
@@ -928,14 +1127,19 @@ async function handleCartridgeImport(
       sendErrors(res, 400, validatedBundle.error);
       return;
     }
-    registry.cartridges.set(validatedBundle.value.card.id, validatedBundle.value);
+    const cartSaveRes = await persistCartridgeIfConfigured(registry, validatedBundle.value);
+    if (!cartSaveRes.ok) {
+      sendErrors(res, 400, cartSaveRes.error);
+      return;
+    }
+    registry.cartridges.set(cartSaveRes.value.card.id, cartSaveRes.value);
 
     sendJson(res, 201, {
       ok: true,
       kind: 'multihog',
-      systemPack: cloneSystemPack(systemPack),
-      cartridgeId: validatedBundle.value.card.id,
-      cartridge: validatedBundle.value,
+      systemPack: cloneSystemPack(storedPack),
+      cartridgeId: cartSaveRes.value.card.id,
+      cartridge: cartSaveRes.value,
       warnings,
     });
     return;
@@ -949,12 +1153,17 @@ async function handleCartridgeImport(
       sendErrors(res, 400, validated.error);
       return;
     }
-    registry.cartridges.set(validated.value.card.id, validated.value);
+    const cartSaveRes = await persistCartridgeIfConfigured(registry, validated.value);
+    if (!cartSaveRes.ok) {
+      sendErrors(res, 400, cartSaveRes.error);
+      return;
+    }
+    registry.cartridges.set(cartSaveRes.value.card.id, cartSaveRes.value);
     sendJson(res, 201, {
       ok: true,
       kind: 'cartridge',
-      cartridgeId: validated.value.card.id,
-      cartridge: validated.value,
+      cartridgeId: cartSaveRes.value.card.id,
+      cartridge: cartSaveRes.value,
     });
     return;
   }
@@ -973,12 +1182,17 @@ async function handleCartridgeImport(
       sendErrors(res, 400, stRes.error);
       return;
     }
-    registry.cartridges.set(stRes.value.card.id, stRes.value);
+    const cartSaveRes = await persistCartridgeIfConfigured(registry, stRes.value);
+    if (!cartSaveRes.ok) {
+      sendErrors(res, 400, cartSaveRes.error);
+      return;
+    }
+    registry.cartridges.set(cartSaveRes.value.card.id, cartSaveRes.value);
     sendJson(res, 201, {
       ok: true,
       kind: 'st_card',
-      cartridgeId: stRes.value.card.id,
-      cartridge: stRes.value,
+      cartridgeId: cartSaveRes.value.card.id,
+      cartridge: cartSaveRes.value,
     });
     return;
   }
@@ -1017,12 +1231,17 @@ async function handleCartridgeImport(
     return;
   }
 
-  registry.cartridges.set(stRes.value.card.id, stRes.value);
+  const cartSaveRes = await persistCartridgeIfConfigured(registry, stRes.value);
+  if (!cartSaveRes.ok) {
+    sendErrors(res, 400, cartSaveRes.error);
+    return;
+  }
+  registry.cartridges.set(cartSaveRes.value.card.id, cartSaveRes.value);
   sendJson(res, 201, {
     ok: true,
     kind: 'st_card',
-    cartridgeId: stRes.value.card.id,
-    cartridge: stRes.value,
+    cartridgeId: cartSaveRes.value.card.id,
+    cartridge: cartSaveRes.value,
   });
 }
 
@@ -1128,8 +1347,40 @@ async function handleCreateSession(
       ]);
       return;
     }
-  } else if (registry.dataDir !== undefined) {
-    saveDir = path.join(registry.dataDir, 'sessions', sessionId);
+  } else if (registry.dataStore !== undefined) {
+    const saveDirRes = registry.dataStore.getSessionSaveDir(sessionId);
+    if (!saveDirRes.ok) {
+      sendErrors(res, 400, saveDirRes.error);
+      return;
+    }
+    saveDir = saveDirRes.value;
+  }
+
+  let userPersona: UserPersonaPreset | undefined;
+  const personaIdRaw = getOwn(payload, 'personaId');
+  const personaRaw = getOwn(payload, 'persona');
+  if (personaIdRaw !== undefined && personaIdRaw !== null) {
+    if (typeof personaIdRaw !== 'string' || !isSafeKey(personaIdRaw)) {
+      sendErrors(res, 400, [
+        validationError('personaId', 'INVALID_TYPE', 'personaId must be a non-empty string'),
+      ]);
+      return;
+    }
+    const foundPersona = registry.personas.get(personaIdRaw);
+    if (foundPersona === undefined) {
+      sendErrors(res, 404, [
+        validationError('personaId', 'PERSONA_NOT_FOUND', `Persona "${personaIdRaw}" was not found`),
+      ]);
+      return;
+    }
+    userPersona = cloneUserPersonaPreset(foundPersona);
+  } else if (personaRaw !== undefined && personaRaw !== null) {
+    const personaRes = validateUserPersonaPreset(personaRaw);
+    if (!personaRes.ok) {
+      sendErrors(res, 400, personaRes.error);
+      return;
+    }
+    userPersona = personaRes.value;
   }
 
   const layerRaw = getOwn(payload, 'userControlRoomLayer');
@@ -1171,6 +1422,7 @@ async function handleCreateSession(
       cartridge,
       ...(systemPack !== undefined ? { systemPack } : {}),
       ...(userControlRoomLayer !== undefined ? { userControlRoomLayer } : {}),
+      ...(userPersona !== undefined ? { userPersona } : {}),
       gateway: bridgeGateway,
       ...(seed !== undefined ? { seed } : {}),
       ...(saveDir !== undefined ? { saveDir } : {}),
@@ -1750,11 +2002,15 @@ async function handleCompilePrompt(
             description: meta.basePack.description,
           };
 
+    const activePersona = runtime.getActivePersona();
     const injectedScriptPromptsRaw = getOwn(payload, 'injectedScriptPrompts');
     const compiledPrompt = compileNarratorPrompt({
       state: workingState,
       config,
       cardPersona,
+      ...(activePersona !== null
+        ? { userPersona: { name: activePersona.name, description: activePersona.description } }
+        : {}),
       liveNudges,
       activeAmbient,
       loreContents: meta.cartridge?.loreFiles,
@@ -1932,6 +2188,1118 @@ async function handleGetChronicle(
   });
 }
 
+function decodePathParam(rawValue: string, field: string): Result<string, ValidationError[]> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(rawValue);
+  } catch {
+    return err([validationError(field, 'INVALID_URI', `Malformed ${field} in path`)]);
+  }
+  if (!isSafeKey(decoded) || decoded.trim().length === 0) {
+    return err([validationError(field, 'INVALID_ID', `Invalid ${field} "${decoded}"`)]);
+  }
+  return ok(decoded);
+}
+
+function parseConnectionConfigObject(
+  raw: unknown,
+  acc: ErrorAccumulator
+): Omit<RoleConnectionConfig, 'role'> | undefined {
+  if (!isPlainObject(raw)) {
+    acc.add('', 'INVALID_TYPE', 'Connection configuration must be a plain object');
+    return undefined;
+  }
+
+  const rawProvider = getOwn(raw, 'provider');
+  let provider: ProviderKind = 'openai_compatible';
+  if (rawProvider !== undefined) {
+    if (typeof rawProvider !== 'string' || !VALID_PROVIDER_KINDS.has(rawProvider)) {
+      acc.add(
+        'provider',
+        'INVALID_PROVIDER',
+        `provider must be one of: ${PROVIDER_KINDS.join(', ')}`
+      );
+    } else {
+      provider = rawProvider as ProviderKind;
+    }
+  }
+
+  const rawBaseUrl = getOwn(raw, 'baseUrl');
+  if (typeof rawBaseUrl !== 'string' || rawBaseUrl.trim().length === 0) {
+    acc.add('baseUrl', 'REQUIRED', 'baseUrl must be a non-empty string');
+  }
+
+  const rawModel = getOwn(raw, 'model');
+  if (typeof rawModel !== 'string' || rawModel.trim().length === 0) {
+    acc.add('model', 'REQUIRED', 'model must be a non-empty string');
+  }
+
+  const rawApiKey = getOwn(raw, 'apiKey');
+  if (rawApiKey !== undefined && typeof rawApiKey !== 'string') {
+    acc.add('apiKey', 'INVALID_TYPE', 'apiKey must be a string');
+  }
+
+  const rawSupportsJsonSchema = getOwn(raw, 'supportsJsonSchema');
+  if (rawSupportsJsonSchema !== undefined && typeof rawSupportsJsonSchema !== 'boolean') {
+    acc.add('supportsJsonSchema', 'INVALID_TYPE', 'supportsJsonSchema must be a boolean');
+  }
+
+  const numericValues: Record<string, number> = {};
+  for (const field of NUMERIC_SAMPLING_FIELDS) {
+    const rawVal = getOwn(raw, field);
+    if (rawVal !== undefined) {
+      if (typeof rawVal !== 'number' || !Number.isFinite(rawVal)) {
+        acc.add(field, 'INVALID_TYPE', `${field} must be a finite number`);
+      } else {
+        setOwn(numericValues, field, rawVal);
+      }
+    }
+  }
+
+  const rawStopSequences = getOwn(raw, 'stopSequences');
+  let stopSequences: string[] | undefined;
+  if (rawStopSequences !== undefined) {
+    if (
+      !Array.isArray(rawStopSequences) ||
+      !rawStopSequences.every((item) => typeof item === 'string')
+    ) {
+      acc.add('stopSequences', 'INVALID_TYPE', 'stopSequences must be an array of strings');
+    } else {
+      stopSequences = [...rawStopSequences];
+    }
+  }
+
+  if (
+    typeof rawBaseUrl !== 'string' ||
+    rawBaseUrl.trim().length === 0 ||
+    typeof rawModel !== 'string' ||
+    rawModel.trim().length === 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    provider,
+    baseUrl: rawBaseUrl,
+    model: rawModel,
+    ...(typeof rawApiKey === 'string' ? { apiKey: rawApiKey } : {}),
+    ...(typeof rawSupportsJsonSchema === 'boolean'
+      ? { supportsJsonSchema: rawSupportsJsonSchema }
+      : {}),
+    ...numericValues,
+    ...(stopSequences !== undefined ? { stopSequences } : {}),
+  };
+}
+
+function redactConnectionForDisplay(
+  conn: Omit<RoleConnectionConfig, 'role'>,
+  redact: boolean
+): Omit<RoleConnectionConfig, 'role'> {
+  const copy: Omit<RoleConnectionConfig, 'role'> = {
+    ...conn,
+    ...(conn.stopSequences !== undefined ? { stopSequences: [...conn.stopSequences] } : {}),
+  };
+  if (redact && copy.apiKey !== undefined && copy.apiKey.length > 0) {
+    return { ...copy, apiKey: '***' };
+  }
+  return copy;
+}
+
+function redactProfilesForDisplay(
+  profiles: Record<string, ConnectionProfile> | undefined,
+  redact: boolean
+): Record<string, ConnectionProfile> {
+  const out: Record<string, ConnectionProfile> = {};
+  if (profiles === undefined) {
+    return out;
+  }
+  const names = Object.keys(profiles).sort(compareStringsDeterministic);
+  for (const name of names) {
+    if (!isSafeKey(name)) {
+      continue;
+    }
+    const profile = getOwn(profiles as Record<string, unknown>, name) as
+      | ConnectionProfile
+      | undefined;
+    if (profile === undefined) {
+      continue;
+    }
+    let nextConns: Partial<Record<AgentRole, Omit<RoleConnectionConfig, 'role'>>> | undefined;
+    if (profile.connections !== undefined) {
+      nextConns = {};
+      for (const roleKey of Object.keys(profile.connections).sort(compareStringsDeterministic)) {
+        if (!isSafeKey(roleKey) || !VALID_AGENT_ROLES.has(roleKey)) {
+          continue;
+        }
+        const cfg = getOwn(profile.connections as Record<string, unknown>, roleKey) as
+          | Omit<RoleConnectionConfig, 'role'>
+          | undefined;
+        if (cfg !== undefined) {
+          setOwn(
+            nextConns as Record<string, unknown>,
+            roleKey,
+            redactConnectionForDisplay(cfg, redact)
+          );
+        }
+      }
+    }
+    setOwn(out, name, {
+      ...(profile.defaultConnection !== undefined
+        ? { defaultConnection: redactConnectionForDisplay(profile.defaultConnection, redact) }
+        : {}),
+      ...(nextConns !== undefined ? { connections: nextConns } : {}),
+    });
+  }
+  return out;
+}
+
+async function handleGetConnections(
+  registry: DaemonRegistry,
+  url: URL,
+  res: ServerResponse
+): Promise<void> {
+  const redact = url.searchParams.get('redact') === 'true';
+  const snap = registry.gateway.getConnectionsSnapshot({ redactApiKeys: redact });
+  const profiles = redactProfilesForDisplay(registry.connectionsDoc.profiles, redact);
+  sendJson(res, 200, {
+    ok: true,
+    ...snap,
+    activeProfile: registry.connectionsDoc.activeProfile ?? null,
+    profiles,
+  });
+}
+
+async function handlePutConnections(
+  registry: DaemonRegistry,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Request body must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const acc = new ErrorAccumulator('body');
+  let nextDefaultAction: 'keep' | 'clear' | Omit<RoleConnectionConfig, 'role'> = 'keep';
+  const rawDefault = getOwn(body, 'defaultConnection');
+  if (rawDefault === null) {
+    nextDefaultAction = 'clear';
+  } else if (rawDefault !== undefined) {
+    const parsedDefault = parseConnectionConfigObject(rawDefault, acc.scope('defaultConnection'));
+    if (parsedDefault !== undefined) {
+      nextDefaultAction = parsedDefault;
+    }
+  }
+
+  const roleUpdates = new Map<AgentRole, Omit<RoleConnectionConfig, 'role'> | null>();
+  const rawConns = getOwn(body, 'connections');
+  if (rawConns !== undefined) {
+    if (!isPlainObject(rawConns)) {
+      acc.add('connections', 'INVALID_TYPE', 'connections must be a plain object');
+    } else {
+      for (const roleKey of Object.keys(rawConns).sort(compareStringsDeterministic)) {
+        if (!isSafeKey(roleKey)) {
+          acc.add(`connections.${roleKey}`, 'UNSAFE_KEY', `Forbidden key "${roleKey}"`);
+          continue;
+        }
+        if (!VALID_AGENT_ROLES.has(roleKey)) {
+          acc.add(`connections.${roleKey}`, 'INVALID_ROLE', `Unknown agent role "${roleKey}"`);
+          continue;
+        }
+        const cfg = getOwn(rawConns, roleKey);
+        if (cfg === null) {
+          roleUpdates.set(roleKey as AgentRole, null);
+        } else {
+          const parsedRole = parseConnectionConfigObject(cfg, acc.scope(`connections.${roleKey}`));
+          if (parsedRole !== undefined) {
+            roleUpdates.set(roleKey as AgentRole, parsedRole);
+          }
+        }
+      }
+    }
+  }
+
+  if (acc.hasErrors()) {
+    sendErrors(res, 400, [...acc.errors]);
+    return;
+  }
+
+  if (nextDefaultAction === 'clear') {
+    registry.gateway.setDefaultConnection(undefined);
+  } else if (nextDefaultAction !== 'keep') {
+    registry.gateway.setDefaultConnection(nextDefaultAction);
+  }
+
+  for (const [role, cfg] of roleUpdates.entries()) {
+    if (cfg === null) {
+      registry.gateway.removeRoleConnection(role);
+    } else {
+      registry.gateway.setRoleConnection(role, cfg);
+    }
+  }
+
+  registry.connectionsDoc = snapshotGatewayToConnectionsDoc(
+    registry.gateway,
+    registry.connectionsDoc
+  );
+  const saveRes = await registry.persistConnectionsDoc();
+  if (!saveRes.ok) {
+    sendErrors(res, 500, saveRes.error);
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    ...registry.gateway.getConnectionsSnapshot(),
+    activeProfile: registry.connectionsDoc.activeProfile ?? null,
+    profiles: redactProfilesForDisplay(registry.connectionsDoc.profiles, false),
+  });
+}
+
+async function handlePostConnectionProfile(
+  registry: DaemonRegistry,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Profile payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const nameRaw = getOwn(body, 'name');
+  if (typeof nameRaw !== 'string' || nameRaw.trim().length === 0) {
+    sendErrors(res, 400, [
+      validationError('name', 'REQUIRED', 'Profile name must be a non-empty string'),
+    ]);
+    return;
+  }
+  const name = nameRaw.trim();
+  const profileInput: Record<string, unknown> = {};
+  const defaultConn = getOwn(body, 'defaultConnection');
+  if (defaultConn !== undefined) {
+    setOwn(profileInput, 'defaultConnection', defaultConn);
+  }
+  const conns = getOwn(body, 'connections');
+  if (conns !== undefined) {
+    setOwn(profileInput, 'connections', conns);
+  }
+
+  const savedRes = saveNamedProfile(
+    registry.connectionsDoc,
+    name,
+    profileInput as ConnectionProfile
+  );
+  if (!savedRes.ok) {
+    sendErrors(res, 400, savedRes.error);
+    return;
+  }
+
+  let nextDoc = savedRes.value;
+  if (getOwn(body, 'activate') === true) {
+    const actRes = activateNamedProfile(nextDoc, name, registry.gateway);
+    if (!actRes.ok) {
+      sendErrors(res, 400, actRes.error);
+      return;
+    }
+    nextDoc = actRes.value;
+  }
+
+  registry.connectionsDoc = nextDoc;
+  const persistRes = await registry.persistConnectionsDoc();
+  if (!persistRes.ok) {
+    sendErrors(res, 500, persistRes.error);
+    return;
+  }
+
+  sendJson(res, 201, {
+    ok: true,
+    name,
+    activeProfile: nextDoc.activeProfile ?? null,
+    profiles: redactProfilesForDisplay(nextDoc.profiles, false),
+    ...registry.gateway.getConnectionsSnapshot(),
+  });
+}
+
+async function handleActivateConnectionProfile(
+  registry: DaemonRegistry,
+  rawName: string,
+  res: ServerResponse
+): Promise<void> {
+  const nameRes = decodePathParam(rawName, 'name');
+  if (!nameRes.ok) {
+    sendErrors(res, 400, nameRes.error);
+    return;
+  }
+
+  const actRes = activateNamedProfile(registry.connectionsDoc, nameRes.value, registry.gateway);
+  if (!actRes.ok) {
+    const status = actRes.error.some((e) => e.code === 'PROFILE_NOT_FOUND') ? 404 : 400;
+    sendErrors(res, status, actRes.error);
+    return;
+  }
+
+  registry.connectionsDoc = actRes.value;
+  const persistRes = await registry.persistConnectionsDoc();
+  if (!persistRes.ok) {
+    sendErrors(res, 500, persistRes.error);
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    activeProfile: actRes.value.activeProfile ?? null,
+    ...registry.gateway.getConnectionsSnapshot(),
+  });
+}
+
+async function handleDeleteConnectionProfile(
+  registry: DaemonRegistry,
+  rawName: string,
+  res: ServerResponse
+): Promise<void> {
+  const nameRes = decodePathParam(rawName, 'name');
+  if (!nameRes.ok) {
+    sendErrors(res, 400, nameRes.error);
+    return;
+  }
+
+  const delRes = deleteNamedProfile(registry.connectionsDoc, nameRes.value);
+  if (!delRes.ok) {
+    const status = delRes.error.some((e) => e.code === 'PROFILE_NOT_FOUND') ? 404 : 400;
+    sendErrors(res, status, delRes.error);
+    return;
+  }
+
+  registry.connectionsDoc = delRes.value;
+  const persistRes = await registry.persistConnectionsDoc();
+  if (!persistRes.ok) {
+    sendErrors(res, 500, persistRes.error);
+    return;
+  }
+
+  sendJson(res, 200, {
+    ok: true,
+    deleted: nameRes.value,
+    activeProfile: delRes.value.activeProfile ?? null,
+    profiles: redactProfilesForDisplay(delRes.value.profiles, false),
+  });
+}
+
+function slugifyPresetId(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slug.length > 0 ? slug : 'imported-preset';
+}
+
+async function savePresetInRegistryAndStore(
+  registry: DaemonRegistry,
+  input: SaveControlRoomPresetInput
+): Promise<Result<SavedControlRoomPreset, ValidationError[]>> {
+  const idCheck = validateSafeStorageId(input.id);
+  if (!idCheck.ok) {
+    return idCheck;
+  }
+  if (typeof input.name !== 'string' || input.name.trim().length === 0) {
+    return err([validationError('name', 'REQUIRED', 'Preset name must be a non-empty string')]);
+  }
+  if (!isPlainObject(input.layer)) {
+    return err([validationError('layer', 'INVALID_TYPE', 'Preset layer must be a plain object')]);
+  }
+
+  if (registry.dataStore !== undefined) {
+    const saveRes = await registry.dataStore.savePreset(input);
+    if (!saveRes.ok) {
+      return saveRes;
+    }
+    registry.presets.set(saveRes.value.id, saveRes.value);
+    return ok(saveRes.value);
+  }
+
+  const saved: SavedControlRoomPreset = {
+    id: idCheck.value,
+    name: input.name.trim(),
+    ...(typeof input.description === 'string' ? { description: input.description } : {}),
+    sourceFormat: input.sourceFormat ?? 'referee',
+    layer: cloneControlRoomLayer(input.layer),
+    updatedAt: input.updatedAt ?? new Date().toISOString(),
+  };
+  registry.presets.set(saved.id, saved);
+  return ok(saved);
+}
+
+async function handleGetPresets(registry: DaemonRegistry, res: ServerResponse): Promise<void> {
+  const presets = Array.from(registry.presets.values()).sort((a, b) =>
+    compareStringsDeterministic(a.id, b.id)
+  );
+  sendJson(res, 200, { ok: true, presets });
+}
+
+async function handlePostPreset(
+  registry: DaemonRegistry,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Preset payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const saveRes = await savePresetInRegistryAndStore(
+    registry,
+    body as unknown as SaveControlRoomPresetInput
+  );
+  if (!saveRes.ok) {
+    sendErrors(res, 400, saveRes.error);
+    return;
+  }
+
+  sendJson(res, 201, { ok: true, preset: saveRes.value });
+}
+
+async function handleDeletePreset(
+  registry: DaemonRegistry,
+  rawId: string,
+  res: ServerResponse
+): Promise<void> {
+  const pathRes = decodePathParam(rawId, 'id');
+  if (!pathRes.ok) {
+    sendErrors(res, 400, pathRes.error);
+    return;
+  }
+  const idRes = validateSafeStorageId(pathRes.value);
+  if (!idRes.ok) {
+    sendErrors(res, 400, idRes.error);
+    return;
+  }
+
+  if (registry.dataStore !== undefined) {
+    const delRes = await registry.dataStore.deletePreset(idRes.value);
+    if (!delRes.ok) {
+      const status = delRes.error.some((e) => e.code === 'FILE_NOT_FOUND') ? 404 : 400;
+      sendErrors(res, status, delRes.error);
+      return;
+    }
+  } else if (!registry.presets.has(idRes.value)) {
+    sendErrors(res, 404, [
+      validationError('id', 'PRESET_NOT_FOUND', `Preset "${idRes.value}" was not found`),
+    ]);
+    return;
+  }
+
+  registry.presets.delete(idRes.value);
+  sendJson(res, 200, { ok: true, deleted: idRes.value });
+}
+
+async function handleImportPreset(
+  registry: DaemonRegistry,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Preset import payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const rawPreset = getOwn(body, 'preset') ?? body;
+  if (typeof rawPreset !== 'string' && !isPlainObject(rawPreset)) {
+    sendErrors(res, 400, [
+      validationError('preset', 'INVALID_TYPE', 'preset must be a JSON object or string'),
+    ]);
+    return;
+  }
+
+  const rawOptions = getOwn(body, 'options');
+  const explicitNameRaw = getOwn(body, 'name');
+  const explicitName =
+    typeof explicitNameRaw === 'string' && explicitNameRaw.trim().length > 0
+      ? explicitNameRaw.trim()
+      : undefined;
+
+  const importOptions = {
+    ...(isPlainObject(rawOptions) ? rawOptions : {}),
+    ...(explicitName !== undefined ? { presetName: explicitName } : {}),
+  };
+
+  const importRes = importSillyTavernPreset(rawPreset, importOptions);
+  if (!importRes.ok) {
+    sendErrors(res, 400, importRes.error);
+    return;
+  }
+
+  const explicitIdRaw = getOwn(body, 'id');
+  let presetId: string;
+  if (explicitIdRaw !== undefined) {
+    if (typeof explicitIdRaw !== 'string') {
+      sendErrors(res, 400, [validationError('id', 'INVALID_TYPE', 'id must be a string')]);
+      return;
+    }
+    const idCheck = validateSafeStorageId(explicitIdRaw);
+    if (!idCheck.ok) {
+      sendErrors(res, 400, idCheck.error);
+      return;
+    }
+    presetId = idCheck.value;
+  } else {
+    presetId = slugifyPresetId(explicitName ?? importRes.value.presetName);
+  }
+
+  const sessionIdRaw = getOwn(body, 'sessionId');
+  let targetRuntime: SessionRuntime | undefined;
+  if (sessionIdRaw !== undefined && sessionIdRaw !== null) {
+    if (typeof sessionIdRaw !== 'string' || !isSafeKey(sessionIdRaw)) {
+      sendErrors(res, 400, [
+        validationError('sessionId', 'INVALID_SESSION_ID', 'sessionId must be a safe string'),
+      ]);
+      return;
+    }
+    targetRuntime = registry.sessions.get(sessionIdRaw);
+    if (targetRuntime === undefined) {
+      sendErrors(res, 404, [
+        validationError('sessionId', 'SESSION_NOT_FOUND', `Session "${sessionIdRaw}" was not found`),
+      ]);
+      return;
+    }
+  }
+
+  const saveRes = await savePresetInRegistryAndStore(registry, {
+    id: presetId,
+    name: explicitName ?? importRes.value.presetName,
+    sourceFormat: importRes.value.format,
+    layer: importRes.value.layer,
+  });
+  if (!saveRes.ok) {
+    sendErrors(res, 400, saveRes.error);
+    return;
+  }
+
+  if (targetRuntime !== undefined) {
+    const applyRes = await registry.withSessionLock(targetRuntime.sessionId, async () =>
+      targetRuntime.updateControlRoomLayer((current) =>
+        mergeControlRoomLayers(current, importRes.value.layer)
+      )
+    );
+    if (!applyRes.ok) {
+      sendErrors(res, 400, applyRes.error);
+      return;
+    }
+  }
+
+  sendJson(res, 201, {
+    ok: true,
+    presetId: saveRes.value.id,
+    format: importRes.value.format,
+    layer: importRes.value.layer,
+    generation: importRes.value.generation,
+    tokenBudgets: importRes.value.tokenBudgets,
+    warnings: importRes.value.warnings,
+  });
+}
+
+async function handleApplySessionPreset(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'apply-preset payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const presetIdRaw = getOwn(body, 'presetId');
+  let savedPreset: SavedControlRoomPreset | undefined;
+  if (presetIdRaw !== undefined && presetIdRaw !== null) {
+    if (typeof presetIdRaw !== 'string' || !isSafeKey(presetIdRaw)) {
+      sendErrors(res, 400, [
+        validationError('presetId', 'INVALID_TYPE', 'presetId must be a non-empty string'),
+      ]);
+      return;
+    }
+    savedPreset = registry.presets.get(presetIdRaw);
+    if (savedPreset === undefined) {
+      sendErrors(res, 404, [
+        validationError('presetId', 'PRESET_NOT_FOUND', `Preset "${presetIdRaw}" was not found`),
+      ]);
+      return;
+    }
+  }
+
+  const sheetPresetIdRaw = getOwn(body, 'sheetPresetId');
+  let sheetPresetId: string | undefined;
+  if (sheetPresetIdRaw !== undefined && sheetPresetIdRaw !== null) {
+    if (typeof sheetPresetIdRaw !== 'string' || sheetPresetIdRaw.trim().length === 0) {
+      sendErrors(res, 400, [
+        validationError('sheetPresetId', 'INVALID_TYPE', 'sheetPresetId must be a non-empty string'),
+      ]);
+      return;
+    }
+    sheetPresetId = sheetPresetIdRaw.trim();
+  }
+
+  const targetRaw = getOwn(body, 'target');
+  let target: 'pc' | 'npc' | 'both' = 'both';
+  if (targetRaw !== undefined) {
+    if (targetRaw !== 'pc' && targetRaw !== 'npc' && targetRaw !== 'both') {
+      sendErrors(res, 400, [
+        validationError('target', 'INVALID_ENUM', 'target must be "pc", "npc", or "both"'),
+      ]);
+      return;
+    }
+    target = targetRaw;
+  }
+
+  if (savedPreset === undefined && sheetPresetId === undefined) {
+    sendErrors(res, 400, [
+      validationError('body', 'REQUIRED', 'At least one of presetId or sheetPresetId is required'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const meta = registry.getSessionMeta(runtime.sessionId, runtime);
+    const updateRes = await runtime.updateControlRoomLayer((current) => {
+      let next =
+        savedPreset !== undefined
+          ? mergeControlRoomLayers(current, savedPreset.layer)
+          : cloneControlRoomLayer(current);
+      if (sheetPresetId !== undefined) {
+        next = applySheetPreset(next, sheetPresetId, target);
+      }
+      return next;
+    });
+
+    if (!updateRes.ok) {
+      sendErrors(res, 400, updateRes.error);
+      return;
+    }
+
+    const diffReport = computeControlRoomDiffReport(
+      updateRes.value,
+      meta.basePack,
+      meta.cartridge?.systemOverrides
+    );
+
+    sendJson(res, 200, {
+      ok: true,
+      config: updateRes.value,
+      state: runtime.getState(),
+      diffReport,
+    });
+  });
+}
+
+async function handleExportSessionPreset(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  url: URL,
+  res: ServerResponse
+): Promise<void> {
+  const format = url.searchParams.get('format') ?? 'referee';
+  if (format !== 'st_chat' && format !== 'st_text' && format !== 'referee') {
+    sendErrors(res, 400, [
+      validationError('format', 'INVALID_FORMAT', 'format must be st_chat, st_text, or referee'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const config = runtime.getConfig();
+    if (format === 'st_chat') {
+      sendJson(res, 200, {
+        ok: true,
+        format,
+        preset: exportToSillyTavernChatCompletionPreset(config),
+      });
+      return;
+    }
+    if (format === 'st_text') {
+      sendJson(res, 200, {
+        ok: true,
+        format,
+        preset: exportToSillyTavernTextCompletionPreset(config),
+      });
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      format: 'referee',
+      preset: cloneResolvedControlRoomConfig(config),
+    });
+  });
+}
+
+async function handleGetPersonas(registry: DaemonRegistry, res: ServerResponse): Promise<void> {
+  const personas = Array.from(registry.personas.values())
+    .sort((a, b) => compareStringsDeterministic(a.id, b.id))
+    .map(cloneUserPersonaPreset);
+  sendJson(res, 200, { ok: true, personas });
+}
+
+async function handlePostPersona(
+  registry: DaemonRegistry,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Persona payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const rawId = getOwn(body, 'id');
+  if (typeof rawId !== 'string') {
+    sendErrors(res, 400, [validationError('id', 'REQUIRED', 'Persona id must be a string')]);
+    return;
+  }
+  const idCheck = validateSafeStorageId(rawId);
+  if (!idCheck.ok) {
+    sendErrors(res, 400, idCheck.error);
+    return;
+  }
+
+  const candidate: UserPersonaPreset = {
+    ...(body as unknown as UserPersonaPreset),
+    updatedAt:
+      typeof getOwn(body, 'updatedAt') === 'string'
+        ? (getOwn(body, 'updatedAt') as string)
+        : new Date().toISOString(),
+  };
+
+  const validated = validateUserPersonaPreset(candidate);
+  if (!validated.ok) {
+    sendErrors(res, 400, validated.error);
+    return;
+  }
+
+  let saved = cloneUserPersonaPreset(validated.value);
+  if (registry.dataStore !== undefined) {
+    const saveRes = await registry.dataStore.savePersona(saved);
+    if (!saveRes.ok) {
+      sendErrors(res, 400, saveRes.error);
+      return;
+    }
+    saved = cloneUserPersonaPreset(saveRes.value);
+  }
+
+  registry.personas.set(saved.id, cloneUserPersonaPreset(saved));
+  sendJson(res, 201, { ok: true, persona: saved });
+}
+
+async function handleDeletePersona(
+  registry: DaemonRegistry,
+  rawId: string,
+  res: ServerResponse
+): Promise<void> {
+  const pathRes = decodePathParam(rawId, 'id');
+  if (!pathRes.ok) {
+    sendErrors(res, 400, pathRes.error);
+    return;
+  }
+  const idRes = validateSafeStorageId(pathRes.value);
+  if (!idRes.ok) {
+    sendErrors(res, 400, idRes.error);
+    return;
+  }
+
+  if (registry.dataStore !== undefined) {
+    const delRes = await registry.dataStore.deletePersona(idRes.value);
+    if (!delRes.ok) {
+      const status = delRes.error.some((e) => e.code === 'FILE_NOT_FOUND') ? 404 : 400;
+      sendErrors(res, status, delRes.error);
+      return;
+    }
+  } else if (!registry.personas.has(idRes.value)) {
+    sendErrors(res, 404, [
+      validationError('id', 'PERSONA_NOT_FOUND', `Persona "${idRes.value}" was not found`),
+    ]);
+    return;
+  }
+
+  registry.personas.delete(idRes.value);
+  sendJson(res, 200, { ok: true, deleted: idRes.value });
+}
+
+async function handlePutSessionPersona(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Persona payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  let targetPersona: UserPersonaPreset | null;
+  if (Object.hasOwn(body, 'personaId')) {
+    const personaIdRaw = getOwn(body, 'personaId');
+    if (personaIdRaw === null) {
+      targetPersona = null;
+    } else if (typeof personaIdRaw === 'string' && isSafeKey(personaIdRaw)) {
+      const found = registry.personas.get(personaIdRaw);
+      if (found === undefined) {
+        sendErrors(res, 404, [
+          validationError('personaId', 'PERSONA_NOT_FOUND', `Persona "${personaIdRaw}" was not found`),
+        ]);
+        return;
+      }
+      targetPersona = cloneUserPersonaPreset(found);
+    } else {
+      sendErrors(res, 400, [
+        validationError('personaId', 'INVALID_TYPE', 'personaId must be a string or null'),
+      ]);
+      return;
+    }
+  } else if (Object.hasOwn(body, 'persona')) {
+    const personaRaw = getOwn(body, 'persona');
+    if (personaRaw === null) {
+      targetPersona = null;
+    } else if (isPlainObject(personaRaw)) {
+      targetPersona = personaRaw as unknown as UserPersonaPreset;
+    } else {
+      sendErrors(res, 400, [
+        validationError('persona', 'INVALID_TYPE', 'persona must be an object or null'),
+      ]);
+      return;
+    }
+  } else {
+    sendErrors(res, 400, [
+      validationError('body', 'REQUIRED', 'Either personaId or persona is required'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const applyRes = await runtime.applyUserPersona(targetPersona);
+    if (!applyRes.ok) {
+      sendErrors(res, 400, applyRes.error);
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      activePersona: runtime.getActivePersona(),
+      state: applyRes.value,
+    });
+  });
+}
+
+async function handleGetSessionCharacters(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  url: URL,
+  res: ServerResponse
+): Promise<void> {
+  const filter: SettingCharacterFilter = {};
+
+  const locationId = url.searchParams.get('locationId');
+  if (locationId !== null && locationId.length > 0) {
+    filter.locationId = locationId;
+  }
+
+  const statusParam = url.searchParams.get('status');
+  if (statusParam !== null && statusParam.length > 0) {
+    if (!VALID_CHARACTER_STATUSES.has(statusParam)) {
+      sendErrors(res, 400, [
+        validationError('status', 'INVALID_ENUM', `Invalid character status "${statusParam}"`),
+      ]);
+      return;
+    }
+    filter.status = statusParam as CharacterStatus;
+  }
+
+  const allegiance = url.searchParams.get('allegiance');
+  if (allegiance !== null && allegiance.length > 0) {
+    filter.allegiance = allegiance;
+  }
+
+  const formGroup = url.searchParams.get('formGroup');
+  if (formGroup !== null && formGroup.length > 0) {
+    filter.formGroup = formGroup;
+  }
+
+  if (url.searchParams.get('presentOnly') === 'true') {
+    filter.presentOnly = true;
+  }
+  filter.includePlayer = url.searchParams.get('includePlayer') !== 'false';
+
+  const query = url.searchParams.get('query');
+  if (query !== null && query.length > 0) {
+    filter.query = query;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const inspection = runtime.inspectSettingCharacters(filter);
+    sendJson(res, 200, {
+      ok: true,
+      ...inspection,
+    });
+  });
+}
+
+async function handleGetSessionCharacterDossier(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  rawCharId: string,
+  res: ServerResponse
+): Promise<void> {
+  const charIdRes = decodePathParam(rawCharId, 'charId');
+  if (!charIdRes.ok) {
+    sendErrors(res, 400, charIdRes.error);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const dossier = runtime.inspectCharacterDossier(charIdRes.value);
+    if (dossier === null) {
+      sendErrors(res, 404, [
+        validationError(
+          'charId',
+          'CHARACTER_NOT_FOUND',
+          `Character "${charIdRes.value}" was not found`
+        ),
+      ]);
+      return;
+    }
+    sendJson(res, 200, { ok: true, dossier });
+  });
+}
+
+async function handlePostSessionCharacter(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Character payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const nestedChar = getOwn(body, 'character');
+  if (nestedChar !== undefined && !isPlainObject(nestedChar)) {
+    sendErrors(res, 400, [
+      validationError('character', 'INVALID_TYPE', 'character must be a plain object'),
+    ]);
+    return;
+  }
+
+  const charSource = (isPlainObject(nestedChar) ? nestedChar : body) as Record<string, unknown>;
+  const rawId = getOwn(body, 'characterId') ?? getOwn(body, 'id') ?? getOwn(charSource, 'id');
+  if (typeof rawId !== 'string' || !isSafeKey(rawId) || rawId.trim().length === 0) {
+    sendErrors(res, 400, [
+      validationError('characterId', 'REQUIRED', 'characterId (or id) must be a safe non-empty string'),
+    ]);
+    return;
+  }
+  const characterId = rawId.trim();
+
+  const rawName = getOwn(charSource, 'name');
+  if (typeof rawName !== 'string' || rawName.trim().length === 0) {
+    sendErrors(res, 400, [
+      validationError('name', 'REQUIRED', 'Character name must be a non-empty string'),
+    ]);
+    return;
+  }
+
+  const { id: _ignoredId, characterId: _ignoredCharId, ...charFields } = charSource;
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const upsertRes = runtime.upsertCharacter(
+      characterId,
+      charFields as Partial<Omit<CharacterEntity, 'id'>> & { name: string }
+    );
+    if (!upsertRes.ok) {
+      sendErrors(res, 400, upsertRes.error);
+      return;
+    }
+    sendJson(res, 201, {
+      ok: true,
+      characterId,
+      state: upsertRes.value,
+      dossier: runtime.inspectCharacterDossier(characterId),
+    });
+  });
+}
+
+async function handlePatchSessionCharacter(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  rawCharId: string,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  const charIdRes = decodePathParam(rawCharId, 'charId');
+  if (!charIdRes.ok) {
+    sendErrors(res, 400, charIdRes.error);
+    return;
+  }
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Character patch payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const nestedChar = getOwn(body, 'character');
+  if (nestedChar !== undefined && !isPlainObject(nestedChar)) {
+    sendErrors(res, 400, [
+      validationError('character', 'INVALID_TYPE', 'character must be a plain object'),
+    ]);
+    return;
+  }
+  const charSource = (isPlainObject(nestedChar) ? nestedChar : body) as Record<string, unknown>;
+  const { id: _ignoredId, characterId: _ignoredCharId, ...charFields } = charSource;
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const existing = getOwn(
+      runtime.getState().entities.characters as Record<string, unknown>,
+      charIdRes.value
+    ) as CharacterEntity | undefined;
+    const rawName = getOwn(charFields, 'name');
+    const resolvedName =
+      typeof rawName === 'string' && rawName.trim().length > 0 ? rawName : existing?.name;
+
+    if (resolvedName === undefined || resolvedName.trim().length === 0) {
+      sendErrors(res, 400, [
+        validationError('name', 'REQUIRED', 'Character name must be a non-empty string'),
+      ]);
+      return;
+    }
+
+    const upsertRes = runtime.upsertCharacter(charIdRes.value, {
+      ...(charFields as Partial<Omit<CharacterEntity, 'id'>>),
+      name: resolvedName,
+    });
+    if (!upsertRes.ok) {
+      sendErrors(res, 400, upsertRes.error);
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      characterId: charIdRes.value,
+      state: upsertRes.value,
+      dossier: runtime.inspectCharacterDossier(charIdRes.value),
+    });
+  });
+}
+
 function findPortraitFromCartridge(
   cartridge: CartridgeBundle
 ): { readonly portraitPath: string | null; readonly portraitBytes: Uint8Array | null } {
@@ -2012,28 +3380,479 @@ async function handleListSessions(registry: DaemonRegistry, res: ServerResponse)
     }
   }
 
-  for (const [sessionId, runtime] of registry.sessions.entries()) {
-    const state = runtime.getState();
-    const config = runtime.getConfig();
-    const meta = registry.getSessionMeta(sessionId, runtime);
-    byId.set(sessionId, {
-      sessionId,
-      title: meta.cartridge?.card.title ?? config.packName,
-      cartridgeId: meta.cartridge?.card.id ?? 'freeform',
-      systemPackId: config.packId,
-      turn: state.meta.turn,
-      day: state.clocks.day,
-      portraitPath: state.player.portraitAsset ?? (meta.cartridge ? findPortraitFromCartridge(meta.cartridge).portraitPath : null),
-      updatedAt: meta.updatedAt ?? new Date(0).toISOString(),
-      active: true,
-      lineage: meta.lineage ?? null,
+  const activeSessions = Array.from(registry.sessions.values())
+    .sort((a, b) => compareStringsDeterministic(a.sessionId, b.sessionId))
+    .map((runtime) => {
+      const state = runtime.getState();
+      const config = runtime.getConfig();
+      const meta = registry.getSessionMeta(runtime.sessionId, runtime);
+      byId.set(runtime.sessionId, {
+        sessionId: runtime.sessionId,
+        title: meta.cartridge?.card.title ?? config.packName,
+        cartridgeId: meta.cartridge?.card.id ?? 'freeform',
+        systemPackId: config.packId,
+        turn: state.meta.turn,
+        day: state.clocks.day,
+        portraitPath:
+          state.player.portraitAsset ??
+          (meta.cartridge ? findPortraitFromCartridge(meta.cartridge).portraitPath : null),
+        updatedAt: meta.updatedAt ?? new Date(0).toISOString(),
+        active: true,
+        lineage: meta.lineage ?? null,
+      });
+      return {
+        sessionId: runtime.sessionId,
+        turn: state.meta.turn,
+        packId: config.packId,
+        cartridgeId: meta.cartridge?.card.id ?? null,
+      };
     });
+
+  let savedSessionIds: string[] = [];
+  if (registry.dataStore !== undefined) {
+    const listed = await registry.dataStore.listSavedSessionIds();
+    savedSessionIds = listed.items;
   }
 
   const sessions = Array.from(byId.values()).sort((a, b) =>
     compareStringsDeterministic(a.sessionId, b.sessionId)
   );
-  sendJson(res, 200, { ok: true, sessions });
+
+  sendJson(res, 200, {
+    ok: true,
+    sessions,
+    activeSessions,
+    savedSessionIds,
+  });
+}
+
+async function resolveSaveDirForSession(
+  registry: DaemonRegistry,
+  sessionId: string,
+  explicitSaveDir: unknown
+): Promise<Result<string, ValidationError[]>> {
+  if (explicitSaveDir !== undefined) {
+    if (typeof explicitSaveDir !== 'string' || explicitSaveDir.trim().length === 0) {
+      return err([
+        validationError('saveDir', 'INVALID_TYPE', 'saveDir must be a non-empty string'),
+      ]);
+    }
+    return ok(explicitSaveDir);
+  }
+  if (registry.dataStore !== undefined) {
+    return registry.dataStore.getSessionSaveDir(sessionId);
+  }
+  return err([
+    validationError('saveDir', 'SAVE_DIR_REQUIRED', 'saveDir is required when dataDir is not configured'),
+  ]);
+}
+
+async function resumeSessionFromDir(
+  registry: DaemonRegistry,
+  sessionId: string,
+  saveDir: string,
+  options?: { cartridgeId?: string; systemPackId?: string }
+): Promise<Result<{ runtime: SessionRuntime; cartridge: CartridgeBundle | null; basePack: SystemPack }, { status: number; errors: ValidationError[] }>> {
+  const loadedRes = await loadSessionSave(saveDir);
+  if (!loadedRes.ok) {
+    const status = loadedRes.error.some((e) => e.code === 'FILE_NOT_FOUND' || e.code === 'SAVE_NOT_FOUND')
+      ? 404
+      : 400;
+    return err({ status, errors: loadedRes.error });
+  }
+  const manifest = loadedRes.value.manifest;
+
+  const targetCartridgeId = options?.cartridgeId ?? (manifest.cartridgeId !== 'freeform' ? manifest.cartridgeId : undefined);
+  let cartridge: CartridgeBundle | null = null;
+  if (targetCartridgeId !== undefined) {
+    const foundCart = registry.cartridges.get(targetCartridgeId);
+    if (foundCart === undefined) {
+      return err({
+        status: 404,
+        errors: [
+          validationError(
+            'cartridgeId',
+            'CARTRIDGE_NOT_FOUND',
+            `Cartridge "${targetCartridgeId}" was not found`
+          ),
+        ],
+      });
+    }
+    cartridge = foundCart;
+  }
+
+  const targetPackId = options?.systemPackId ?? manifest.systemPackId;
+  const foundPack = registry.systemPacks.get(targetPackId) ?? getStockSystemPack(targetPackId);
+  const systemPack = foundPack !== undefined ? cloneSystemPack(foundPack) : undefined;
+
+  const bridgeGateway = new SessionBridgeGateway(registry.gateway);
+  const runtimeRes = await SessionRuntime.fromSaveDirectory(saveDir, {
+    sessionId,
+    cartridge,
+    ...(systemPack !== undefined ? { systemPack } : {}),
+    gateway: bridgeGateway,
+  });
+  if (!runtimeRes.ok) {
+    return err({ status: 400, errors: runtimeRes.error });
+  }
+
+  const runtime = runtimeRes.value;
+  const resolvedPack =
+    systemPack ??
+    registry.systemPacks.get(runtime.getConfig().packId) ??
+    getStockSystemPack(runtime.getConfig().packId) ??
+    cloneSystemPack(STOCK_FREEFORM_PACK);
+
+  registry.registerSession(runtime, {
+    cartridge,
+    basePack: resolvedPack,
+    bridgeGateway,
+  });
+
+  return ok({ runtime, cartridge, basePack: resolvedPack });
+}
+
+async function handleResumeSession(
+  registry: DaemonRegistry,
+  rawSessionId: string,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  const idRes = decodeSessionId(rawSessionId);
+  if (!idRes.ok) {
+    sendErrors(res, 400, idRes.error);
+    return;
+  }
+  const sessionId = idRes.value;
+
+  if (registry.sessions.has(sessionId)) {
+    sendErrors(res, 409, [
+      validationError('sessionId', 'SESSION_EXISTS', `Session "${sessionId}" is already active`),
+    ]);
+    return;
+  }
+
+  if (body !== undefined && !isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Resume payload must be a JSON object'),
+    ]);
+    return;
+  }
+  const payload = body ?? {};
+  const saveDirRes = await resolveSaveDirForSession(registry, sessionId, getOwn(payload, 'saveDir'));
+  if (!saveDirRes.ok) {
+    sendErrors(res, 400, saveDirRes.error);
+    return;
+  }
+
+  const cartridgeIdRaw = getOwn(payload, 'cartridgeId');
+  const systemPackIdRaw = getOwn(payload, 'systemPackId');
+  const resumed = await resumeSessionFromDir(registry, sessionId, saveDirRes.value, {
+    ...(typeof cartridgeIdRaw === 'string' ? { cartridgeId: cartridgeIdRaw } : {}),
+    ...(typeof systemPackIdRaw === 'string' ? { systemPackId: systemPackIdRaw } : {}),
+  });
+
+  if (!resumed.ok) {
+    sendErrors(res, resumed.error.status, resumed.error.errors);
+    return;
+  }
+
+  const runtime = resumed.value.runtime;
+  sendJson(res, 200, {
+    ok: true,
+    sessionId: runtime.sessionId,
+    state: runtime.getState(),
+    config: runtime.getConfig(),
+    beatLedger: runtime.getBeatLedger(),
+    combatState: runtime.getCombatState(),
+    swipeTree: runtime.getSwipeTree(),
+  });
+}
+
+async function handleBranchSession(
+  registry: DaemonRegistry,
+  rawSessionId: string,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  const sourceIdRes = decodeSessionId(rawSessionId);
+  if (!sourceIdRes.ok) {
+    sendErrors(res, 400, sourceIdRes.error);
+    return;
+  }
+  const sourceSessionId = sourceIdRes.value;
+
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Branch payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const targetSessionIdRaw = getOwn(body, 'targetSessionId');
+  if (typeof targetSessionIdRaw !== 'string') {
+    sendErrors(res, 400, [
+      validationError('targetSessionId', 'REQUIRED', 'targetSessionId must be a string'),
+    ]);
+    return;
+  }
+  const targetIdCheck = validateSafeStorageId(targetSessionIdRaw);
+  if (!targetIdCheck.ok) {
+    sendErrors(res, 400, targetIdCheck.error);
+    return;
+  }
+  const targetSessionId = targetIdCheck.value;
+
+  if (registry.sessions.has(targetSessionId)) {
+    sendErrors(res, 409, [
+      validationError('targetSessionId', 'SESSION_EXISTS', `Session "${targetSessionId}" is already active`),
+    ]);
+    return;
+  }
+
+  const sourceDirRes = await resolveSaveDirForSession(
+    registry,
+    sourceSessionId,
+    getOwn(body, 'sourceSaveDir')
+  );
+  if (!sourceDirRes.ok) {
+    sendErrors(res, 400, sourceDirRes.error);
+    return;
+  }
+
+  const targetDirRes = await resolveSaveDirForSession(
+    registry,
+    targetSessionId,
+    getOwn(body, 'targetSaveDir')
+  );
+  if (!targetDirRes.ok) {
+    sendErrors(res, 400, targetDirRes.error);
+    return;
+  }
+
+  const activeSource = registry.sessions.get(sourceSessionId);
+  if (activeSource !== undefined) {
+    await registry.withSessionLock(sourceSessionId, async () => {
+      await activeSource.flushPendingSaves();
+    });
+  }
+
+  const branchAtTurnRaw = getOwn(body, 'branchAtTurn');
+  let branchAtTurn: number;
+  if (branchAtTurnRaw !== undefined) {
+    if (typeof branchAtTurnRaw !== 'number' || !Number.isInteger(branchAtTurnRaw) || branchAtTurnRaw < 0) {
+      sendErrors(res, 400, [
+        validationError('branchAtTurn', 'INVALID_INTEGER', 'branchAtTurn must be a non-negative integer'),
+      ]);
+      return;
+    }
+    branchAtTurn = branchAtTurnRaw;
+  } else if (activeSource !== undefined) {
+    branchAtTurn = activeSource.getState().meta.turn;
+  } else {
+    const loadedRes = await loadSessionSave(sourceDirRes.value);
+    if (!loadedRes.ok) {
+      sendErrors(res, 404, loadedRes.error);
+      return;
+    }
+    branchAtTurn = loadedRes.value.manifest.currentTurn;
+  }
+
+  const branchRes = await branchSave(
+    sourceDirRes.value,
+    branchAtTurn,
+    targetDirRes.value,
+    targetSessionId
+  );
+  if (!branchRes.ok) {
+    sendErrors(res, 400, branchRes.error);
+    return;
+  }
+
+  let loadedSession: { sessionId: string; state: unknown; config: unknown } | undefined;
+  if (getOwn(body, 'load') === true || getOwn(body, 'resume') === true) {
+    const resumed = await resumeSessionFromDir(registry, targetSessionId, targetDirRes.value);
+    if (!resumed.ok) {
+      sendErrors(res, resumed.error.status, resumed.error.errors);
+      return;
+    }
+    loadedSession = {
+      sessionId: resumed.value.runtime.sessionId,
+      state: resumed.value.runtime.getState(),
+      config: resumed.value.runtime.getConfig(),
+    };
+  }
+
+  sendJson(res, 201, {
+    ok: true,
+    sourceSessionId,
+    targetSessionId,
+    branchAtTurn,
+    manifest: branchRes.value,
+    ...(loadedSession !== undefined ? { session: loadedSession } : {}),
+  });
+}
+
+async function handleStartCombat(
+  registry: DaemonRegistry,
+  runtime: SessionRuntime,
+  body: unknown,
+  res: ServerResponse
+): Promise<void> {
+  if (!isPlainObject(body)) {
+    sendErrors(res, 400, [
+      validationError('body', 'INVALID_TYPE', 'Combat start payload must be a JSON object'),
+    ]);
+    return;
+  }
+
+  const participantsRaw = getOwn(body, 'participants');
+  if (!Array.isArray(participantsRaw) || participantsRaw.length === 0) {
+    sendErrors(res, 400, [
+      validationError('participants', 'INVALID_TYPE', 'participants must be a non-empty array'),
+    ]);
+    return;
+  }
+
+  const acc = new ErrorAccumulator('participants');
+  const normalizedParticipants: Parameters<SessionRuntime['startCombat']>[0] extends readonly (infer T)[]
+    ? T[]
+    : never[] = [];
+
+  for (let i = 0; i < participantsRaw.length; i += 1) {
+    const raw = participantsRaw[i];
+    const pAcc = acc.scope(`[${i}]`);
+    if (!isPlainObject(raw)) {
+      pAcc.add('', 'INVALID_TYPE', 'Participant must be a plain object');
+      continue;
+    }
+    const id = getOwn(raw, 'id');
+    const name = getOwn(raw, 'name');
+    const team = getOwn(raw, 'team');
+    const hp = getOwn(raw, 'hp');
+    const maxHp = getOwn(raw, 'maxHp');
+
+    if (typeof id !== 'string' || !isSafeKey(id) || id.trim().length === 0) {
+      pAcc.add('id', 'REQUIRED', 'Participant id must be a safe non-empty string');
+    }
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      pAcc.add('name', 'REQUIRED', 'Participant name must be a non-empty string');
+    }
+    if (team !== 'ally' && team !== 'enemy' && team !== 'neutral') {
+      pAcc.add('team', 'INVALID_ENUM', 'Participant team must be "ally", "enemy", or "neutral"');
+    }
+    if (typeof hp !== 'number' || !Number.isFinite(hp)) {
+      pAcc.add('hp', 'INVALID_TYPE', 'Participant hp must be a finite number');
+    }
+    if (typeof maxHp !== 'number' || !Number.isFinite(maxHp) || maxHp <= 0) {
+      pAcc.add('maxHp', 'INVALID_TYPE', 'Participant maxHp must be a positive finite number');
+    }
+
+    const rawCoord = getOwn(raw, 'coord');
+    const coord =
+      isPlainObject(rawCoord) &&
+      typeof getOwn(rawCoord, 'x') === 'number' &&
+      typeof getOwn(rawCoord, 'y') === 'number'
+        ? { x: getOwn(rawCoord, 'x') as number, y: getOwn(rawCoord, 'y') as number }
+        : { x: i, y: 0 };
+
+    const rawSpeed = getOwn(raw, 'speed');
+    const speed = typeof rawSpeed === 'number' && Number.isFinite(rawSpeed) ? rawSpeed : 30;
+    const rawAc = getOwn(raw, 'ac');
+    const ac = typeof rawAc === 'number' && Number.isFinite(rawAc) ? rawAc : 10;
+    const rawWillpower = getOwn(raw, 'willpower');
+    const willpower =
+      typeof rawWillpower === 'number' && Number.isFinite(rawWillpower) ? rawWillpower : 10;
+    const rawMaxWillpower = getOwn(raw, 'maxWillpower');
+    const maxWillpower =
+      typeof rawMaxWillpower === 'number' && Number.isFinite(rawMaxWillpower)
+        ? rawMaxWillpower
+        : willpower;
+
+    const rawRemainingActions = getOwn(raw, 'remainingActions');
+    const remainingActions = isPlainObject(rawRemainingActions)
+      ? {
+          action:
+            typeof getOwn(rawRemainingActions, 'action') === 'number'
+              ? (getOwn(rawRemainingActions, 'action') as number)
+              : 1,
+          bonus:
+            typeof getOwn(rawRemainingActions, 'bonus') === 'number'
+              ? (getOwn(rawRemainingActions, 'bonus') as number)
+              : 1,
+          reaction:
+            typeof getOwn(rawRemainingActions, 'reaction') === 'number'
+              ? (getOwn(rawRemainingActions, 'reaction') as number)
+              : 1,
+        }
+      : { action: 1, bonus: 1, reaction: 1 };
+
+    if (!pAcc.hasErrors()) {
+      normalizedParticipants.push({
+        ...(raw as Record<string, unknown>),
+        id: (id as string).trim(),
+        name: (name as string).trim(),
+        team: team as 'ally' | 'enemy' | 'neutral',
+        coord,
+        alive: getOwn(raw, 'alive') !== false,
+        hp: hp as number,
+        maxHp: maxHp as number,
+        ac,
+        speed,
+        remainingMovement:
+          typeof getOwn(raw, 'remainingMovement') === 'number'
+            ? (getOwn(raw, 'remainingMovement') as number)
+            : speed,
+        remainingActions,
+        resources: isPlainObject(getOwn(raw, 'resources'))
+          ? (getOwn(raw, 'resources') as Record<string, number>)
+          : {},
+        cooldowns: isPlainObject(getOwn(raw, 'cooldowns'))
+          ? (getOwn(raw, 'cooldowns') as Record<string, number>)
+          : {},
+        stats: isPlainObject(getOwn(raw, 'stats'))
+          ? (getOwn(raw, 'stats') as Record<string, number>)
+          : {},
+        statuses: Array.isArray(getOwn(raw, 'statuses')) ? (getOwn(raw, 'statuses') as []) : [],
+        abilities: Array.isArray(getOwn(raw, 'abilities'))
+          ? (getOwn(raw, 'abilities') as string[])
+          : [],
+        passives: Array.isArray(getOwn(raw, 'passives')) ? (getOwn(raw, 'passives') as []) : [],
+        willpower,
+        maxWillpower,
+      } as (typeof normalizedParticipants)[number]);
+    }
+  }
+
+  if (acc.hasErrors()) {
+    sendErrors(res, 400, [...acc.errors]);
+    return;
+  }
+
+  const optionsRaw = getOwn(body, 'options');
+  if (optionsRaw !== undefined && !isPlainObject(optionsRaw)) {
+    sendErrors(res, 400, [
+      validationError('options', 'INVALID_TYPE', 'options must be a plain object'),
+    ]);
+    return;
+  }
+
+  await registry.withSessionLock(runtime.sessionId, async () => {
+    const startRes = runtime.startCombat(
+      normalizedParticipants,
+      (optionsRaw ?? {}) as StartCombatOptions
+    );
+    if (!startRes.ok) {
+      sendErrors(res, 400, startRes.error);
+      return;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      combatState: startRes.value.combatState,
+      state: startRes.value.state,
+      auditEntries: startRes.value.auditEntries,
+    });
+  });
 }
 
 async function handleDeleteSession(
@@ -2593,7 +4412,10 @@ async function handlePatchPlayer(
       name = cartridge.card.persona.name || cartridge.card.title;
     }
     if (avatarAssetPath === undefined) {
-      avatarAssetPath = card?.portraitPath ?? findPortraitFromCartridge(cartridge).portraitPath ?? `/api/cards/${cardId}/portrait`;
+      avatarAssetPath =
+        card?.portraitPath ??
+        findPortraitFromCartridge(cartridge).portraitPath ??
+        `/api/cards/${cardId}/portrait`;
     }
     if (sections === undefined && cartridge.card.description.length > 0) {
       sections = { identity: cartridge.card.description };
@@ -2790,7 +4612,7 @@ async function handleTravel(
     ]);
     return;
   }
-  const targetLocationId = getOwn(body, 'targetLocationId');
+  const targetLocationId = getOwn(body, 'targetLocationId') ?? getOwn(body, 'destinationId');
   if (typeof targetLocationId !== 'string' || !isSafeKey(targetLocationId)) {
     sendErrors(res, 400, [
       validationError('targetLocationId', 'REQUIRED', 'targetLocationId must be a safe string'),
@@ -2976,8 +4798,7 @@ export function createDaemonRequestHandler(
 
       // GET /api/connections
       if (method === 'GET' && pathname === '/api/connections') {
-        const snap = registry.gateway.getConnectionsSnapshot();
-        sendJson(res, 200, { ok: true, ...snap });
+        await handleGetConnections(registry, url, res);
         return;
       }
 
@@ -2988,55 +4809,110 @@ export function createDaemonRequestHandler(
           sendErrors(res, parsed.status, parsed.errors);
           return;
         }
-        if (!isPlainObject(parsed.value)) {
-          sendErrors(res, 400, [
-            validationError('body', 'INVALID_TYPE', 'Request body must be a JSON object'),
-          ]);
+        await handlePutConnections(registry, parsed.value, res);
+        return;
+      }
+
+      // POST /api/connections/profiles
+      if (method === 'POST' && pathname === '/api/connections/profiles') {
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          sendErrors(res, parsed.status, parsed.errors);
           return;
         }
-        const rawDefault = getOwn(parsed.value, 'defaultConnection');
-        if (isPlainObject(rawDefault)) {
-          const baseUrl = getOwn(rawDefault, 'baseUrl');
-          const model = getOwn(rawDefault, 'model');
-          const apiKey = getOwn(rawDefault, 'apiKey');
-          const provider = getOwn(rawDefault, 'provider');
-          if (typeof baseUrl === 'string' && typeof model === 'string') {
-            registry.gateway.setDefaultConnection({
-              provider:
-                provider === 'ollama' || provider === 'anthropic' || provider === 'mock'
-                  ? provider
-                  : 'openai_compatible',
-              baseUrl,
-              model,
-              ...(typeof apiKey === 'string' ? { apiKey } : {}),
-            });
-          }
+        await handlePostConnectionProfile(registry, parsed.value, res);
+        return;
+      }
+
+      // POST /api/connections/profiles/:name/activate
+      if (
+        method === 'POST' &&
+        segments.length === 5 &&
+        segments[0] === 'api' &&
+        segments[1] === 'connections' &&
+        segments[2] === 'profiles' &&
+        segments[4] === 'activate'
+      ) {
+        await handleActivateConnectionProfile(registry, segments[3] as string, res);
+        return;
+      }
+
+      // DELETE /api/connections/profiles/:name
+      if (
+        method === 'DELETE' &&
+        segments.length === 4 &&
+        segments[0] === 'api' &&
+        segments[1] === 'connections' &&
+        segments[2] === 'profiles'
+      ) {
+        await handleDeleteConnectionProfile(registry, segments[3] as string, res);
+        return;
+      }
+
+      // GET /api/presets
+      if (method === 'GET' && pathname === '/api/presets') {
+        await handleGetPresets(registry, res);
+        return;
+      }
+
+      // POST /api/presets
+      if (method === 'POST' && pathname === '/api/presets') {
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          sendErrors(res, parsed.status, parsed.errors);
+          return;
         }
-        const rawConns = getOwn(parsed.value, 'connections');
-        if (isPlainObject(rawConns)) {
-          for (const roleKey of Object.keys(rawConns)) {
-            if (!isSafeKey(roleKey)) continue;
-            const cfg = getOwn(rawConns, roleKey);
-            if (isPlainObject(cfg)) {
-              const baseUrl = getOwn(cfg, 'baseUrl');
-              const model = getOwn(cfg, 'model');
-              const apiKey = getOwn(cfg, 'apiKey');
-              const provider = getOwn(cfg, 'provider');
-              if (typeof baseUrl === 'string' && typeof model === 'string') {
-                registry.gateway.setRoleConnection(roleKey as AgentRole, {
-                  provider:
-                    provider === 'ollama' || provider === 'anthropic' || provider === 'mock'
-                      ? provider
-                      : 'openai_compatible',
-                  baseUrl,
-                  model,
-                  ...(typeof apiKey === 'string' ? { apiKey } : {}),
-                });
-              }
-            }
-          }
+        await handlePostPreset(registry, parsed.value, res);
+        return;
+      }
+
+      // POST /api/presets/import
+      if (method === 'POST' && pathname === '/api/presets/import') {
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          sendErrors(res, parsed.status, parsed.errors);
+          return;
         }
-        sendJson(res, 200, { ok: true, ...registry.gateway.getConnectionsSnapshot() });
+        await handleImportPreset(registry, parsed.value, res);
+        return;
+      }
+
+      // DELETE /api/presets/:id
+      if (
+        method === 'DELETE' &&
+        segments.length === 3 &&
+        segments[0] === 'api' &&
+        segments[1] === 'presets'
+      ) {
+        await handleDeletePreset(registry, segments[2] as string, res);
+        return;
+      }
+
+      // GET /api/personas
+      if (method === 'GET' && pathname === '/api/personas') {
+        await handleGetPersonas(registry, res);
+        return;
+      }
+
+      // POST /api/personas
+      if (method === 'POST' && pathname === '/api/personas') {
+        const parsed = await readJsonBody(req);
+        if (!parsed.ok) {
+          sendErrors(res, parsed.status, parsed.errors);
+          return;
+        }
+        await handlePostPersona(registry, parsed.value, res);
+        return;
+      }
+
+      // DELETE /api/personas/:id
+      if (
+        method === 'DELETE' &&
+        segments.length === 3 &&
+        segments[0] === 'api' &&
+        segments[1] === 'personas'
+      ) {
+        await handleDeletePersona(registry, segments[2] as string, res);
         return;
       }
 
@@ -3140,40 +5016,31 @@ export function createDaemonRequestHandler(
         return;
       }
 
-      // Session-scoped nested routes: /api/sessions/:id/messages/:nodeId & /api/sessions/:id/combat/preview
-      if (segments.length === 5 && segments[0] === 'api' && segments[1] === 'sessions') {
-        const rawSessionId = segments[2] as string;
-        const runtime = getSessionOrNotFound(registry, rawSessionId, res);
-        if (runtime === null) {
-          return;
-        }
-
-        if (method === 'PATCH' && segments[3] === 'messages') {
-          const nodeId = segments[4] as string;
-          const parsed = await readJsonBody(req);
-          if (!parsed.ok) {
-            sendErrors(res, parsed.status, parsed.errors);
-            return;
-          }
-          await handleEditMessage(registry, runtime, nodeId, parsed.value, res);
-          return;
-        }
-
-        if (method === 'POST' && segments[3] === 'combat' && segments[4] === 'preview') {
-          const parsed = await readJsonBody(req);
-          if (!parsed.ok) {
-            sendErrors(res, parsed.status, parsed.errors);
-            return;
-          }
-          await handleCombatPreview(registry, runtime, parsed.value, res);
-          return;
-        }
-      }
-
       // Session-scoped routes: /api/sessions/:id/:subroute
       if (segments.length === 4 && segments[0] === 'api' && segments[1] === 'sessions') {
         const rawSessionId = segments[2] as string;
         const subroute = segments[3] as string;
+
+        if (method === 'POST' && subroute === 'resume') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleResumeSession(registry, rawSessionId, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'branch') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleBranchSession(registry, rawSessionId, parsed.value, res);
+          return;
+        }
+
         const runtime = getSessionOrNotFound(registry, rawSessionId, res);
         if (runtime === null) {
           return;
@@ -3191,6 +5058,95 @@ export function createDaemonRequestHandler(
             return;
           }
           await handlePatchControlRoom(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'PUT' && subroute === 'persona') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handlePutSessionPersona(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'GET' && subroute === 'characters') {
+          await handleGetSessionCharacters(registry, runtime, url, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'characters') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          if (isPlainObject(parsed.value) && typeof getOwn(parsed.value, 'cardId') === 'string') {
+            await handleAttachSessionCharacter(registry, runtime, parsed.value, res);
+            return;
+          }
+          await handlePostSessionCharacter(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'clone') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleCloneSession(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'GET' && subroute === 'swipe-tree') {
+          await handleGetSwipeTree(registry, runtime, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'continue') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleContinueSession(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'PATCH' && subroute === 'player') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handlePatchPlayer(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'travel') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleTravel(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && subroute === 'downtime') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleDowntime(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'GET' && subroute === 'context-budget') {
+          await handleGetContextBudget(registry, runtime, res);
           return;
         }
 
@@ -3259,74 +5215,85 @@ export function createDaemonRequestHandler(
           registry.sseHub.addClient(runtime.sessionId, res, req);
           return;
         }
+      }
 
-        if (method === 'POST' && subroute === 'clone') {
+      // Nested session-scoped routes: /api/sessions/:id/:group/:action
+      if (segments.length === 5 && segments[0] === 'api' && segments[1] === 'sessions') {
+        const rawSessionId = segments[2] as string;
+        const group = segments[3] as string;
+        const action = segments[4] as string;
+        const runtime = getSessionOrNotFound(registry, rawSessionId, res);
+        if (runtime === null) {
+          return;
+        }
+
+        if (method === 'POST' && group === 'control-room' && action === 'apply-preset') {
           const parsed = await readJsonBody(req);
           if (!parsed.ok) {
             sendErrors(res, parsed.status, parsed.errors);
             return;
           }
-          await handleCloneSession(registry, runtime, parsed.value, res);
+          await handleApplySessionPreset(registry, runtime, parsed.value, res);
           return;
         }
 
-        if (method === 'GET' && subroute === 'swipe-tree') {
-          await handleGetSwipeTree(registry, runtime, res);
+        if (method === 'GET' && group === 'preset' && action === 'export') {
+          await handleExportSessionPreset(registry, runtime, url, res);
           return;
         }
 
-        if (method === 'POST' && subroute === 'continue') {
+        if (method === 'GET' && group === 'characters') {
+          await handleGetSessionCharacterDossier(registry, runtime, action, res);
+          return;
+        }
+
+        if (method === 'PATCH' && group === 'characters') {
           const parsed = await readJsonBody(req);
           if (!parsed.ok) {
             sendErrors(res, parsed.status, parsed.errors);
             return;
           }
-          await handleContinueSession(registry, runtime, parsed.value, res);
+          await handlePatchSessionCharacter(registry, runtime, action, parsed.value, res);
           return;
         }
 
-        if (method === 'POST' && subroute === 'characters') {
+        if (method === 'POST' && group === 'combat' && action === 'start') {
           const parsed = await readJsonBody(req);
           if (!parsed.ok) {
             sendErrors(res, parsed.status, parsed.errors);
             return;
           }
-          await handleAttachSessionCharacter(registry, runtime, parsed.value, res);
+          await handleStartCombat(registry, runtime, parsed.value, res);
           return;
         }
 
-        if (method === 'PATCH' && subroute === 'player') {
+        if (method === 'PATCH' && group === 'messages') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleEditMessage(registry, runtime, action, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && group === 'combat' && action === 'preview') {
+          const parsed = await readJsonBody(req);
+          if (!parsed.ok) {
+            sendErrors(res, parsed.status, parsed.errors);
+            return;
+          }
+          await handleCombatPreview(registry, runtime, parsed.value, res);
+          return;
+        }
+
+        if (method === 'POST' && group === 'player' && action === 'bind') {
           const parsed = await readJsonBody(req);
           if (!parsed.ok) {
             sendErrors(res, parsed.status, parsed.errors);
             return;
           }
           await handlePatchPlayer(registry, runtime, parsed.value, res);
-          return;
-        }
-
-        if (method === 'POST' && subroute === 'travel') {
-          const parsed = await readJsonBody(req);
-          if (!parsed.ok) {
-            sendErrors(res, parsed.status, parsed.errors);
-            return;
-          }
-          await handleTravel(registry, runtime, parsed.value, res);
-          return;
-        }
-
-        if (method === 'POST' && subroute === 'downtime') {
-          const parsed = await readJsonBody(req);
-          if (!parsed.ok) {
-            sendErrors(res, parsed.status, parsed.errors);
-            return;
-          }
-          await handleDowntime(registry, runtime, parsed.value, res);
-          return;
-        }
-
-        if (method === 'GET' && subroute === 'context-budget') {
-          await handleGetContextBudget(registry, runtime, res);
           return;
         }
       }

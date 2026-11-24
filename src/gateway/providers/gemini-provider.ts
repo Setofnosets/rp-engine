@@ -128,7 +128,7 @@ export class GeminiProvider implements ModelProvider {
     if (sampler.topP !== undefined) {
       generationConfig.topP = sampler.topP;
     }
-    if (sampler.topK !== undefined) {
+    if (sampler.topK !== undefined && sampler.topK > 0) {
       generationConfig.topK = sampler.topK;
     }
     if (sampler.maxTokens !== undefined) {

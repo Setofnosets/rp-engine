@@ -33,13 +33,17 @@ function normalizeOptionalNumber(value: number | undefined): number | undefined 
  */
 export interface ResolvedSampler {
   readonly temperature?: number;
+  readonly maxTokens?: number;
+  readonly maxContextTokens?: number;
   readonly topP?: number;
   readonly topK?: number;
   readonly minP?: number;
-  readonly repetitionPenalty?: number;
+  readonly topA?: number;
+  readonly typicalP?: number;
+  readonly tfs?: number;
   readonly frequencyPenalty?: number;
   readonly presencePenalty?: number;
-  readonly maxTokens?: number;
+  readonly repetitionPenalty?: number;
   readonly stop?: readonly string[];
   readonly seed?: number;
 }
@@ -50,7 +54,24 @@ export interface ResolvedSampler {
  */
 export function resolveEffectiveSampler(
   config: RoleConnectionConfig,
-  req?: Pick<GatewayGenerateTextRequest | GatewayStructuredRequest, 'temperature' | 'maxTokens' | 'sampler'>
+  req?: Pick<
+    GatewayGenerateTextRequest | GatewayStructuredRequest,
+    | 'temperature'
+    | 'maxTokens'
+    | 'maxContextTokens'
+    | 'topP'
+    | 'topK'
+    | 'minP'
+    | 'topA'
+    | 'typicalP'
+    | 'tfs'
+    | 'frequencyPenalty'
+    | 'presencePenalty'
+    | 'repetitionPenalty'
+    | 'stopSequences'
+    | 'seed'
+    | 'sampler'
+  >
 ): ResolvedSampler {
   const cfgSampler = config.sampler;
   const reqSampler = req?.sampler;
@@ -58,34 +79,62 @@ export function resolveEffectiveSampler(
   const temperature = normalizeOptionalNumber(
     req?.temperature ?? reqSampler?.temperature ?? config.temperature ?? cfgSampler?.temperature
   );
-  const topP = normalizeOptionalNumber(reqSampler?.topP ?? cfgSampler?.topP);
-  const topK = normalizeOptionalNumber(reqSampler?.topK ?? cfgSampler?.topK);
-  const minP = normalizeOptionalNumber(reqSampler?.minP ?? cfgSampler?.minP);
-  const repetitionPenalty = normalizeOptionalNumber(
-    reqSampler?.repetitionPenalty ?? cfgSampler?.repetitionPenalty
-  );
-  const frequencyPenalty = normalizeOptionalNumber(
-    reqSampler?.frequencyPenalty ?? cfgSampler?.frequencyPenalty
-  );
-  const presencePenalty = normalizeOptionalNumber(
-    reqSampler?.presencePenalty ?? cfgSampler?.presencePenalty
-  );
   const maxTokens = normalizeOptionalNumber(
     req?.maxTokens ?? reqSampler?.maxTokens ?? config.maxTokens ?? cfgSampler?.maxTokens
   );
-  const seed = normalizeOptionalNumber(reqSampler?.seed ?? cfgSampler?.seed);
-  const rawStop = reqSampler?.stop ?? cfgSampler?.stop;
+  const maxContextTokens = normalizeOptionalNumber(
+    req?.maxContextTokens ?? config.maxContextTokens
+  );
+  const topP = normalizeOptionalNumber(
+    req?.topP ?? reqSampler?.topP ?? config.topP ?? cfgSampler?.topP
+  );
+  const topK = normalizeOptionalNumber(
+    req?.topK ?? reqSampler?.topK ?? config.topK ?? cfgSampler?.topK
+  );
+  const minP = normalizeOptionalNumber(
+    req?.minP ?? reqSampler?.minP ?? config.minP ?? cfgSampler?.minP
+  );
+  const topA = normalizeOptionalNumber(req?.topA ?? config.topA);
+  const typicalP = normalizeOptionalNumber(req?.typicalP ?? config.typicalP);
+  const tfs = normalizeOptionalNumber(req?.tfs ?? config.tfs);
+  const frequencyPenalty = normalizeOptionalNumber(
+    req?.frequencyPenalty ??
+      reqSampler?.frequencyPenalty ??
+      config.frequencyPenalty ??
+      cfgSampler?.frequencyPenalty
+  );
+  const presencePenalty = normalizeOptionalNumber(
+    req?.presencePenalty ??
+      reqSampler?.presencePenalty ??
+      config.presencePenalty ??
+      cfgSampler?.presencePenalty
+  );
+  const repetitionPenalty = normalizeOptionalNumber(
+    req?.repetitionPenalty ??
+      reqSampler?.repetitionPenalty ??
+      config.repetitionPenalty ??
+      cfgSampler?.repetitionPenalty
+  );
+  const seed = normalizeOptionalNumber(
+    req?.seed ?? reqSampler?.seed ?? config.seed ?? cfgSampler?.seed
+  );
+  const rawStop =
+    req?.stopSequences ?? reqSampler?.stop ?? config.stopSequences ?? cfgSampler?.stop;
   const stop = rawStop !== undefined ? [...rawStop] : undefined;
 
   return {
     ...(temperature !== undefined ? { temperature } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(topP !== undefined ? { topP } : {}),
     ...(topK !== undefined ? { topK } : {}),
     ...(minP !== undefined ? { minP } : {}),
-    ...(repetitionPenalty !== undefined ? { repetitionPenalty } : {}),
+    ...(topA !== undefined ? { topA } : {}),
+    ...(typicalP !== undefined ? { typicalP } : {}),
+    ...(tfs !== undefined ? { tfs } : {}),
     ...(frequencyPenalty !== undefined ? { frequencyPenalty } : {}),
     ...(presencePenalty !== undefined ? { presencePenalty } : {}),
-    ...(maxTokens !== undefined ? { maxTokens } : {}),
+    ...(repetitionPenalty !== undefined ? { repetitionPenalty } : {}),
     ...(stop !== undefined && stop.length > 0 ? { stop } : {}),
     ...(seed !== undefined ? { seed } : {}),
   };
