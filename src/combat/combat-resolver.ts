@@ -12,34 +12,70 @@ import {
   getOwnNumber,
   getSafeCombatant,
   getSafeCombatantIds,
+  isActorRooted,
   isActorStunned,
   isSafeKey,
   setOwnProperty,
   validateSingleCombatAction,
 } from './action-validator.js';
+import { computeCombatVariables, resolveScaledDiceExpression } from './combat-variables.js';
+import { type EffectTemplate, expandEffectTemplateTargets } from './effect-templates.js';
 import { computeFallbackActions } from './fallback-tactics.js';
-import type { GridCoord, TacticalGrid, TerrainTheme } from './grid-types.js';
+import type {
+  GridCoord,
+  TacticalGrid,
+  TerrainModificationSpec,
+  TerrainTheme,
+} from './grid-types.js';
 import {
   DEFAULT_MAX_PASSIVE_RECURSION_DEPTH,
   type PassiveDefinition,
   type PassiveTriggerHook,
   adjustWillpower,
   evaluatePassiveHooks,
+  isCriticalNaturalRoll,
+  isFumbleNaturalRoll,
+  resolveWillpowerBreak,
 } from './passives-and-willpower.js';
 import { awardExperience } from './rpg-progression.js';
 import type { SkillDefinition, SkillEffectSpec, SkillRegistry } from './skill-registry.js';
-import { evaluateLineOfSight, getTileAt } from './spatial-math.js';
+import { computeHighGroundAttackBonus, evaluateLineOfSight, getTileAt } from './spatial-math.js';
 import {
   type ActiveStatusEffect,
   applyStatusEffect,
   tickStatusEffects,
 } from './status-effects.js';
 import {
+  type CombatFormLoadout,
+  type SummonTemplate,
+  applyCombatTransformation,
+  applyTransformTempHpDamage,
+  despawnSummonsForFallenCaster,
+  purgeSummonsOnEncounterEnd,
+  revertAllTransformsOnEncounterEnd,
+  revertCombatTransformation,
+  spawnCombatSummon,
+  tickAndCleanupSummons,
+  tickCombatTransformations,
+} from './summons-and-transforms.js';
+import {
+  applyTerrainModification,
+  applyTraditionalZoneHazard,
+  evaluateTileHazardTrigger,
+  resolveKnockbackWithCollision,
+  tickRoundTerrainHazards,
+} from './terrain-effects.js';
+import {
   type InitiativeParticipant,
   generateDeploymentCoords,
   generateTacticalGrid,
   rollInitiativeOrder,
 } from './terrain-generator.js';
+import {
+  type TraditionalTurnStyle,
+  computeTraditionalEffectiveAc,
+  isRangedSkill,
+} from './traditional-theater.js';
 
 export interface CombatOutcomeSummary {
   round: number;
@@ -59,6 +95,7 @@ export interface StartCombatEncounterParams {
   worldState: WorldState;
   participants: readonly CombatantState[];
   mode: 'tactical_grid' | 'traditional';
+  turnStyle?: TraditionalTurnStyle;
   theme?: TerrainTheme;
   gridSize?: { width: number; height: number };
   rng: RngState;
@@ -78,6 +115,10 @@ export interface ResolveCombatTurnParams {
   registry: SkillRegistry;
   rng: RngState;
   xpAwardOnVictory?: number;
+  summons?: Record<string, SummonTemplate>;
+  formLoadouts?: Record<string, CombatFormLoadout>;
+  effectTemplates?: Record<string, EffectTemplate>;
+  fleeDc?: number;
 }
 
 export interface ResolveCombatTurnResult {
@@ -125,12 +166,12 @@ function cloneCombatant(c: CombatantState): CombatantState {
     id: c.id,
     name: c.name,
     team: c.team,
-    coord: { x: c.coord.x, y: c.coord.y },
+    coord: { x: c.coord.x === 0 ? 0 : c.coord.x, y: c.coord.y === 0 ? 0 : c.coord.y },
     alive: c.alive,
     hp: c.hp === 0 ? 0 : c.hp,
     maxHp: c.maxHp === 0 ? 0 : c.maxHp,
-    ac: c.ac,
-    speed: c.speed,
+    ac: c.ac === 0 ? 0 : c.ac,
+    speed: c.speed === 0 ? 0 : c.speed,
     remainingMovement: c.remainingMovement === 0 ? 0 : c.remainingMovement,
     remainingActions: {
       action: c.remainingActions.action,
@@ -145,6 +186,24 @@ function cloneCombatant(c: CombatantState): CombatantState {
     passives: c.passives.map(clonePassive),
     willpower: c.willpower === 0 ? 0 : c.willpower,
     maxWillpower: c.maxWillpower === 0 ? 0 : c.maxWillpower,
+    ...(c.formationRow !== undefined ? { formationRow: c.formationRow } : {}),
+    ...(c.willpowerOutcome !== undefined ? { willpowerOutcome: c.willpowerOutcome } : {}),
+    ...(c.isSummon !== undefined ? { isSummon: c.isSummon } : {}),
+    ...(c.summonerId !== undefined ? { summonerId: c.summonerId } : {}),
+    ...(c.summonRemainingTurns !== undefined
+      ? { summonRemainingTurns: c.summonRemainingTurns }
+      : {}),
+    ...(c.activeTransform !== undefined
+      ? {
+          activeTransform: {
+            loadoutId: c.activeTransform.loadoutId,
+            remainingTurns: c.activeTransform.remainingTurns,
+            tempHp: c.activeTransform.tempHp === 0 ? 0 : c.activeTransform.tempHp,
+            revertOnZeroTempHp: c.activeTransform.revertOnZeroTempHp,
+            preTransformSnapshot: { ...c.activeTransform.preTransformSnapshot },
+          },
+        }
+      : {}),
   };
 }
 
@@ -189,6 +248,7 @@ function cloneCombatState(state: CombatState): CombatState {
   return {
     active: state.active,
     mode: state.mode,
+    ...(state.turnStyle !== undefined ? { turnStyle: state.turnStyle } : {}),
     round: state.round,
     turnIndex: state.turnIndex,
     initiativeOrder: [...state.initiativeOrder],
@@ -347,21 +407,46 @@ function markDefeatedIfDead(combatant: CombatantState, defeatedIds: string[]): b
 function computeEffectMagnitude(
   effect: SkillEffectSpec,
   caster: CombatantState,
-  rng: RngState
+  rng: RngState,
+  combat?: CombatState,
+  target?: CombatantState,
+  isCrit = false
 ): { amount: number; nextRng: RngState } {
   let currentRng = rng;
   let total = 0;
 
   if (effect.dice !== undefined) {
-    const rollRes = rollDice(effect.dice, currentRng);
-    if (!rollRes.ok) {
-      throw new RefereeError(
-        `Invalid dice notation "${effect.dice}": ${formatValidationErrors(rollRes.error)}`,
-        { code: 'INVALID_SKILL_DICE', details: rollRes.error }
-      );
+    let diceExpr = effect.dice;
+    if (combat !== undefined && (diceExpr.includes('@') || effect.scale !== undefined)) {
+      const vars = computeCombatVariables(combat, caster, target);
+      diceExpr = resolveScaledDiceExpression(diceExpr, vars, effect.scale);
     }
-    currentRng = rollRes.value.nextState;
-    total += rollRes.value.total;
+    if (/^[+-]?\d+$/.test(diceExpr.trim())) {
+      total += Number.parseInt(diceExpr.trim(), 10);
+    } else {
+      const rollRes = rollDice(diceExpr, currentRng);
+      if (!rollRes.ok) {
+        throw new RefereeError(
+          `Invalid dice notation "${effect.dice}": ${formatValidationErrors(rollRes.error)}`,
+          { code: 'INVALID_SKILL_DICE', details: rollRes.error }
+        );
+      }
+      currentRng = rollRes.value.nextState;
+      total += rollRes.value.total;
+
+      if (isCrit && (effect.type === 'damage' || effect.type === 'drain')) {
+        const critRoll = unwrap(rollDice(diceExpr, currentRng));
+        currentRng = critRoll.nextState;
+        total += critRoll.total;
+      }
+    }
+  } else if (effect.scale !== undefined && combat !== undefined) {
+    const vars = computeCombatVariables(combat, caster, target);
+    const rawVal = vars[effect.scale.variable];
+    const scaled = Math.trunc(rawVal * effect.scale.per);
+    const minVal = effect.scale.min ?? -Infinity;
+    const maxVal = effect.scale.max ?? Infinity;
+    total += Math.max(minVal, Math.min(maxVal, scaled));
   }
   if (effect.flat !== undefined) {
     total += effect.flat;
@@ -370,41 +455,7 @@ function computeEffectMagnitude(
     total += getEffectiveStat(caster, effect.scalingStat);
   }
 
-  return { amount: total, nextRng: currentRng };
-}
-
-function stepKnockback(
-  combat: CombatState,
-  casterCoord: GridCoord,
-  target: CombatantState,
-  distance: number
-): void {
-  if (combat.mode !== 'tactical_grid' || combat.grid === null || distance <= 0) {
-    return;
-  }
-  const dx = Math.sign(target.coord.x - casterCoord.x);
-  const dy = Math.sign(target.coord.y - casterCoord.y);
-  if (dx === 0 && dy === 0) {
-    return;
-  }
-
-  const occupiedKeys = new Set<string>();
-  for (const id of getSafeCombatantIds(combat)) {
-    const c = getSafeCombatant(combat, id);
-    if (c !== undefined && c.alive && c.hp > 0 && c.id !== target.id) {
-      occupiedKeys.add(`${c.coord.x},${c.coord.y}`);
-    }
-  }
-
-  const steps = Math.floor(distance);
-  for (let i = 0; i < steps; i += 1) {
-    const nextCoord: GridCoord = { x: target.coord.x + dx, y: target.coord.y + dy };
-    const tile = getTileAt(combat.grid, nextCoord);
-    if (tile === null || !tile.passable || occupiedKeys.has(`${nextCoord.x},${nextCoord.y}`)) {
-      break;
-    }
-    target.coord = nextCoord;
-  }
+  return { amount: total === 0 ? 0 : total, nextRng: currentRng };
 }
 
 interface TurnExecutionContext {
@@ -414,6 +465,80 @@ interface TurnExecutionContext {
   damageDealt: Record<string, number>;
   defeatedIds: string[];
   newlyTriggeredCooldowns: Set<string>;
+  extraWorldPatches: PatchOperation[];
+  summons?: Record<string, SummonTemplate>;
+  formLoadouts?: Record<string, CombatFormLoadout>;
+  effectTemplates?: Record<string, EffectTemplate>;
+  fleeDc: number;
+}
+
+function applyDamageToCombatant(
+  ctx: TurnExecutionContext,
+  targetId: string,
+  rawDamage: number
+): { target: CombatantState | undefined; actualDamage: number; died: boolean } {
+  const target = getSafeCombatant(ctx.combat, targetId);
+  if (target === undefined || !target.alive || target.hp <= 0 || rawDamage <= 0) {
+    return { target, actualDamage: 0, died: false };
+  }
+  const dmg = Math.max(0, rawDamage);
+  let remaining = dmg;
+  if (target.activeTransform !== undefined) {
+    const absRes = applyTransformTempHpDamage(ctx.combat, target.id, dmg);
+    ctx.combat = absRes.nextCombatState;
+    remaining = absRes.remainingDamage;
+  }
+  const updatedTarget = getSafeCombatant(ctx.combat, targetId);
+  if (updatedTarget === undefined) {
+    return { target: undefined, actualDamage: dmg, died: false };
+  }
+  if (remaining > 0) {
+    updatedTarget.hp = clampHp(updatedTarget.hp - remaining, updatedTarget.maxHp);
+  }
+  recordDamage(ctx.damageDealt, updatedTarget.id, dmg);
+  const died = markDefeatedIfDead(updatedTarget, ctx.defeatedIds);
+  return { target: updatedTarget, actualDamage: dmg, died };
+}
+
+function checkAndResolveWillpowerBreak(
+  ctx: TurnExecutionContext,
+  target: CombatantState
+): void {
+  if (!target.alive || target.hp <= 0 || target.willpower > 0 || target.willpowerOutcome === undefined) {
+    return;
+  }
+  const res = resolveWillpowerBreak(
+    {
+      alive: target.alive,
+      team: target.team,
+      hp: target.hp,
+      willpower: target.willpower,
+    },
+    target.willpowerOutcome
+  );
+  target.alive = res.alive;
+  target.team = res.team;
+  target.hp = clampHp(res.hp, target.maxHp);
+  target.willpower = res.willpower === 0 ? 0 : res.willpower;
+  if (res.appliedStatusId !== null) {
+    target.statuses = applyStatusEffect(target.statuses, {
+      id: res.appliedStatusId,
+      name: res.appliedStatusId,
+      remainingTurns: 99,
+      intensity: 1,
+      stackPolicy: 'refresh',
+      tickTiming: 'turn_end',
+      ...(res.outcome === 'incapacitate' ? { stun: true } : {}),
+    });
+  }
+  if (!target.alive) {
+    markDefeatedIfDead(target, ctx.defeatedIds);
+    const caster = getSafeCombatant(ctx.combat, target.id);
+    if (caster !== undefined) {
+      const despawn = despawnSummonsForFallenCaster(ctx.combat, caster.id);
+      ctx.combat = despawn.nextCombatState;
+    }
+  }
 }
 
 function applySelfPassiveEffects(
@@ -594,9 +719,15 @@ function handleTargetDefeated(
   killer: CombatantState,
   victim: CombatantState
 ): void {
-  applySelfPassiveEffects(ctx, killer, 'on_kill');
-  const killerWill = adjustWillpower(killer.willpower, killer.maxWillpower, 2);
-  killer.willpower = killerWill.next;
+  const despawnRes = despawnSummonsForFallenCaster(ctx.combat, victim.id);
+  ctx.combat = despawnRes.nextCombatState;
+
+  const liveKiller = getSafeCombatant(ctx.combat, killer.id);
+  if (liveKiller !== undefined && liveKiller.alive && liveKiller.hp > 0) {
+    applySelfPassiveEffects(ctx, liveKiller, 'on_kill');
+    const killerWill = adjustWillpower(liveKiller.willpower, liveKiller.maxWillpower, 2);
+    liveKiller.willpower = killerWill.next;
+  }
 
   for (const id of getSafeCombatantIds(ctx.combat)) {
     if (id === victim.id) {
@@ -607,8 +738,165 @@ function handleTargetDefeated(
       applySelfPassiveEffects(ctx, ally, 'on_ally_down');
       const allyWill = adjustWillpower(ally.willpower, ally.maxWillpower, -2);
       ally.willpower = allyWill.next;
+      checkAndResolveWillpowerBreak(ctx, ally);
     }
   }
+}
+
+function applySingleEffectToTarget(
+  ctx: TurnExecutionContext,
+  actor: CombatantState,
+  target: CombatantState,
+  effect: SkillEffectSpec,
+  saveSucceeded: boolean,
+  isCrit: boolean,
+  halveOnSave: boolean
+): number {
+  const mag = computeEffectMagnitude(effect, actor, ctx.rng, ctx.combat, target, isCrit);
+  ctx.rng = mag.nextRng;
+  let damageDealtHere = 0;
+
+  switch (effect.type) {
+    case 'damage': {
+      let dmg = Math.max(0, mag.amount);
+      if (halveOnSave && saveSucceeded) {
+        dmg = Math.floor(dmg / 2);
+      }
+      const dmgRes = applyDamageToCombatant(ctx, target.id, dmg);
+      damageDealtHere = dmgRes.actualDamage;
+      break;
+    }
+
+    case 'drain': {
+      let dmg = Math.max(0, mag.amount);
+      if (halveOnSave && saveSucceeded) {
+        dmg = Math.floor(dmg / 2);
+      }
+      const dmgRes = applyDamageToCombatant(ctx, target.id, dmg);
+      damageDealtHere = dmgRes.actualDamage;
+      const liveActor = getSafeCombatant(ctx.combat, actor.id);
+      if (liveActor !== undefined && liveActor.alive && liveActor.hp > 0 && damageDealtHere > 0) {
+        liveActor.hp = clampHp(liveActor.hp + damageDealtHere, liveActor.maxHp);
+      }
+      break;
+    }
+
+    case 'heal': {
+      const liveTarget = getSafeCombatant(ctx.combat, target.id);
+      if (liveTarget !== undefined && liveTarget.alive && liveTarget.hp > 0) {
+        const healAmt = Math.max(0, mag.amount);
+        liveTarget.hp = clampHp(liveTarget.hp + healAmt, liveTarget.maxHp);
+      }
+      break;
+    }
+
+    case 'apply_status': {
+      if (halveOnSave && saveSucceeded) {
+        break;
+      }
+      const liveTarget = getSafeCombatant(ctx.combat, target.id);
+      if (liveTarget !== undefined && liveTarget.alive && liveTarget.hp > 0 && effect.statusId !== undefined) {
+        liveTarget.statuses = applyStatusEffect(liveTarget.statuses, buildStatusEffectFromSpec(effect));
+      }
+      break;
+    }
+
+    case 'remove_status': {
+      const liveTarget = getSafeCombatant(ctx.combat, target.id);
+      if (liveTarget !== undefined && effect.statusId !== undefined) {
+        liveTarget.statuses = liveTarget.statuses.filter((s) => s.id !== effect.statusId);
+      }
+      break;
+    }
+
+    case 'restore_resource': {
+      const resKey = effect.resourceKey;
+      const liveTarget = getSafeCombatant(ctx.combat, target.id);
+      if (liveTarget !== undefined && liveTarget.alive && resKey !== undefined && isSafeKey(resKey)) {
+        const prev = getOwnNumber(liveTarget.resources, resKey) ?? 0;
+        setOwnProperty(liveTarget.resources, resKey, prev + Math.max(0, mag.amount));
+      }
+      break;
+    }
+
+    case 'knockback': {
+      if (halveOnSave && saveSucceeded) {
+        break;
+      }
+      const liveTarget = getSafeCombatant(ctx.combat, target.id);
+      if (liveTarget !== undefined && liveTarget.alive && liveTarget.hp > 0 && effect.distance !== undefined) {
+        const kbRes = resolveKnockbackWithCollision(
+          ctx.combat,
+          actor.coord,
+          liveTarget,
+          effect.distance,
+          ctx.rng
+        );
+        ctx.rng = kbRes.nextRng;
+        if (kbRes.collided && kbRes.collisionDamage > 0) {
+          recordDamage(ctx.damageDealt, liveTarget.id, kbRes.collisionDamage);
+          damageDealtHere += kbRes.collisionDamage;
+          markDefeatedIfDead(liveTarget, ctx.defeatedIds);
+          if (kbRes.collidedCombatantId !== null) {
+            const other = getSafeCombatant(ctx.combat, kbRes.collidedCombatantId);
+            if (other !== undefined) {
+              recordDamage(ctx.damageDealt, other.id, kbRes.collisionDamage);
+              if (markDefeatedIfDead(other, ctx.defeatedIds)) {
+                handleTargetDefeated(ctx, actor, other);
+              }
+            }
+          }
+        }
+        if (kbRes.movedSteps > 0 && liveTarget.alive && liveTarget.hp > 0 && ctx.combat.grid !== null) {
+          const landedTile = getTileAt(ctx.combat.grid, liveTarget.coord);
+          if (landedTile !== null) {
+            const hazRes = evaluateTileHazardTrigger(landedTile, liveTarget, 'step_entry', ctx.rng);
+            ctx.rng = hazRes.nextRng;
+            if (hazRes.triggered) {
+              if (hazRes.damage > 0) {
+                const hazDmg = applyDamageToCombatant(ctx, liveTarget.id, hazRes.damage);
+                damageDealtHere += hazDmg.actualDamage;
+              }
+              if (hazRes.healing > 0 && liveTarget.alive && liveTarget.hp > 0) {
+                liveTarget.hp = clampHp(liveTarget.hp + hazRes.healing, liveTarget.maxHp);
+              }
+              for (const st of hazRes.appliedStatuses) {
+                if (liveTarget.alive && liveTarget.hp > 0) {
+                  liveTarget.statuses = applyStatusEffect(liveTarget.statuses, st);
+                }
+              }
+            }
+          }
+        }
+      }
+      break;
+    }
+
+    case 'transform': {
+      const loadoutId = effect.formLoadoutId;
+      const loadout =
+        loadoutId !== undefined && ctx.formLoadouts !== undefined && isSafeKey(loadoutId) && Object.hasOwn(ctx.formLoadouts, loadoutId)
+          ? (Object.getOwnPropertyDescriptor(ctx.formLoadouts, loadoutId)?.value as CombatFormLoadout | undefined)
+          : undefined;
+      if (loadout !== undefined) {
+        const tfRes = applyCombatTransformation(ctx.combat, target.id, loadout);
+        ctx.combat = tfRes.nextCombatState;
+        ctx.extraWorldPatches.push(...tfRes.worldPatches);
+      }
+      break;
+    }
+
+    case 'revert_transform': {
+      const revRes = revertCombatTransformation(ctx.combat, target.id);
+      ctx.combat = revRes.nextCombatState;
+      break;
+    }
+
+    default:
+      break;
+  }
+
+  return damageDealtHere;
 }
 
 function executeSkillOnTarget(
@@ -621,26 +909,43 @@ function executeSkillOnTarget(
     return;
   }
 
-  let coverAcBonus = 0;
+  let effectiveAc = target.ac + getStatusModifierSum(target, 'ac');
+  let highGroundBonus = 0;
+
   if (ctx.combat.mode === 'tactical_grid' && ctx.combat.grid !== null && target.id !== actor.id) {
     const los = evaluateLineOfSight(ctx.combat.grid, actor.coord, target.coord);
     if (los.cover === 'half') {
-      coverAcBonus = 2;
+      effectiveAc += 2;
     } else if (los.cover === 'full') {
-      coverAcBonus = 5;
+      effectiveAc += 5;
     }
+    highGroundBonus = computeHighGroundAttackBonus(ctx.combat.grid, actor.coord, target.coord);
+  } else if (ctx.combat.mode === 'traditional' && target.id !== actor.id) {
+    const tradAc = computeTraditionalEffectiveAc(ctx.combat, target.id, isRangedSkill(skill));
+    const nonGuardedAcMods = target.statuses
+      .filter((s) => s.remainingTurns > 0 && s.id !== 'guarded' && s.statModifiers !== undefined)
+      .reduce((sum, s) => sum + (getOwnNumber(s.statModifiers!, 'ac') ?? 0), 0);
+    effectiveAc = tradAc + nonGuardedAcMods;
   }
 
   let didHit = true;
+  let isCrit = false;
   let saveSucceeded = false;
 
   if (skill.hitResolution.kind === 'attack_roll') {
     const rollRes = unwrap(rollDice('1d20', ctx.rng));
     ctx.rng = rollRes.nextState;
+    const d20 = rollRes.rolls[0] ?? rollRes.total;
     const attackStat = skill.hitResolution.stat ?? 'str';
-    const attackTotal = rollRes.total + getEffectiveStat(actor, attackStat);
-    const effectiveAc = target.ac + getStatusModifierSum(target, 'ac') + coverAcBonus;
-    didHit = attackTotal >= effectiveAc;
+    const attackTotal = rollRes.total + getEffectiveStat(actor, attackStat) + highGroundBonus;
+    if (isFumbleNaturalRoll(d20)) {
+      didHit = false;
+    } else if (isCriticalNaturalRoll(d20)) {
+      didHit = true;
+      isCrit = true;
+    } else {
+      didHit = attackTotal >= effectiveAc;
+    }
   } else if (skill.hitResolution.kind === 'save') {
     const saveRes = unwrap(rollDice('1d20', ctx.rng));
     ctx.rng = saveRes.nextState;
@@ -659,80 +964,158 @@ function executeSkillOnTarget(
   let totalDamageTaken = 0;
 
   for (const effect of skill.effects) {
-    const mag = computeEffectMagnitude(effect, actor, ctx.rng);
-    ctx.rng = mag.nextRng;
-
-    switch (effect.type) {
-      case 'damage': {
-        let dmg = Math.max(0, mag.amount);
-        if (skill.hitResolution.kind === 'save' && saveSucceeded) {
-          dmg = Math.floor(dmg / 2);
-        }
-        target.hp = clampHp(target.hp - dmg, target.maxHp);
-        recordDamage(ctx.damageDealt, target.id, dmg);
-        totalDamageTaken += dmg;
-        markDefeatedIfDead(target, ctx.defeatedIds);
-        break;
-      }
-
-      case 'heal': {
-        if (target.alive && target.hp > 0) {
-          const healAmt = Math.max(0, mag.amount);
-          target.hp = clampHp(target.hp + healAmt, target.maxHp);
-        }
-        break;
-      }
-
-      case 'apply_status': {
-        if (skill.hitResolution.kind === 'save' && saveSucceeded) {
-          break;
-        }
-        if (target.alive && target.hp > 0 && effect.statusId !== undefined) {
-          target.statuses = applyStatusEffect(target.statuses, buildStatusEffectFromSpec(effect));
-        }
-        break;
-      }
-
-      case 'remove_status': {
-        if (effect.statusId !== undefined) {
-          target.statuses = target.statuses.filter((s) => s.id !== effect.statusId);
-        }
-        break;
-      }
-
-      case 'restore_resource': {
-        const resKey = effect.resourceKey;
-        if (target.alive && resKey !== undefined && isSafeKey(resKey)) {
-          const prev = getOwnNumber(target.resources, resKey) ?? 0;
-          setOwnProperty(target.resources, resKey, prev + Math.max(0, mag.amount));
-        }
-        break;
-      }
-
-      case 'knockback': {
-        if (skill.hitResolution.kind === 'save' && saveSucceeded) {
-          break;
-        }
-        if (target.alive && target.hp > 0 && effect.distance !== undefined) {
-          stepKnockback(ctx.combat, actor.coord, target, effect.distance);
-        }
-        break;
-      }
+    if (effect.type === 'modify_terrain' || effect.type === 'summon') {
+      continue;
     }
+    const liveActor = getSafeCombatant(ctx.combat, actor.id) ?? actor;
+    const liveTarget = getSafeCombatant(ctx.combat, target.id);
+    if (liveTarget === undefined) {
+      break;
+    }
+    totalDamageTaken += applySingleEffectToTarget(
+      ctx,
+      liveActor,
+      liveTarget,
+      effect,
+      saveSucceeded,
+      isCrit,
+      skill.hitResolution.kind === 'save'
+    );
   }
 
-  if (target.id !== actor.id) {
-    triggerOnHitPassives(ctx, actor, target);
-    if (totalDamageTaken > 0) {
-      if (target.alive && target.hp > 0) {
+  const finalTarget = getSafeCombatant(ctx.combat, target.id);
+  const finalActor = getSafeCombatant(ctx.combat, actor.id) ?? actor;
+  if (finalTarget !== undefined && finalTarget.id !== finalActor.id) {
+    triggerOnHitPassives(ctx, finalActor, finalTarget);
+    const afterOnHitTarget = getSafeCombatant(ctx.combat, finalTarget.id);
+    if (afterOnHitTarget !== undefined && totalDamageTaken > 0) {
+      if (afterOnHitTarget.alive && afterOnHitTarget.hp > 0) {
         const willDelta = -Math.max(1, Math.floor(totalDamageTaken / 4));
-        const willRes = adjustWillpower(target.willpower, target.maxWillpower, willDelta);
-        target.willpower = willRes.next;
-        triggerOnDamagedChain(ctx, target, actor, 0);
+        const willRes = adjustWillpower(
+          afterOnHitTarget.willpower,
+          afterOnHitTarget.maxWillpower,
+          willDelta
+        );
+        afterOnHitTarget.willpower = willRes.next;
+        checkAndResolveWillpowerBreak(ctx, afterOnHitTarget);
+        if (afterOnHitTarget.alive && afterOnHitTarget.hp > 0) {
+          triggerOnDamagedChain(ctx, afterOnHitTarget, finalActor, 0);
+        }
       }
     }
-    if (targetWasAlive && !target.alive) {
-      handleTargetDefeated(ctx, actor, target);
+    const afterChainTarget = getSafeCombatant(ctx.combat, target.id);
+    if (targetWasAlive && afterChainTarget !== undefined && !afterChainTarget.alive) {
+      handleTargetDefeated(ctx, finalActor, afterChainTarget);
+    }
+  }
+}
+
+function executeStepEntryHazard(ctx: TurnExecutionContext, actor: CombatantState): void {
+  if (ctx.combat.mode !== 'tactical_grid' || ctx.combat.grid === null || !actor.alive || actor.hp <= 0) {
+    return;
+  }
+  const tile = getTileAt(ctx.combat.grid, actor.coord);
+  if (tile === null) {
+    return;
+  }
+  const hazRes = evaluateTileHazardTrigger(tile, actor, 'step_entry', ctx.rng);
+  ctx.rng = hazRes.nextRng;
+  if (!hazRes.triggered) {
+    return;
+  }
+  if (hazRes.damage > 0) {
+    applyDamageToCombatant(ctx, actor.id, hazRes.damage);
+  }
+  const liveActor = getSafeCombatant(ctx.combat, actor.id);
+  if (liveActor !== undefined && liveActor.alive && liveActor.hp > 0) {
+    if (hazRes.healing > 0) {
+      liveActor.hp = clampHp(liveActor.hp + hazRes.healing, liveActor.maxHp);
+    }
+    for (const st of hazRes.appliedStatuses) {
+      liveActor.statuses = applyStatusEffect(liveActor.statuses, st);
+    }
+  }
+}
+
+function executeEffectTemplateSkill(
+  ctx: TurnExecutionContext,
+  actor: CombatantState,
+  skill: SkillDefinition,
+  template: EffectTemplate,
+  targetIds: readonly string[]
+): void {
+  const primaryTarget =
+    targetIds[0] !== undefined ? getSafeCombatant(ctx.combat, targetIds[0]) : undefined;
+  const expanded = expandEffectTemplateTargets(template, ctx.combat, actor, primaryTarget, targetIds);
+  for (const stepTarget of expanded.stepTargets) {
+    const step = stepTarget.step;
+    for (const tid of stepTarget.targetIds) {
+      const liveActor = getSafeCombatant(ctx.combat, actor.id);
+      const target = getSafeCombatant(ctx.combat, tid);
+      if (liveActor === undefined || target === undefined || !target.alive || target.hp <= 0) {
+        continue;
+      }
+      if (step.kind === 'damage' || step.kind === 'drain') {
+        applySingleEffectToTarget(
+          ctx,
+          liveActor,
+          target,
+          {
+            type: step.kind,
+            ...(step.dice !== undefined ? { dice: step.dice } : {}),
+            ...(step.flat !== undefined ? { flat: step.flat } : {}),
+            ...(step.scalingStat !== undefined ? { scalingStat: step.scalingStat } : {}),
+            ...(step.scale !== undefined ? { scale: step.scale } : {}),
+          },
+          false,
+          false,
+          false
+        );
+      } else if (step.kind === 'heal') {
+        applySingleEffectToTarget(
+          ctx,
+          liveActor,
+          target,
+          {
+            type: 'heal',
+            ...(step.dice !== undefined ? { dice: step.dice } : {}),
+            ...(step.flat !== undefined ? { flat: step.flat } : {}),
+            ...(step.scalingStat !== undefined ? { scalingStat: step.scalingStat } : {}),
+            ...(step.scale !== undefined ? { scale: step.scale } : {}),
+          },
+          false,
+          false,
+          false
+        );
+      } else if (step.kind === 'status' && step.statusId !== undefined) {
+        applySingleEffectToTarget(
+          ctx,
+          liveActor,
+          target,
+          {
+            type: 'apply_status',
+            statusId: step.statusId,
+            ...(step.statusDuration !== undefined ? { statusDuration: step.statusDuration } : {}),
+            ...(step.statusIntensity !== undefined ? { statusIntensity: step.statusIntensity } : {}),
+          },
+          false,
+          false,
+          false
+        );
+      } else if (step.kind === 'cure' && step.statusId !== undefined) {
+        applySingleEffectToTarget(
+          ctx,
+          liveActor,
+          target,
+          {
+            type: 'remove_status',
+            statusId: step.statusId,
+          },
+          false,
+          false,
+          false
+        );
+      }
     }
   }
 }
@@ -751,11 +1134,32 @@ function executeValidatedAction(
   switch (action.type) {
     case 'move': {
       if (payload.resolvedPath !== undefined && payload.resolvedPath.length > 0) {
-        const dest = payload.resolvedPath[payload.resolvedPath.length - 1] as GridCoord;
-        actor.coord = { x: dest.x, y: dest.y };
+        const startIndex =
+          payload.resolvedPath[0]!.x === actor.coord.x && payload.resolvedPath[0]!.y === actor.coord.y
+            ? 1
+            : 0;
+        for (let i = startIndex; i < payload.resolvedPath.length; i += 1) {
+          const step = payload.resolvedPath[i] as GridCoord;
+          const liveActor = getSafeCombatant(ctx.combat, actor.id);
+          if (
+            liveActor === undefined ||
+            !liveActor.alive ||
+            liveActor.hp <= 0 ||
+            isActorRooted(liveActor) ||
+            isActorStunned(liveActor)
+          ) {
+            break;
+          }
+          liveActor.coord = { x: step.x, y: step.y };
+          executeStepEntryHazard(ctx, liveActor);
+        }
       }
-      actor.remainingMovement = Math.max(0, actor.remainingMovement - (payload.moveCost ?? 0));
-      ctx.executedActions.push(`move:${actor.coord.x},${actor.coord.y}`);
+      const movedActor = getSafeCombatant(ctx.combat, actor.id) ?? actor;
+      movedActor.remainingMovement = Math.max(
+        0,
+        movedActor.remainingMovement - (payload.moveCost ?? 0)
+      );
+      ctx.executedActions.push(`move:${movedActor.coord.x},${movedActor.coord.y}`);
       return 'continue';
     }
 
@@ -810,13 +1214,71 @@ function executeValidatedAction(
       }
 
       const targetIds = payload.resolvedTargetIds ?? [];
-      for (const targetId of targetIds) {
-        if (!actor.alive || actor.hp <= 0) {
-          break;
+
+      // Tile / area-level effects (modify_terrain, summon)
+      for (const effect of skill.effects) {
+        if (effect.type === 'modify_terrain' && effect.terrainSpec !== undefined) {
+          const spec = effect.terrainSpec as unknown as TerrainModificationSpec;
+          if (ctx.combat.mode === 'tactical_grid' && ctx.combat.grid !== null) {
+            const aimCoord =
+              action.targetCoord ??
+              (targetIds[0] !== undefined ? getSafeCombatant(ctx.combat, targetIds[0])?.coord : undefined) ??
+              actor.coord;
+            ctx.combat.grid = applyTerrainModification(ctx.combat.grid, actor.coord, aimCoord, spec);
+          } else if (ctx.combat.mode === 'traditional') {
+            const zoneRes = applyTraditionalZoneHazard(ctx.combat, spec);
+            if (zoneRes.applied) {
+              for (const zId of zoneRes.affectedCombatantIds) {
+                const zUnit = getSafeCombatant(ctx.combat, zId);
+                if (zUnit !== undefined && zUnit.alive && zUnit.hp > 0) {
+                  for (const st of zoneRes.zoneStatuses) {
+                    zUnit.statuses = applyStatusEffect(zUnit.statuses, st);
+                  }
+                }
+              }
+            }
+          }
+        } else if (effect.type === 'summon' && effect.summonId !== undefined) {
+          const tpl =
+            ctx.summons !== undefined &&
+            isSafeKey(effect.summonId) &&
+            Object.hasOwn(ctx.summons, effect.summonId)
+              ? (Object.getOwnPropertyDescriptor(ctx.summons, effect.summonId)?.value as
+                  | SummonTemplate
+                  | undefined)
+              : undefined;
+          if (tpl !== undefined) {
+            const prefCoord = action.targetCoord ?? actor.coord;
+            const spawnRes = spawnCombatSummon(ctx.combat, actor.id, tpl, prefCoord, ctx.rng);
+            ctx.combat = spawnRes.nextCombatState;
+            ctx.rng = spawnRes.nextRng;
+          }
         }
-        const target = getSafeCombatant(ctx.combat, targetId);
-        if (target !== undefined) {
-          executeSkillOnTarget(ctx, actor, target, skill);
+      }
+
+      const cachedTemplate =
+        skill.effectTemplate ??
+        (ctx.effectTemplates !== undefined &&
+        isSafeKey(skill.id) &&
+        Object.hasOwn(ctx.effectTemplates, skill.id)
+          ? (Object.getOwnPropertyDescriptor(ctx.effectTemplates, skill.id)?.value as
+              | EffectTemplate
+              | undefined)
+          : undefined);
+
+      if (cachedTemplate !== undefined) {
+        const liveActor = getSafeCombatant(ctx.combat, actor.id) ?? actor;
+        executeEffectTemplateSkill(ctx, liveActor, skill, cachedTemplate, targetIds);
+      } else {
+        for (const targetId of targetIds) {
+          const liveActor = getSafeCombatant(ctx.combat, actor.id);
+          if (liveActor === undefined || !liveActor.alive || liveActor.hp <= 0) {
+            break;
+          }
+          const target = getSafeCombatant(ctx.combat, targetId);
+          if (target !== undefined) {
+            executeSkillOnTarget(ctx, liveActor, target, skill);
+          }
         }
       }
 
@@ -826,16 +1288,55 @@ function executeValidatedAction(
 
     case 'item': {
       actor.remainingActions.action = Math.max(0, actor.remainingActions.action - 1);
+      const itemId = action.itemId.trim();
+      if (isSafeKey(itemId)) {
+        const invCount = getOwnNumber(actor.resources, itemId);
+        if (invCount !== undefined && invCount > 0) {
+          setOwnProperty(actor.resources, itemId, invCount - 1);
+        }
+      }
+      if (payload.skill !== undefined) {
+        const targetIds = payload.resolvedTargetIds ?? [actor.id];
+        for (const targetId of targetIds) {
+          const liveActor = getSafeCombatant(ctx.combat, actor.id);
+          const target = getSafeCombatant(ctx.combat, targetId);
+          if (liveActor !== undefined && target !== undefined) {
+            executeSkillOnTarget(ctx, liveActor, target, payload.skill);
+          }
+        }
+      }
       ctx.executedActions.push(`item:${action.itemId}`);
       return 'continue';
     }
 
     case 'flee': {
       actor.remainingActions.action = Math.max(0, actor.remainingActions.action - 1);
+      const roll = unwrap(rollDice('1d20', ctx.rng));
+      ctx.rng = roll.nextState;
+      const d20 = roll.rolls[0] ?? roll.total;
+      const dexMod = getEffectiveStat(actor, 'dex');
+      if (roll.total + dexMod >= ctx.fleeDc || isCriticalNaturalRoll(d20)) {
+        actor.statuses = applyStatusEffect(actor.statuses, {
+          id: 'fled',
+          name: 'Fled',
+          remainingTurns: 99,
+          intensity: 1,
+          stackPolicy: 'refresh',
+          tickTiming: 'turn_end',
+        });
+      }
       ctx.executedActions.push('flee');
       return 'end_turn';
     }
   }
+}
+
+function isCombatantActiveInEncounter(c: CombatantState): boolean {
+  return (
+    c.alive &&
+    c.hp > 0 &&
+    !c.statuses.some((s) => s.id === 'fled' || s.id === 'surrendered')
+  );
 }
 
 function evaluateEncounterOutcome(combat: CombatState): {
@@ -854,12 +1355,12 @@ function evaluateEncounterOutcome(combat: CombatState): {
     }
     if (c.team === 'ally') {
       hadAllies = true;
-      if (c.alive && c.hp > 0) {
+      if (isCombatantActiveInEncounter(c)) {
         livingAllies += 1;
       }
     } else if (c.team === 'enemy') {
       hadEnemies = true;
-      if (c.alive && c.hp > 0) {
+      if (isCombatantActiveInEncounter(c)) {
         livingEnemies += 1;
       }
     }
@@ -903,9 +1404,12 @@ function advanceTurnPointer(combat: CombatState, actorId: string): void {
       continue;
     }
     const candidate = getSafeCombatant(combat, candidateId);
-    if (candidate !== undefined && candidate.alive && candidate.hp > 0) {
+    if (candidate !== undefined && isCombatantActiveInEncounter(candidate)) {
       if (rawNext >= order.length) {
         combat.round += 1;
+        if (combat.mode === 'tactical_grid' && combat.grid !== null) {
+          combat.grid = tickRoundTerrainHazards(combat.grid);
+        }
       }
       combat.turnIndex = candidateIdx;
       return;
@@ -1172,6 +1676,9 @@ export function startCombatEncounter(
   const combatState: CombatState = {
     active: true,
     mode: params.mode,
+    ...(params.mode === 'traditional'
+      ? { turnStyle: params.turnStyle ?? 'phased' }
+      : {}),
     round: 1,
     turnIndex: firstLivingIndex,
     initiativeOrder,
@@ -1268,6 +1775,11 @@ export function resolveCombatTurn(
     damageDealt: {},
     defeatedIds: [],
     newlyTriggeredCooldowns: new Set<string>(),
+    extraWorldPatches: [],
+    ...(params.summons !== undefined ? { summons: params.summons } : {}),
+    ...(params.formLoadouts !== undefined ? { formLoadouts: params.formLoadouts } : {}),
+    ...(params.effectTemplates !== undefined ? { effectTemplates: params.effectTemplates } : {}),
+    fleeDc: params.fleeDc ?? 10,
   };
 
   // Start-of-turn status ticks
@@ -1282,30 +1794,60 @@ export function resolveCombatTurn(
     ctx.damageDealt
   );
 
-  if (actor.alive && actor.hp > 0) {
-    applySelfPassiveEffects(ctx, actor, 'on_turn_start');
+  // Start-of-turn tile hazard tick
+  if (
+    ctx.combat.mode === 'tactical_grid' &&
+    ctx.combat.grid !== null &&
+    actor.alive &&
+    actor.hp > 0
+  ) {
+    const startTile = getTileAt(ctx.combat.grid, actor.coord);
+    if (startTile !== null) {
+      const hazStart = evaluateTileHazardTrigger(startTile, actor, 'turn_start', ctx.rng);
+      ctx.rng = hazStart.nextRng;
+      if (hazStart.triggered) {
+        if (hazStart.damage > 0) {
+          applyDamageToCombatant(ctx, actor.id, hazStart.damage);
+        }
+        const liveStartActor = getSafeCombatant(ctx.combat, actor.id);
+        if (liveStartActor !== undefined && liveStartActor.alive && liveStartActor.hp > 0) {
+          if (hazStart.healing > 0) {
+            liveStartActor.hp = clampHp(liveStartActor.hp + hazStart.healing, liveStartActor.maxHp);
+          }
+          for (const st of hazStart.appliedStatuses) {
+            liveStartActor.statuses = applyStatusEffect(liveStartActor.statuses, st);
+          }
+        }
+      }
+    }
   }
 
-  const stunnedAtTurnStart = tickStart.isStunned || isActorStunned(actor);
+  const postHazardActor = getSafeCombatant(ctx.combat, actor.id) ?? actor;
+  if (postHazardActor.alive && postHazardActor.hp > 0) {
+    applySelfPassiveEffects(ctx, postHazardActor, 'on_turn_start');
+  }
+
+  const stunnedAtTurnStart = tickStart.isStunned || isActorStunned(postHazardActor);
   const rejectedReasons: string[] = [];
   let salvagedPrefixCount = 0;
   let usedFallback = false;
 
-  if (!actor.alive || actor.hp <= 0) {
-    rejectedReasons.push(`ACTOR_DEAD: Actor "${actor.id}" is defeated and skips turn`);
+  if (!postHazardActor.alive || postHazardActor.hp <= 0) {
+    rejectedReasons.push(`ACTOR_DEAD: Actor "${postHazardActor.id}" is defeated and skips turn`);
   } else if (stunnedAtTurnStart) {
-    rejectedReasons.push(`ACTOR_STUNNED: Actor "${actor.id}" is stunned and skips turn`);
+    rejectedReasons.push(`ACTOR_STUNNED: Actor "${postHazardActor.id}" is stunned and skips turn`);
   } else {
     let needFallback = params.proposedActions.length === 0;
 
     for (const action of params.proposedActions) {
-      const checkOutcome = evaluateEncounterOutcome(nextCombatState);
-      if (checkOutcome.encounterEnded || !actor.alive || actor.hp <= 0) {
+      const checkOutcome = evaluateEncounterOutcome(ctx.combat);
+      const liveActor = getSafeCombatant(ctx.combat, params.actorId);
+      if (checkOutcome.encounterEnded || liveActor === undefined || !liveActor.alive || liveActor.hp <= 0) {
         break;
       }
 
       const validation = validateSingleCombatAction(
-        nextCombatState,
+        ctx.combat,
         params.actorId,
         action,
         params.registry
@@ -1319,28 +1861,30 @@ export function resolveCombatTurn(
         break;
       }
 
-      const stepSignal = executeValidatedAction(ctx, actor, action, validation.value);
+      const stepSignal = executeValidatedAction(ctx, liveActor, action, validation.value);
       if (stepSignal === 'end_turn') {
         break;
       }
     }
 
-    const midOutcome = evaluateEncounterOutcome(nextCombatState);
-    if (needFallback && !midOutcome.encounterEnded && actor.alive && actor.hp > 0) {
+    const midOutcome = evaluateEncounterOutcome(ctx.combat);
+    const midActor = getSafeCombatant(ctx.combat, params.actorId);
+    if (needFallback && !midOutcome.encounterEnded && midActor !== undefined && midActor.alive && midActor.hp > 0) {
       const fallbackActions = computeFallbackActions(
-        nextCombatState,
+        ctx.combat,
         params.actorId,
         params.registry
       );
       if (fallbackActions.length > 0) {
         usedFallback = true;
         for (const fbAction of fallbackActions) {
-          const checkOutcome = evaluateEncounterOutcome(nextCombatState);
-          if (checkOutcome.encounterEnded || !actor.alive || actor.hp <= 0) {
+          const checkOutcome = evaluateEncounterOutcome(ctx.combat);
+          const liveFbActor = getSafeCombatant(ctx.combat, params.actorId);
+          if (checkOutcome.encounterEnded || liveFbActor === undefined || !liveFbActor.alive || liveFbActor.hp <= 0) {
             break;
           }
           const validation = validateSingleCombatAction(
-            nextCombatState,
+            ctx.combat,
             params.actorId,
             fbAction,
             params.registry
@@ -1348,7 +1892,7 @@ export function resolveCombatTurn(
           if (!validation.ok) {
             continue;
           }
-          const stepSignal = executeValidatedAction(ctx, actor, fbAction, validation.value);
+          const stepSignal = executeValidatedAction(ctx, liveFbActor, fbAction, validation.value);
           if (stepSignal === 'end_turn') {
             break;
           }
@@ -1357,26 +1901,37 @@ export function resolveCombatTurn(
     }
   }
 
-  // End-of-turn status ticks and cooldown decay for the acting combatant
-  const tickEnd = tickStatusEffects(actor.statuses, 'turn_end', ctx.rng);
-  ctx.rng = tickEnd.nextRng;
-  actor.statuses = tickEnd.statuses;
-  if (actor.alive && actor.hp > 0) {
-    applyTickDamageAndHealing(
-      actor,
-      tickEnd.tickDamageTotal,
-      tickEnd.tickHealingTotal,
-      ctx.defeatedIds,
-      ctx.damageDealt
-    );
-  }
-  decrementCooldowns(actor, ctx.newlyTriggeredCooldowns);
+  // End-of-turn status ticks, cooldown decay, summon & transformation duration ticks
+  const endActor = getSafeCombatant(ctx.combat, params.actorId);
+  if (endActor !== undefined) {
+    const tickEnd = tickStatusEffects(endActor.statuses, 'turn_end', ctx.rng);
+    ctx.rng = tickEnd.nextRng;
+    endActor.statuses = tickEnd.statuses;
+    if (endActor.alive && endActor.hp > 0) {
+      applyTickDamageAndHealing(
+        endActor,
+        tickEnd.tickDamageTotal,
+        tickEnd.tickHealingTotal,
+        ctx.defeatedIds,
+        ctx.damageDealt
+      );
+    }
+    decrementCooldowns(endActor, ctx.newlyTriggeredCooldowns);
 
-  const finalOutcome = evaluateEncounterOutcome(nextCombatState);
+    const tfTick = tickCombatTransformations(ctx.combat, endActor.id);
+    ctx.combat = tfTick.nextCombatState;
+
+    const sumTick = tickAndCleanupSummons(ctx.combat, endActor.id);
+    ctx.combat = sumTick.nextCombatState;
+  }
+
+  const finalOutcome = evaluateEncounterOutcome(ctx.combat);
   if (finalOutcome.encounterEnded) {
-    nextCombatState.active = false;
+    ctx.combat.active = false;
+    ctx.combat = purgeSummonsOnEncounterEnd(ctx.combat).nextCombatState;
+    ctx.combat = revertAllTransformsOnEncounterEnd(ctx.combat).nextCombatState;
   } else {
-    advanceTurnPointer(nextCombatState, params.actorId);
+    advanceTurnPointer(ctx.combat, params.actorId);
   }
 
   const baseSummary: Omit<CombatOutcomeSummary, 'summaryText'> = {
@@ -1397,17 +1952,20 @@ export function resolveCombatTurn(
     summaryText,
   };
 
-  const worldPatches = syncWorldPatches(
-    nextCombatState,
-    params.worldState,
-    finalOutcome.encounterEnded,
-    finalOutcome.winnerTeam,
-    params.xpAwardOnVictory,
-    summaryText
-  );
+  const worldPatches = [
+    ...ctx.extraWorldPatches,
+    ...syncWorldPatches(
+      ctx.combat,
+      params.worldState,
+      finalOutcome.encounterEnded,
+      finalOutcome.winnerTeam,
+      params.xpAwardOnVictory,
+      summaryText
+    ),
+  ];
 
   return {
-    nextCombatState,
+    nextCombatState: ctx.combat,
     worldPatches,
     outcomeSummary,
     salvagedCount: salvagedPrefixCount,
