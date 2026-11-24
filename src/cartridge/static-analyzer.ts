@@ -20,12 +20,20 @@ import {
   type EndingDefinition,
   type RouteDefinition,
 } from '../beats/routes-and-endings.js';
+import { validateEffectTemplate } from '../combat/effect-templates.js';
+import { PASSIVE_TRIGGER_HOOKS } from '../combat/passives-and-willpower.js';
 import { createDefaultSkillCatalog } from '../combat/skill-registry.js';
 import { type ValidationError, validationError } from '../core/errors.js';
 import { ErrorAccumulator } from '../core/result.js';
 import { getStockSystemPack } from '../schema/stock-system-packs.js';
 import { type SystemCapabilities } from '../schema/tracker-module.js';
-import { type FormDefinition } from '../state/forms.js';
+import { validateCharacterCardSheet } from '../state/character-card-sheet.js';
+import {
+  type FormDefinition,
+  type FormTransitionRule,
+  buildFormIndex,
+  validateFormTransitionRules,
+} from '../state/forms.js';
 import { type PatchOperation } from '../state/patch.js';
 import { applyPatchBatch } from '../state/reducer.js';
 import { type LocationEntity } from '../state/spatial-topology.js';
@@ -38,6 +46,7 @@ import {
 } from '../state/world-state.js';
 import {
   type CartridgeBundle,
+  type CartridgeCombatConfig,
   getSafeProperty,
   isPlainObject,
   isUnsafeRecordKey,
@@ -300,6 +309,426 @@ export function detectBeatCycles(beats: readonly BeatDefinition[]): ValidationEr
   }
 
   return errors;
+}
+
+const VALID_PASSIVE_HOOKS: ReadonlySet<string> = new Set(PASSIVE_TRIGGER_HOOKS);
+
+function validateLocationGeometry(geometry: unknown, gAcc: ErrorAccumulator): void {
+  if (!isPlainObject(geometry)) {
+    gAcc.add('', 'INVALID_TYPE', 'Location.geometry must be a plain object');
+    return;
+  }
+  const x = Object.getOwnPropertyDescriptor(geometry, 'x')?.value;
+  const y = Object.getOwnPropertyDescriptor(geometry, 'y')?.value;
+  if (typeof x !== 'number' || !Number.isFinite(x)) {
+    gAcc.add('x', 'INVALID_TYPE', 'Location.geometry.x must be a finite number');
+  }
+  if (typeof y !== 'number' || !Number.isFinite(y)) {
+    gAcc.add('y', 'INVALID_TYPE', 'Location.geometry.y must be a finite number');
+  }
+  const polygon = Object.getOwnPropertyDescriptor(geometry, 'polygon')?.value;
+  if (polygon !== undefined) {
+    if (!Array.isArray(polygon)) {
+      gAcc.add('polygon', 'INVALID_TYPE', 'Location.geometry.polygon must be an array');
+    } else {
+      for (let i = 0; i < polygon.length; i += 1) {
+        const pt = polygon[i];
+        if (
+          !Array.isArray(pt) ||
+          pt.length !== 2 ||
+          typeof pt[0] !== 'number' ||
+          !Number.isFinite(pt[0]) ||
+          typeof pt[1] !== 'number' ||
+          !Number.isFinite(pt[1])
+        ) {
+          gAcc.add(
+            `polygon[${i}]`,
+            'INVALID_TYPE',
+            `Location.geometry.polygon[${i}] must be a [number, number] tuple of finite numbers`
+          );
+        }
+      }
+    }
+  }
+  const mapRef = Object.getOwnPropertyDescriptor(geometry, 'mapRef')?.value;
+  if (mapRef !== undefined) {
+    if (!isPlainObject(mapRef)) {
+      gAcc.add('mapRef', 'INVALID_TYPE', 'Location.geometry.mapRef must be a plain object');
+    } else {
+      const layer = Object.getOwnPropertyDescriptor(mapRef, 'layer')?.value;
+      const id = Object.getOwnPropertyDescriptor(mapRef, 'id')?.value;
+      if (typeof layer !== 'string' || layer.trim().length === 0) {
+        gAcc.add('mapRef.layer', 'REQUIRED', 'Location.geometry.mapRef.layer must be a non-empty string');
+      }
+      if (typeof id !== 'string' || id.trim().length === 0) {
+        gAcc.add('mapRef.id', 'REQUIRED', 'Location.geometry.mapRef.id must be a non-empty string');
+      }
+    }
+  }
+}
+
+function validatePassiveDefinitions(passives: unknown, pAcc: ErrorAccumulator): void {
+  if (!Array.isArray(passives)) {
+    pAcc.add('', 'INVALID_TYPE', 'passives must be an array');
+    return;
+  }
+  const seenIds = new Set<string>();
+  for (let i = 0; i < passives.length; i += 1) {
+    const raw = passives[i];
+    const itemAcc = pAcc.scope(`[${i}]`);
+    if (!isPlainObject(raw)) {
+      itemAcc.add('', 'INVALID_TYPE', 'PassiveDefinition must be a plain object');
+      continue;
+    }
+    const id = Object.getOwnPropertyDescriptor(raw, 'id')?.value;
+    if (typeof id !== 'string' || id.trim().length === 0) {
+      itemAcc.add('id', 'REQUIRED', 'PassiveDefinition.id must be a non-empty string');
+    } else if (isUnsafeRecordKey(id)) {
+      itemAcc.add('id', 'UNSAFE_KEY', `Unsafe passive id "${id}"`);
+    } else if (seenIds.has(id)) {
+      itemAcc.add('id', 'DUPLICATE_ID', `Duplicate passive id "${id}"`);
+    } else {
+      seenIds.add(id);
+    }
+
+    const name = Object.getOwnPropertyDescriptor(raw, 'name')?.value;
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      itemAcc.add('name', 'REQUIRED', 'PassiveDefinition.name must be a non-empty string');
+    }
+
+    const hook = Object.getOwnPropertyDescriptor(raw, 'hook')?.value;
+    if (typeof hook !== 'string' || !VALID_PASSIVE_HOOKS.has(hook)) {
+      itemAcc.add('hook', 'INVALID_VALUE', `Invalid passive hook "${String(hook)}"`);
+    }
+
+    const priority = Object.getOwnPropertyDescriptor(raw, 'priority')?.value;
+    if (typeof priority !== 'number' || !Number.isFinite(priority)) {
+      itemAcc.add('priority', 'INVALID_TYPE', 'PassiveDefinition.priority must be a finite number');
+    }
+
+    const effect = Object.getOwnPropertyDescriptor(raw, 'effect')?.value;
+    if (!isPlainObject(effect) || typeof Object.getOwnPropertyDescriptor(effect, 'type')?.value !== 'string') {
+      itemAcc.add('effect', 'INVALID_TYPE', 'PassiveDefinition.effect must be an object with string "type"');
+    }
+  }
+}
+
+function validateCombatConfigRefs(
+  combat: CartridgeCombatConfig,
+  knownSkillIds: ReadonlySet<string>,
+  formById: ReadonlyMap<string, FormDefinition>,
+  hasForms: boolean,
+  validateSkillRefs: boolean,
+  cAcc: ErrorAccumulator
+): void {
+  const summonIds = new Set<string>();
+  if (isPlainObject(combat.summons)) {
+    for (const key of Object.keys(combat.summons)) {
+      if (!isUnsafeRecordKey(key)) {
+        summonIds.add(key);
+      }
+    }
+    for (const [summonKey, summonTpl] of Object.entries(combat.summons)) {
+      if (isUnsafeRecordKey(summonKey) || !summonTpl) {
+        continue;
+      }
+      if (validateSkillRefs && Array.isArray(summonTpl.abilities)) {
+        for (let i = 0; i < summonTpl.abilities.length; i += 1) {
+          const skillId = summonTpl.abilities[i];
+          if (typeof skillId === 'string' && !knownSkillIds.has(skillId)) {
+            cAcc.add(
+              `summons.${summonKey}.abilities[${i}]`,
+              'UNKNOWN_SKILL_ID',
+              `Summon "${summonKey}" references unknown skill "${skillId}"`
+            );
+          }
+        }
+      }
+      if (summonTpl.passives !== undefined) {
+        validatePassiveDefinitions(
+          summonTpl.passives,
+          cAcc.scope(`summons.${summonKey}.passives`)
+        );
+      }
+    }
+  }
+
+  const formLoadoutIds = new Set<string>();
+  if (isPlainObject(combat.formLoadouts)) {
+    for (const key of Object.keys(combat.formLoadouts)) {
+      if (!isUnsafeRecordKey(key)) {
+        formLoadoutIds.add(key);
+      }
+    }
+    for (const [loadoutKey, loadout] of Object.entries(combat.formLoadouts)) {
+      if (isUnsafeRecordKey(loadoutKey) || !loadout) {
+        continue;
+      }
+      if (validateSkillRefs && Array.isArray(loadout.abilities)) {
+        for (let i = 0; i < loadout.abilities.length; i += 1) {
+          const skillId = loadout.abilities[i];
+          if (typeof skillId === 'string' && !knownSkillIds.has(skillId)) {
+            cAcc.add(
+              `formLoadouts.${loadoutKey}.abilities[${i}]`,
+              'UNKNOWN_SKILL_ID',
+              `Form loadout "${loadoutKey}" references unknown skill "${skillId}"`
+            );
+          }
+        }
+      }
+      if (loadout.passives !== undefined) {
+        validatePassiveDefinitions(
+          loadout.passives,
+          cAcc.scope(`formLoadouts.${loadoutKey}.passives`)
+        );
+      }
+      if (loadout.persistFormIdToWorld !== undefined) {
+        if (
+          typeof loadout.persistFormIdToWorld !== 'string' ||
+          loadout.persistFormIdToWorld.trim().length === 0
+        ) {
+          cAcc.add(
+            `formLoadouts.${loadoutKey}.persistFormIdToWorld`,
+            'INVALID_TYPE',
+            `Form loadout "${loadoutKey}" persistFormIdToWorld must be a non-empty string`
+          );
+        } else if (hasForms && !formById.has(loadout.persistFormIdToWorld)) {
+          cAcc.add(
+            `formLoadouts.${loadoutKey}.persistFormIdToWorld`,
+            'UNKNOWN_FORM_REF',
+            `Form loadout "${loadoutKey}" persistFormIdToWorld references unknown form "${loadout.persistFormIdToWorld}"`
+          );
+        }
+      }
+    }
+  }
+
+  if (isPlainObject(combat.effectTemplates)) {
+    for (const [tplKey, tpl] of Object.entries(combat.effectTemplates)) {
+      if (isUnsafeRecordKey(tplKey)) {
+        continue;
+      }
+      const tplRes = validateEffectTemplate(tpl);
+      if (!tplRes.ok) {
+        cAcc.scope(`effectTemplates.${tplKey}`).addAll(tplRes.error);
+        continue;
+      }
+      const validTpl = tplRes.value;
+      if (validateSkillRefs && !knownSkillIds.has(validTpl.skillId)) {
+        cAcc.add(
+          `effectTemplates.${tplKey}.skillId`,
+          'UNKNOWN_SKILL_ID',
+          `Effect template "${tplKey}" references unknown skill "${validTpl.skillId}"`
+        );
+      }
+      for (let i = 0; i < validTpl.steps.length; i += 1) {
+        const step = validTpl.steps[i];
+        if (!step) continue;
+        if (
+          step.kind === 'summon' &&
+          typeof step.summonId === 'string' &&
+          summonIds.size > 0 &&
+          !summonIds.has(step.summonId)
+        ) {
+          cAcc.add(
+            `effectTemplates.${tplKey}.steps[${i}].summonId`,
+            'UNKNOWN_SUMMON_REF',
+            `Effect template "${tplKey}" step ${i} references unknown summon "${step.summonId}"`
+          );
+        }
+        if (
+          step.kind === 'transform' &&
+          typeof step.formLoadoutId === 'string' &&
+          formLoadoutIds.size > 0 &&
+          !formLoadoutIds.has(step.formLoadoutId)
+        ) {
+          cAcc.add(
+            `effectTemplates.${tplKey}.steps[${i}].formLoadoutId`,
+            'UNKNOWN_FORM_LOADOUT_REF',
+            `Effect template "${tplKey}" step ${i} references unknown formLoadout "${step.formLoadoutId}"`
+          );
+        }
+      }
+    }
+  }
+}
+
+function analyzeFormRuleWarnings(bundle: CartridgeBundle): ValidationError[] {
+  const formRules = bundle.initialEntities?.formRules;
+  if (!Array.isArray(formRules) || formRules.length === 0) {
+    return [];
+  }
+
+  const forms = bundle.initialEntities?.forms ?? [];
+  const characters = mergeRecordMaps<CharacterEntity>(
+    bundle.initialState?.entities?.characters,
+    bundle.initialEntities?.characters
+  );
+
+  const warnings: ValidationError[] = [];
+  const rulesByGroup = new Map<string, FormTransitionRule[]>();
+  const formsByGroup = new Map<string, Set<string>>();
+
+  for (const form of forms) {
+    if (!form || typeof form.id !== 'string' || typeof form.formGroup !== 'string') {
+      continue;
+    }
+    let set = formsByGroup.get(form.formGroup);
+    if (!set) {
+      set = new Set();
+      formsByGroup.set(form.formGroup, set);
+    }
+    set.add(form.id);
+  }
+
+  for (const rule of formRules) {
+    if (!rule || typeof rule.formGroup !== 'string') {
+      continue;
+    }
+    let list = rulesByGroup.get(rule.formGroup);
+    if (!list) {
+      list = [];
+      rulesByGroup.set(rule.formGroup, list);
+    }
+    list.push(rule);
+  }
+
+  const initialFormsByGroup = new Map<string, Set<string>>();
+  for (const char of Object.values(characters)) {
+    if (!char || typeof char.formId !== 'string') continue;
+    for (const form of forms) {
+      if (form && form.id === char.formId) {
+        let set = initialFormsByGroup.get(form.formGroup);
+        if (!set) {
+          set = new Set();
+          initialFormsByGroup.set(form.formGroup, set);
+        }
+        set.add(form.id);
+      }
+    }
+  }
+
+  const sortedGroups = [...rulesByGroup.keys()].sort(compareStringsLexicographic);
+  for (const group of sortedGroups) {
+    const groupRules = rulesByGroup.get(group) ?? [];
+    const groupForms = formsByGroup.get(group) ?? new Set<string>();
+
+    // 1. Detect cycles in form transition rules within this formGroup
+    const adj = new Map<string, string[]>();
+    for (const fId of groupForms) {
+      adj.set(fId, []);
+    }
+    for (const rule of groupRules) {
+      if (typeof rule.toFormId !== 'string' || typeof rule.fromFormId !== 'string') {
+        continue;
+      }
+      if (rule.fromFormId === '*') {
+        for (const fId of groupForms) {
+          if (fId !== rule.toFormId) {
+            const list = adj.get(fId) ?? [];
+            if (!list.includes(rule.toFormId)) list.push(rule.toFormId);
+            adj.set(fId, list);
+          }
+        }
+      } else {
+        const list = adj.get(rule.fromFormId) ?? [];
+        if (!list.includes(rule.toFormId)) list.push(rule.toFormId);
+        adj.set(rule.fromFormId, list);
+      }
+    }
+
+    const sortedNodes = [...adj.keys()].sort(compareStringsLexicographic);
+    for (const list of adj.values()) {
+      list.sort(compareStringsLexicographic);
+    }
+
+    const UNVISITED = 0;
+    const VISITING = 1;
+    const VISITED = 2;
+    const visitState = new Map<string, number>();
+    const stack: string[] = [];
+    const seenCycleKeys = new Set<string>();
+
+    const dfs = (node: string): void => {
+      visitState.set(node, VISITING);
+      stack.push(node);
+      for (const next of adj.get(node) ?? []) {
+        const st = visitState.get(next) ?? UNVISITED;
+        if (st === VISITING) {
+          const idx = stack.indexOf(next);
+          if (idx !== -1) {
+            const ring = stack.slice(idx);
+            const minNode = [...ring].sort(compareStringsLexicographic)[0] ?? next;
+            const minIdx = ring.indexOf(minNode);
+            const canonical = [...ring.slice(minIdx), ...ring.slice(0, minIdx)].join('->');
+            if (!seenCycleKeys.has(canonical)) {
+              seenCycleKeys.add(canonical);
+              warnings.push(
+                validationError(
+                  'initialEntities.formRules',
+                  'FORM_RULE_CYCLE',
+                  `Form transition rule cycle detected in formGroup "${group}": ${[...ring, next].join(' -> ')}`
+                )
+              );
+            }
+          }
+        } else if (st === UNVISITED) {
+          dfs(next);
+        }
+      }
+      stack.pop();
+      visitState.set(node, VISITED);
+    };
+
+    for (const node of sortedNodes) {
+      if ((visitState.get(node) ?? UNVISITED) === UNVISITED) {
+        dfs(node);
+      }
+    }
+
+    // 2. Detect unreachable form rules (fromFormId cannot be reached from initial forms or '*' rules)
+    if (groupForms.size > 0) {
+      const reachableForms = new Set<string>(initialFormsByGroup.get(group) ?? []);
+      if (reachableForms.size === 0) {
+        const firstForm = [...groupForms].sort(compareStringsLexicographic)[0];
+        if (firstForm !== undefined) {
+          reachableForms.add(firstForm);
+        }
+      }
+      for (const rule of groupRules) {
+        if (rule.fromFormId === '*') {
+          reachableForms.add(rule.toFormId);
+        }
+      }
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const rule of groupRules) {
+          if (
+            rule.fromFormId !== '*' &&
+            reachableForms.has(rule.fromFormId) &&
+            !reachableForms.has(rule.toFormId)
+          ) {
+            reachableForms.add(rule.toFormId);
+            changed = true;
+          }
+        }
+      }
+      for (const rule of groupRules) {
+        if (rule.fromFormId !== '*' && !reachableForms.has(rule.fromFormId)) {
+          warnings.push(
+            validationError(
+              `initialEntities.formRules.${rule.id}`,
+              'UNREACHABLE_FORM_RULE',
+              `Form transition rule "${rule.id}" in formGroup "${group}" has unreachable fromFormId "${rule.fromFormId}"`
+            )
+          );
+        }
+      }
+    }
+  }
+
+  return warnings;
 }
 
 /**
@@ -811,6 +1240,15 @@ export function validateCrossFileReferences(bundle: CartridgeBundle): Validation
         }
       }
     }
+    if (char.cardSheet !== undefined) {
+      const sheetRes = validateCharacterCardSheet(
+        char.cardSheet,
+        `initialEntities.characters.${charId}.cardSheet`
+      );
+      if (!sheetRes.ok) {
+        acc.addAll(sheetRes.error);
+      }
+    }
   }
 
   for (const [factionId, faction] of Object.entries(factions)) {
@@ -896,6 +1334,75 @@ export function validateCrossFileReferences(bundle: CartridgeBundle): Validation
         `Location "${locId}" controllingFactionId "${loc.controllingFactionId}" does not exist in factions`
       );
     }
+    if (loc.geometry !== undefined) {
+      validateLocationGeometry(loc.geometry, acc.scope(`initialEntities.locations.${locId}.geometry`));
+    }
+    if (loc.connectionsMeta !== undefined) {
+      if (!isPlainObject(loc.connectionsMeta)) {
+        acc.add(
+          `initialEntities.locations.${locId}.connectionsMeta`,
+          'INVALID_TYPE',
+          `Location "${locId}" connectionsMeta must be a plain object`
+        );
+      } else {
+        for (const targetId of Object.keys(loc.connectionsMeta)) {
+          if (isUnsafeRecordKey(targetId)) {
+            acc.add(
+              `initialEntities.locations.${locId}.connectionsMeta.${targetId}`,
+              'UNSAFE_KEY',
+              `Unsafe key "${targetId}" in connectionsMeta`
+            );
+            continue;
+          }
+          if (targetId === locId) {
+            acc.add(
+              `initialEntities.locations.${locId}.connectionsMeta.${targetId}`,
+              'SELF_CONNECTED_LOCATION',
+              `Location "${locId}" connectionsMeta cannot target itself`
+            );
+          } else if (isTier2 && getSafeProperty(locations, targetId) === undefined) {
+            acc.add(
+              `initialEntities.locations.${locId}.connectionsMeta.${targetId}`,
+              'UNRESOLVED_LOCATION',
+              `Location "${locId}" connectionsMeta references unknown location "${targetId}"`
+            );
+          }
+        }
+      }
+    }
+    if (loc.hiddenAssets !== undefined) {
+      if (!isPlainObject(loc.hiddenAssets)) {
+        acc.add(
+          `initialEntities.locations.${locId}.hiddenAssets`,
+          'INVALID_TYPE',
+          `Location "${locId}" hiddenAssets must be a plain object`
+        );
+      } else {
+        for (const [assetKey, asset] of Object.entries(loc.hiddenAssets)) {
+          if (isUnsafeRecordKey(assetKey)) {
+            acc.add(
+              `initialEntities.locations.${locId}.hiddenAssets.${assetKey}`,
+              'UNSAFE_KEY',
+              `Unsafe key "${assetKey}" in hiddenAssets`
+            );
+            continue;
+          }
+          if (
+            asset &&
+            typeof asset.linkedLocationId === 'string' &&
+            asset.linkedLocationId.trim().length > 0 &&
+            isTier2 &&
+            getSafeProperty(locations, asset.linkedLocationId) === undefined
+          ) {
+            acc.add(
+              `initialEntities.locations.${locId}.hiddenAssets.${assetKey}.linkedLocationId`,
+              'UNRESOLVED_LOCATION',
+              `Hidden asset "${asset.id}" in location "${locId}" references unknown linkedLocationId "${asset.linkedLocationId}"`
+            );
+          }
+        }
+      }
+    }
   }
 
   for (let i = 0; i < forms.length; i += 1) {
@@ -919,6 +1426,40 @@ export function validateCrossFileReferences(bundle: CartridgeBundle): Validation
             'UNKNOWN_FORM_REF',
             `Form "${form.id}" legalTargets references unknown form "${targetId}"`
           );
+        }
+      }
+    }
+  }
+
+  const formRules = bundle.initialEntities?.formRules;
+  if (formRules !== undefined) {
+    const formIndex = forms.length > 0 ? buildFormIndex(forms) : undefined;
+    const formRulesRes = validateFormTransitionRules(
+      formRules,
+      formIndex,
+      'initialEntities.formRules'
+    );
+    if (!formRulesRes.ok) {
+      acc.addAll(formRulesRes.error);
+    }
+    if (Array.isArray(formRules)) {
+      for (let i = 0; i < formRules.length; i += 1) {
+        const rule = formRules[i];
+        if (!rule || typeof rule !== 'object') {
+          continue;
+        }
+        validatePredicateRefs(rule.when, acc.scope(`initialEntities.formRules[${i}].when`));
+        if (Array.isArray(rule.secretIdentity?.knownByCharacterIds)) {
+          for (let j = 0; j < rule.secretIdentity.knownByCharacterIds.length; j += 1) {
+            const cid = rule.secretIdentity.knownByCharacterIds[j];
+            if (typeof cid === 'string' && getSafeProperty(characters, cid) === undefined) {
+              acc.add(
+                `initialEntities.formRules[${i}].secretIdentity.knownByCharacterIds[${j}]`,
+                'UNKNOWN_CHARACTER_REF',
+                `FormTransitionRule "${rule.id}" secretIdentity references unknown character "${cid}"`
+              );
+            }
+          }
         }
       }
     }
@@ -998,6 +1539,17 @@ export function validateCrossFileReferences(bundle: CartridgeBundle): Validation
         );
       }
     }
+  }
+
+  if (bundle.combat !== undefined) {
+    validateCombatConfigRefs(
+      bundle.combat,
+      knownSkillIds,
+      formById,
+      forms.length > 0,
+      true,
+      acc.scope('combat')
+    );
   }
 
   return [...acc.errors];
@@ -2000,6 +2552,7 @@ export function analyzeCartridgeGraph(
 
   errors.push(...detectBeatCycles(bundle.beats ?? []));
   errors.push(...validateCrossFileReferences(bundle));
+  warnings.push(...analyzeFormRuleWarnings(bundle));
 
   const beats = [...(bundle.beats ?? [])];
   const routes = [...(bundle.routes ?? [])];

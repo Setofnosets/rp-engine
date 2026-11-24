@@ -812,3 +812,202 @@ describe('PR-5.1 BR-7 unreachable ending, deadlock, and Crimson Keep graph verif
     }
   });
 });
+
+describe('PR-10.3: Static analyzer extensions (formRules, combat config, spatial geometry & cardSheet lore)', () => {
+  it('validates FormTransitionRule refs, when predicates, and emits cycle/unreachable warnings', () => {
+    const bundle = createCrimsonKeepBundle();
+    bundle.initialEntities!.forms = [
+      {
+        id: 'warden_base',
+        characterId: 'warden',
+        formGroup: 'warden_forms',
+        displayName: 'Warden Base',
+        legalTargets: ['warden_ascended'],
+      },
+      {
+        id: 'warden_ascended',
+        characterId: 'warden',
+        formGroup: 'warden_forms',
+        displayName: 'Warden Ascended',
+        legalTargets: ['warden_base'],
+      },
+      {
+        id: 'warden_orphan',
+        characterId: 'warden',
+        formGroup: 'warden_forms',
+        displayName: 'Warden Orphan',
+        legalTargets: [],
+      },
+    ];
+    bundle.initialEntities!.characters!.warden!.formId = 'warden_base';
+    bundle.initialEntities!.characters!.warden!.formGroup = 'warden_forms';
+    bundle.initialEntities!.formRules = [
+      {
+        id: 'rule_ascend',
+        formGroup: 'warden_forms',
+        fromFormId: 'warden_base',
+        toFormId: 'warden_ascended',
+        when: { flag: 'ascended_flag' },
+        priority: 10,
+      },
+      {
+        id: 'rule_revert',
+        formGroup: 'warden_forms',
+        fromFormId: 'warden_ascended',
+        toFormId: 'warden_base',
+        when: { flag: 'reverted_flag' },
+        priority: 5,
+      },
+      {
+        id: 'rule_unreachable',
+        formGroup: 'warden_forms',
+        fromFormId: 'warden_orphan',
+        toFormId: 'warden_ascended',
+        when: { flag: 'never_reached' },
+        priority: 1,
+      },
+    ];
+
+    const report = analyzeCartridgeGraph(bundle);
+    expect(report.ok).toBe(true);
+    expect(report.errors).toEqual([]);
+    expect(report.warnings.some((w) => w.code === 'FORM_RULE_CYCLE')).toBe(true);
+    expect(report.warnings.some((w) => w.code === 'UNREACHABLE_FORM_RULE')).toBe(true);
+
+    // Invalid form rule reference & unknown character in secretIdentity
+    bundle.initialEntities!.formRules = [
+      ...bundle.initialEntities!.formRules,
+      {
+        id: 'rule_bad',
+        formGroup: 'warden_forms',
+        fromFormId: 'nonexistent_form',
+        toFormId: 'warden_base',
+        when: { beat: 'nonexistent_beat', status: 'resolved' },
+        priority: 1,
+        secretIdentity: {
+          knownByCharacterIds: ['ghost_npc'],
+          unmaskOnPublicTransform: true,
+        },
+      },
+    ];
+    const badErrors = validateCrossFileReferences(bundle);
+    const badCodes = badErrors.map((e) => e.code);
+    expect(badCodes).toContain('FORM_NOT_FOUND');
+    expect(badCodes).toContain('UNKNOWN_BEAT_REF');
+    expect(badCodes).toContain('UNKNOWN_CHARACTER_REF');
+  });
+
+  it('validates CartridgeCombatConfig (summons, formLoadouts, effectTemplates) and LocationEntity geometry/connectionsMeta/hiddenAssets & cardSheet', () => {
+    const bundle = createCrimsonKeepBundle();
+    bundle.combat = {
+      summons: {
+        bad_summon: {
+          id: 'bad_summon',
+          name: 'Bad Summon',
+          maxHp: 10,
+          ac: 10,
+          speed: 4,
+          stats: { str: 2 },
+          abilities: ['missing_summon_skill'],
+          durationTurns: 2,
+          maxActivePerCaster: 1,
+          despawnOnSummonerDefeat: true,
+          initiativePolicy: 'after_summoner',
+        },
+      },
+      formLoadouts: {
+        bad_loadout: {
+          id: 'bad_loadout',
+          displayName: 'Bad Form',
+          abilities: ['missing_form_skill'],
+          replaceAbilities: false,
+          durationTurns: 3,
+          persistFormIdToWorld: 'missing_world_form',
+        },
+      },
+      effectTemplates: {
+        bad_tpl: {
+          id: 'bad_tpl',
+          skillId: 'missing_tpl_skill',
+          source: 'test',
+          steps: [
+            {
+              kind: 'summon',
+              role: '$caster',
+              summonId: 'missing_summon_id',
+            },
+          ],
+        },
+      },
+    };
+    bundle.initialEntities!.forms = [
+      {
+        id: 'valid_form',
+        characterId: 'warden',
+        formGroup: 'warden_forms',
+        displayName: 'Valid Form',
+        legalTargets: [],
+      },
+    ];
+    const firstLocId = Object.keys(bundle.initialEntities!.locations!)[0]!;
+    const firstLoc = bundle.initialEntities!.locations![firstLocId]!;
+    firstLoc.geometry = {
+      x: Number.NaN,
+      y: 10,
+      polygon: [[0, 0]],
+      mapRef: { layer: '', id: 'node_1' },
+    };
+    firstLoc.connectionsMeta = {
+      nonexistent_target: { state: 'open' },
+    };
+    firstLoc.hiddenAssets = {
+      secret_tunnel: {
+        id: 'secret_tunnel',
+        kind: 'subdungeon',
+        name: 'Secret Tunnel',
+        knowledgeTier: 'unrevealed',
+        canonStatus: 'intact',
+        canonLocked: false,
+        linkedLocationId: 'missing_linked_loc',
+      },
+    };
+    (bundle.initialEntities!.characters!.warden as unknown as Record<string, unknown>).cardSheet = {
+      sourceSpec: 'v2',
+      name: 'Warden',
+      description: 'Desc',
+      personality: '',
+      scenario: '',
+      firstMes: '',
+      alternateGreetings: [],
+      mesExample: '',
+      creatorNotes: '',
+      systemPrompt: '',
+      postHistoryInstructions: '',
+      tags: [],
+      portraitAssetPath: '',
+      embeddedLoreEntries: [
+        {
+          keys: ['keep'],
+          secondaryKeys: [],
+          content: 'Lore',
+          constant: 'not_a_bool',
+          insertionOrder: 10,
+          enabled: true,
+        },
+      ],
+    };
+
+    const errs = validateCrossFileReferences(bundle);
+    const paths = errs.map((e) => e.path);
+    expect(paths).toContain('combat.summons.bad_summon.abilities[0]');
+    expect(paths).toContain('combat.formLoadouts.bad_loadout.abilities[0]');
+    expect(paths).toContain('combat.formLoadouts.bad_loadout.persistFormIdToWorld');
+    expect(paths).toContain('combat.effectTemplates.bad_tpl.skillId');
+    expect(paths).toContain('combat.effectTemplates.bad_tpl.steps[0].summonId');
+    expect(paths).toContain(`initialEntities.locations.${firstLocId}.geometry.x`);
+    expect(paths).toContain(`initialEntities.locations.${firstLocId}.geometry.mapRef.layer`);
+    expect(paths).toContain(`initialEntities.locations.${firstLocId}.connectionsMeta.nonexistent_target`);
+    expect(paths).toContain(`initialEntities.locations.${firstLocId}.hiddenAssets.secret_tunnel.linkedLocationId`);
+    expect(paths).toContain('initialEntities.characters.warden.cardSheet.embeddedLoreEntries[0].constant');
+  });
+});

@@ -2784,6 +2784,15 @@ export class SessionRuntime {
         registry: this.skillRegistry,
         rng: workingState.meta.rngState,
         xpAwardOnVictory: this.xpAwardOnVictory,
+        ...(this.cartridge?.combat?.summons !== undefined
+          ? { summons: this.cartridge.combat.summons }
+          : {}),
+        ...(this.cartridge?.combat?.formLoadouts !== undefined
+          ? { formLoadouts: this.cartridge.combat.formLoadouts }
+          : {}),
+        ...(this.cartridge?.combat?.effectTemplates !== undefined
+          ? { effectTemplates: this.cartridge.combat.effectTemplates }
+          : {}),
       });
 
       workingCombatState = playerTurnRes.nextCombatState;
@@ -2843,6 +2852,15 @@ export class SessionRuntime {
           registry: this.skillRegistry,
           rng: workingState.meta.rngState,
           xpAwardOnVictory: this.xpAwardOnVictory,
+          ...(this.cartridge?.combat?.summons !== undefined
+            ? { summons: this.cartridge.combat.summons }
+            : {}),
+          ...(this.cartridge?.combat?.formLoadouts !== undefined
+            ? { formLoadouts: this.cartridge.combat.formLoadouts }
+            : {}),
+          ...(this.cartridge?.combat?.effectTemplates !== undefined
+            ? { effectTemplates: this.cartridge.combat.effectTemplates }
+            : {}),
         });
 
         workingCombatState = npcTurnRes.nextCombatState;
