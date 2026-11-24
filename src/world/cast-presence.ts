@@ -128,6 +128,13 @@ function cloneCharacter(character: CharacterEntity): CharacterEntity {
   if (character.corruption !== undefined) {
     cloned.corruption = { ...character.corruption };
   }
+  if (character.lockedForms !== undefined) {
+    const lockedForms: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(character.lockedForms)) {
+      setOwn(lockedForms, k, v);
+    }
+    cloned.lockedForms = lockedForms;
+  }
 
   return cloned;
 }
@@ -218,12 +225,35 @@ export function computeLocationCast(
   state: WorldState,
   formDefinitions?: readonly FormDefinition[]
 ): CastPresenceResult {
-  const excludedPlayerCharacterId = state.player.characterId ?? null;
+  const playerCharacterId = state.player.characterId ?? null;
+  const canonCharacterId = state.player.canonCharacterId ?? null;
+  const excludedPlayerCharacterId = canonCharacterId ?? playerCharacterId;
   const pinnedIds = state.scene.pinnedCharacterIds;
   const pinnedSet = new Set(pinnedIds);
   const sceneLocationId = state.scene.locationId;
   const spatialMode = state.capabilities.spatialMode;
   const formLookup = buildFormGroupLookup(formDefinitions);
+
+  const excludedCanonFormGroups = new Set<string>();
+  if (canonCharacterId !== null && isSafeKey(canonCharacterId)) {
+    const canonChar = getOwn(state.entities.characters, canonCharacterId);
+    if (canonChar) {
+      const canonGroup = resolveEffectiveFormGroup(canonChar, formLookup);
+      if (typeof canonGroup === 'string' && canonGroup.length > 0) {
+        excludedCanonFormGroups.add(canonGroup);
+      }
+    }
+    const charFormGroups = formLookup.byCharacterId.get(canonCharacterId);
+    if (charFormGroups) {
+      for (const g of charFormGroups) {
+        excludedCanonFormGroups.add(g);
+      }
+    }
+    const directFormGroup = formLookup.byFormId.get(canonCharacterId);
+    if (directFormGroup !== undefined) {
+      excludedCanonFormGroups.add(directFormGroup);
+    }
+  }
 
   const candidates: Array<{
     id: string;
@@ -234,12 +264,24 @@ export function computeLocationCast(
   const charIds = Object.keys(state.entities.characters).filter(isSafeKey).sort(compareIdsDeterministic);
 
   for (const charId of charIds) {
-    if (excludedPlayerCharacterId !== null && charId === excludedPlayerCharacterId) {
+    if (
+      (playerCharacterId !== null && charId === playerCharacterId) ||
+      (canonCharacterId !== null && charId === canonCharacterId)
+    ) {
       continue;
     }
 
     const character = getOwn(state.entities.characters, charId);
     if (!character || NON_ACTIVE_CHARACTER_STATUSES.has(character.status)) {
+      continue;
+    }
+
+    const effectiveGroup = resolveEffectiveFormGroup(character, formLookup);
+    if (
+      canonCharacterId !== null &&
+      typeof effectiveGroup === 'string' &&
+      excludedCanonFormGroups.has(effectiveGroup)
+    ) {
       continue;
     }
 
@@ -256,7 +298,6 @@ export function computeLocationCast(
       continue;
     }
 
-    const effectiveGroup = resolveEffectiveFormGroup(character, formLookup);
     candidates.push({
       id: charId,
       formGroup: effectiveGroup,
