@@ -2,6 +2,7 @@ import type { ResolvedControlRoomConfig } from '../config/control-room-config.js
 import { formatClockDisplay } from '../core/world-clock.js';
 import type { GameSystemModule, SystemCapabilities } from '../schema/tracker-module.js';
 import type { FormDefinition } from '../state/forms.js';
+import { type LocationEntity, projectPlayerVisibleLocations } from '../state/spatial-topology.js';
 import type {
   CharacterEntity,
   CharacterProgression,
@@ -346,7 +347,11 @@ function resolveBlockSlotIndex(
   return fallbackIndex;
 }
 
-function buildLocationLabel(state: WorldState, capabilities: SystemCapabilities): string {
+function buildLocationLabel(
+  state: WorldState,
+  capabilities: SystemCapabilities,
+  visibleLocations: Readonly<Record<string, LocationEntity>>
+): string {
   if (capabilities.spatialMode === 'scene_only') {
     const loc = state.scene.location.trim();
     return loc.length > 0 ? loc : 'Unknown';
@@ -354,7 +359,7 @@ function buildLocationLabel(state: WorldState, capabilities: SystemCapabilities)
 
   const locId = state.scene.locationId;
   if (typeof locId === 'string' && isSafeRecordKey(locId)) {
-    const locEntity = getOwnSafe(state.entities.locations, locId);
+    const locEntity = getOwnSafe(visibleLocations, locId);
     if (locEntity !== undefined) {
       let label = `${locEntity.name} (${locEntity.status})`;
       if (
@@ -429,6 +434,7 @@ interface StateRenderContext {
   state: WorldState;
   config: ResolvedControlRoomConfig;
   effectiveCaps: SystemCapabilities;
+  visibleLocations: Readonly<Record<string, LocationEntity>>;
   activeModules: readonly GameSystemModule[];
   slots: BlockOrderSlots;
   clocksEnabled: boolean;
@@ -441,7 +447,7 @@ interface StateRenderContext {
 }
 
 function appendClockAndSceneItems(ctx: StateRenderContext): void {
-  const { state, config, effectiveCaps, activeModules, slots, clocksEnabled, pushItem } = ctx;
+  const { state, config, effectiveCaps, visibleLocations, activeModules, slots, clocksEnabled, pushItem } = ctx;
 
   if (clocksEnabled) {
     const clockLine = formatClockDisplay(state.clocks, config.tuningDials);
@@ -449,7 +455,7 @@ function appendClockAndSceneItems(ctx: StateRenderContext): void {
   }
 
   const hasSeparatePacingBlock = config.blockOrder.includes('PACING');
-  const locationLabel = buildLocationLabel(state, effectiveCaps);
+  const locationLabel = buildLocationLabel(state, effectiveCaps, visibleLocations);
   const sceneParts: string[] = [`Scene: ${locationLabel}`];
   if (state.scene.mood.trim().length > 0) {
     sceneParts.push(`Mood: ${state.scene.mood.trim()}`);
@@ -458,6 +464,41 @@ function appendClockAndSceneItems(ctx: StateRenderContext): void {
     sceneParts.push(`Pacing: ${state.scene.pacing.trim()}`);
   }
   pushItem(sceneParts.join(' | '), slots.scene, 100);
+
+  if (effectiveCaps.spatialMode !== 'scene_only' && typeof state.scene.locationId === 'string' && isSafeRecordKey(state.scene.locationId)) {
+    const visibleLoc = getOwnSafe(visibleLocations, state.scene.locationId);
+    if (visibleLoc !== undefined) {
+      const exits = visibleLoc.connectedLocations
+        .filter((id: string) => isSafeRecordKey(id) && id.trim().length > 0)
+        .slice()
+        .sort(compareStringsDeterministic);
+      if (exits.length > 0) {
+        const exitLabels = exits.map((targetId: string) => {
+          const targetLoc = getOwnSafe(visibleLocations, targetId);
+          return targetLoc !== undefined && targetLoc.name.trim().length > 0
+            ? `${targetLoc.name.trim()} (${targetId})`
+            : targetId;
+        });
+        pushItem(`  Exits: ${exitLabels.join(', ')}`, slots.scene, 82);
+      }
+
+      if (visibleLoc.hiddenAssets !== undefined) {
+        const assetKeys = Object.keys(visibleLoc.hiddenAssets)
+          .filter(isSafeRecordKey)
+          .sort(compareStringsDeterministic);
+        const assetLabels: string[] = [];
+        for (const assetKey of assetKeys) {
+          const asset = getOwnSafe(visibleLoc.hiddenAssets, assetKey);
+          if (asset !== undefined && asset.knowledgeTier !== 'unrevealed') {
+            assetLabels.push(`${asset.name} (${asset.knowledgeTier})`);
+          }
+        }
+        if (assetLabels.length > 0) {
+          pushItem(`  Known Assets: ${assetLabels.join(', ')}`, slots.scene, 78);
+        }
+      }
+    }
+  }
 
   if (hasSeparatePacingBlock && state.scene.pacing.trim().length > 0) {
     let pacingText = `Pacing: ${state.scene.pacing.trim()}`;
@@ -885,10 +926,13 @@ export function renderWorldStateBlockWithStats(
   const items: RenderedStateItem[] = [];
   let seq = 0;
 
+  const visibleLocations = projectPlayerVisibleLocations(state.entities.locations);
+
   const ctx: StateRenderContext = {
     state,
     config,
     effectiveCaps,
+    visibleLocations,
     activeModules: getActiveGameSystemModules(config, effectiveCaps),
     slots: buildBlockOrderSlots(config.blockOrder),
     clocksEnabled:
