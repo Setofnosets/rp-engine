@@ -823,6 +823,18 @@ function executeValidatedAction(
       ctx.executedActions.push(`skill:${skill.id}`);
       return 'continue';
     }
+
+    case 'item': {
+      actor.remainingActions.action = Math.max(0, actor.remainingActions.action - 1);
+      ctx.executedActions.push(`item:${action.itemId}`);
+      return 'continue';
+    }
+
+    case 'flee': {
+      actor.remainingActions.action = Math.max(0, actor.remainingActions.action - 1);
+      ctx.executedActions.push('flee');
+      return 'end_turn';
+    }
   }
 }
 
