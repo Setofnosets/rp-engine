@@ -16,7 +16,48 @@ export type AgentRole =
 /**
  * Supported backend provider kinds.
  */
-export type ProviderKind = 'openai_compatible' | 'ollama' | 'anthropic' | 'mock';
+export type ProviderKind =
+  | 'openai_compatible'
+  | 'openai'
+  | 'anthropic'
+  | 'gemini'
+  | 'ollama'
+  | 'mock';
+
+/**
+ * Reusable sampler configuration preset assignable to roles or connections.
+ */
+export interface SamplerPreset {
+  readonly id: string;
+  readonly name: string;
+  readonly temperature?: number;
+  readonly topP?: number;
+  readonly topK?: number;
+  readonly minP?: number;
+  readonly repetitionPenalty?: number;
+  readonly frequencyPenalty?: number;
+  readonly presencePenalty?: number;
+  readonly maxTokens?: number;
+  readonly stop?: readonly string[];
+  readonly seed?: number;
+}
+
+/**
+ * Reusable connection preset for cloud or local model endpoints.
+ */
+export interface ConnectionPreset {
+  readonly id: string;
+  readonly name: string;
+  readonly provider: ProviderKind;
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly apiKeyEnv?: string;
+  readonly apiKey?: string;
+  readonly samplerPresetId?: string;
+  readonly enablePromptCache?: boolean;
+  readonly timeoutMs?: number;
+  readonly supportsJsonSchema?: boolean;
+}
 
 /**
  * Connection and inference configuration bound to an {@link AgentRole}.
@@ -31,6 +72,9 @@ export interface RoleConnectionConfig {
   readonly maxTokens?: number;
   readonly timeoutMs?: number;
   readonly supportsJsonSchema?: boolean;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly samplerPresetId?: string;
+  readonly enablePromptCache?: boolean;
 }
 
 /**
@@ -51,6 +95,8 @@ export interface GatewayGenerateTextRequest {
   readonly signal?: AbortSignal;
   readonly temperature?: number;
   readonly maxTokens?: number;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly enablePromptCache?: boolean;
 }
 
 /**
@@ -65,6 +111,8 @@ export interface GatewayStructuredRequest {
   readonly maxRepairAttempts?: number;
   readonly temperature?: number;
   readonly maxTokens?: number;
+  readonly sampler?: Partial<SamplerPreset>;
+  readonly enablePromptCache?: boolean;
 }
 
 /**

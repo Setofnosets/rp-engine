@@ -75,8 +75,8 @@ describe('ModelGateway per-role routing and configuration', () => {
       connections: {
         narrator: {
           role: 'narrator',
-          provider: 'anthropic',
-          baseUrl: 'https://api.anthropic.com',
+          provider: 'mock',
+          baseUrl: 'mock://unregistered',
           model: 'claude-test',
         },
       },
