@@ -51,7 +51,14 @@ export type PatchOperation =
       entityId: string;
       patch: Record<string, unknown>;
     }
-  | { op: 'form_transform'; characterId: string; targetFormId: string }
+  | {
+      op: 'form_transform';
+      characterId: string;
+      targetFormId: string;
+      lockPermanent?: boolean;
+      cureTrigger?: string;
+      triggerTag?: string;
+    }
   | { op: 'emergent_location_visit'; locationName: string }
   | {
       op: 'chronicle_append';

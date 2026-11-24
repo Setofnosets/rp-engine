@@ -20,6 +20,7 @@ import {
   cloneCharacterCardSheet,
   validateCharacterCardSheet,
 } from './character-card-sheet.js';
+import { type FormIndex, applyFormProfileOverlay } from './forms.js';
 import {
   type AssetKnowledgeTier,
   type ConnectionMeta,
@@ -82,6 +83,7 @@ export interface CharacterEntity {
   progression?: CharacterProgression;
   resources?: Record<string, ResourcePool>;
   corruption?: CorruptionState;
+  lockedForms?: Record<string, boolean>;
   abilities: string[];
   goals: string[];
   agenda: string;
@@ -191,6 +193,7 @@ export interface WorldState {
     id: string;
     name: string;
     characterId: string | null;
+    canonCharacterId?: string | null;
     locationId: string | null;
     progression?: CharacterProgression;
     resources?: Record<string, ResourcePool>;
@@ -284,6 +287,12 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   }
   const proto = Object.getPrototypeOf(value) as object | null;
   return proto === Object.prototype || proto === null;
+}
+
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isUnsafeKey(key: string): boolean {
+  return key.length === 0 || FORBIDDEN_KEYS.has(key);
 }
 
 function setRecordEntry<T>(record: Record<string, T>, key: string, value: T): void {
@@ -425,6 +434,9 @@ function cloneCharacterEntity(character: CharacterEntity): CharacterEntity {
   if (character.portraitAsset !== undefined) {
     cloned.portraitAsset = character.portraitAsset;
   }
+  if (character.lockedForms !== undefined) {
+    cloned.lockedForms = clonePrimitiveRecord(character.lockedForms);
+  }
   return cloned;
 }
 
@@ -524,6 +536,9 @@ export function cloneWorldState(state: WorldState): WorldState {
     customFields: clonePlainRecord(state.player.customFields),
     sections: cloneSections(state.player.sections),
   };
+  if (state.player.canonCharacterId !== undefined) {
+    player.canonCharacterId = state.player.canonCharacterId;
+  }
   if (state.player.progression !== undefined) {
     player.progression = cloneProgression(state.player.progression);
   }
@@ -683,6 +698,9 @@ export function createWorldState(options: CreateWorldStateOptions = {}): WorldSt
       : {},
     sections: options.player?.sections ? cloneSections(options.player.sections) : {},
   };
+  if (options.player?.canonCharacterId !== undefined) {
+    player.canonCharacterId = options.player.canonCharacterId;
+  }
 
   if (options.player?.progression !== undefined) {
     player.progression = cloneProgression(options.player.progression);
@@ -1582,6 +1600,33 @@ export function validateWorldState(
             entity.portraitAsset = rawChar.portraitAsset;
           }
         }
+        if (rawChar.lockedForms !== undefined) {
+          if (!isPlainObject(rawChar.lockedForms)) {
+            errors.add(`${charPath}.lockedForms`, 'INVALID_TYPE', 'lockedForms must be an object');
+          } else {
+            const lockedForms: Record<string, boolean> = {};
+            for (const [formKey, lockedVal] of Object.entries(rawChar.lockedForms)) {
+              if (isUnsafeKey(formKey)) {
+                errors.add(
+                  `${charPath}.lockedForms.${formKey}`,
+                  'UNSAFE_PROPERTY_KEY',
+                  `Unsafe lockedForms key "${formKey}"`
+                );
+                continue;
+              }
+              if (typeof lockedVal !== 'boolean') {
+                errors.add(
+                  `${charPath}.lockedForms.${formKey}`,
+                  'INVALID_TYPE',
+                  'lockedForms values must be boolean'
+                );
+                continue;
+              }
+              setRecordEntry(lockedForms, formKey, lockedVal);
+            }
+            entity.lockedForms = lockedForms;
+          }
+        }
         setRecordEntry(characters, key, entity);
       }
     }
@@ -1817,6 +1862,22 @@ export function validateWorldState(
         'UNRESOLVED_CHARACTER',
         `player.characterId "${player.characterId}" does not resolve in entities.characters`
       );
+    }
+    if (rawPlayer.canonCharacterId !== undefined) {
+      const canonCharacterId = validateNullableString(
+        rawPlayer.canonCharacterId,
+        'player.canonCharacterId',
+        errors,
+        warnings
+      );
+      player.canonCharacterId = canonCharacterId;
+      if (canonCharacterId !== null && !Object.hasOwn(characters, canonCharacterId)) {
+        errors.add(
+          'player.canonCharacterId',
+          'UNRESOLVED_CHARACTER',
+          `player.canonCharacterId "${canonCharacterId}" does not resolve in entities.characters`
+        );
+      }
     }
     player.locationId = validateNullableString(
       rawPlayer.locationId,
@@ -2468,4 +2529,100 @@ function attachValidatedLocationV2Fields(
       locEntity.hiddenAssets = hidden;
     }
   }
+}
+
+/**
+ * Bind the player to a canon roster character, syncing identity, location, sections,
+ * resources, and progression from the character (and its active form if `formIndex` is supplied),
+ * and removing the bound character (and same-formGroup forms) from `scene.presentCharacterIds`.
+ */
+export function bindPlayerToCanonCharacter(
+  worldState: WorldState,
+  canonCharacterId: string,
+  formIndex?: FormIndex
+): WorldState {
+  if (typeof canonCharacterId !== 'string' || canonCharacterId.trim().length === 0 || isUnsafeKey(canonCharacterId)) {
+    throw new RefereeError(`Invalid canonCharacterId "${String(canonCharacterId)}"`, {
+      code: 'INVALID_CANON_CHARACTER_ID',
+      details: { canonCharacterId },
+    });
+  }
+
+  if (!Object.hasOwn(worldState.entities.characters, canonCharacterId)) {
+    throw new RefereeError(`Canon character "${canonCharacterId}" was not found in entities.characters`, {
+      code: 'CHARACTER_NOT_FOUND',
+      details: { canonCharacterId },
+    });
+  }
+
+  const nextState = cloneWorldState(worldState);
+  const rawChar = Object.getOwnPropertyDescriptor(nextState.entities.characters, canonCharacterId)
+    ?.value as CharacterEntity | undefined;
+  if (!rawChar) {
+    throw new RefereeError(`Canon character "${canonCharacterId}" was not found in entities.characters`, {
+      code: 'CHARACTER_NOT_FOUND',
+      details: { canonCharacterId },
+    });
+  }
+
+  let effectiveChar = rawChar;
+  if (formIndex && rawChar.formId !== null && formIndex.byId.has(rawChar.formId)) {
+    effectiveChar = applyFormProfileOverlay(rawChar, rawChar.formId, formIndex);
+    setRecordEntry(nextState.entities.characters, canonCharacterId, effectiveChar);
+  }
+
+  nextState.player.characterId = effectiveChar.id;
+  nextState.player.canonCharacterId = effectiveChar.id;
+  nextState.player.name = effectiveChar.name;
+  nextState.player.locationId = effectiveChar.locationId;
+  nextState.player.sections = cloneSections(effectiveChar.sections);
+
+  if (effectiveChar.resources !== undefined) {
+    nextState.player.resources = cloneResources(effectiveChar.resources);
+  } else {
+    delete nextState.player.resources;
+  }
+
+  if (effectiveChar.progression !== undefined) {
+    nextState.player.progression = cloneProgression(effectiveChar.progression);
+  } else {
+    delete nextState.player.progression;
+  }
+
+  if (effectiveChar.locationId !== null) {
+    nextState.scene.locationId = effectiveChar.locationId;
+    if (!isUnsafeKey(effectiveChar.locationId) && Object.hasOwn(nextState.entities.locations, effectiveChar.locationId)) {
+      const loc = Object.getOwnPropertyDescriptor(
+        nextState.entities.locations,
+        effectiveChar.locationId
+      )?.value as LocationEntity | undefined;
+      if (loc) {
+        nextState.scene.location = loc.name;
+      }
+    }
+  }
+
+  const excludedGroup =
+    effectiveChar.formGroup ??
+    (effectiveChar.formId !== null ? formIndex?.byId.get(effectiveChar.formId)?.formGroup ?? null : null);
+  nextState.scene.presentCharacterIds = nextState.scene.presentCharacterIds.filter((id) => {
+    if (id === effectiveChar.id) {
+      return false;
+    }
+    if (excludedGroup !== null && !isUnsafeKey(id) && Object.hasOwn(nextState.entities.characters, id)) {
+      const other = Object.getOwnPropertyDescriptor(nextState.entities.characters, id)
+        ?.value as CharacterEntity | undefined;
+      if (other) {
+        const otherGroup =
+          other.formGroup ??
+          (other.formId !== null ? formIndex?.byId.get(other.formId)?.formGroup ?? null : null);
+        if (otherGroup === excludedGroup) {
+          return false;
+        }
+      }
+    }
+    return true;
+  });
+
+  return nextState;
 }

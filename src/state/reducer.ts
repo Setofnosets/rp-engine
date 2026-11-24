@@ -7,7 +7,12 @@ import type {
 } from '../schema/dynamic-schema-compiler.js';
 import type { DynamicFieldSpec } from '../schema/tracker-module.js';
 import type { AuditEntry } from './audit-log.js';
-import { type FormIndex, applyFormProfileOverlay, isLegalTransform } from './forms.js';
+import {
+  type FormIndex,
+  type FormTransitionRule,
+  applyFormProfileOverlay,
+  isLegalTransform,
+} from './forms.js';
 import {
   type EntityCollectionName,
   PATCH_SOURCES,
@@ -54,6 +59,7 @@ import {
 export interface ReducerOptions {
   compiledSchema?: CompiledTrackerSchema;
   formIndex?: FormIndex;
+  formRules?: readonly FormTransitionRule[];
   auditSeqStart?: number;
 }
 
@@ -2371,6 +2377,68 @@ function applySingleOperation(
         return ok(undefined);
       }
 
+      const isCurrentLocked =
+        oldFormId !== null &&
+        char.lockedForms !== undefined &&
+        getOwn(char.lockedForms, oldFormId) === true;
+
+      if (isCurrentLocked && oldFormId !== null) {
+        const cureTrigger =
+          typeof op.cureTrigger === 'string' && op.cureTrigger.trim().length > 0
+            ? op.cureTrigger
+            : undefined;
+
+        let cureAllowed = cureTrigger !== undefined;
+        if (cureTrigger !== undefined && ctx.options.formRules) {
+          const matchingRules = ctx.options.formRules.filter(
+            (rule) =>
+              (char.formGroup === null || rule.formGroup === char.formGroup) &&
+              (rule.toFormId === oldFormId || rule.toFormId === op.targetFormId)
+          );
+          cureAllowed = matchingRules.some(
+            (rule) => rule.reversibleBy !== undefined && rule.reversibleBy.includes(cureTrigger)
+          );
+        }
+
+        if (!cureAllowed) {
+          return err([
+            validationError(
+              canonicalPath,
+              'FORM_LOCKED',
+              `Form "${oldFormId}" for "${op.characterId}" is permanently locked`
+            ),
+          ]);
+        }
+      }
+
+      const applyLockState = (targetChar: CharacterEntity): void => {
+        if (isCurrentLocked && oldFormId !== null && targetChar.lockedForms) {
+          const nextLocked: Record<string, boolean> = {};
+          for (const [k, v] of Object.entries(targetChar.lockedForms)) {
+            if (isSafeKey(k) && k !== oldFormId) {
+              setOwn(nextLocked, k, v);
+            }
+          }
+          if (Object.keys(nextLocked).length === 0) {
+            delete targetChar.lockedForms;
+          } else {
+            targetChar.lockedForms = nextLocked;
+          }
+        }
+        if (op.lockPermanent === true && isSafeKey(op.targetFormId)) {
+          const nextLocked: Record<string, boolean> = {};
+          if (targetChar.lockedForms) {
+            for (const [k, v] of Object.entries(targetChar.lockedForms)) {
+              if (isSafeKey(k)) {
+                setOwn(nextLocked, k, v);
+              }
+            }
+          }
+          setOwn(nextLocked, op.targetFormId, true);
+          targetChar.lockedForms = nextLocked;
+        }
+      };
+
       if (ctx.options.formIndex) {
         if (!isLegalTransform(char.formId, op.targetFormId, ctx.options.formIndex)) {
           return err([
@@ -2382,7 +2450,22 @@ function applySingleOperation(
           ]);
         }
         const transformed = applyFormProfileOverlay(char, op.targetFormId, ctx.options.formIndex);
+        applyLockState(transformed);
         setOwn(ctx.nextState.entities.characters, op.characterId, transformed);
+        if (ctx.nextState.player.characterId === op.characterId) {
+          ctx.nextState.player.name = transformed.name;
+          const nextPlayerSections: Record<string, string | string[]> = {};
+          for (const [secKey, secVal] of Object.entries(transformed.sections)) {
+            if (isSafeKey(secKey)) {
+              setOwn(
+                nextPlayerSections,
+                secKey,
+                typeof secVal === 'string' ? secVal : [...secVal]
+              );
+            }
+          }
+          ctx.nextState.player.sections = nextPlayerSections;
+        }
         recordChangedIfDifferent(
           ctx,
           `entities.characters.${op.characterId}.formId`,
@@ -2424,6 +2507,7 @@ function applySingleOperation(
         emitAudit(ctx, op.op, canonicalPath, oldFormId, transformed.formId, 'committed');
       } else {
         char.formId = op.targetFormId;
+        applyLockState(char);
         recordChangedIfDifferent(ctx, canonicalPath, oldFormId, op.targetFormId);
         emitAudit(ctx, op.op, canonicalPath, oldFormId, op.targetFormId, 'committed');
       }

@@ -2,6 +2,11 @@ import type { BeatPressure } from '../config/control-room-config.js';
 import { type ValidationError, validationError } from '../core/errors.js';
 import { type Result, err, ok } from '../core/result.js';
 import type { AuditEntry } from '../state/audit-log.js';
+import {
+  type FormIndex,
+  type FormTransitionRule,
+  evaluateFormTransitionRules,
+} from '../state/forms.js';
 import type { PatchOperation, PatchSource } from '../state/patch.js';
 import { type ReducerOptions, applyPatchBatch } from '../state/reducer.js';
 import type { WorldState } from '../state/world-state.js';
@@ -62,6 +67,10 @@ export interface EvaluateBeatGraphParams {
   readonly recentTranscriptLines?: readonly string[];
   readonly beatPressure?: BeatPressure;
   readonly reducerOptions?: ReducerOptions;
+  readonly formRules?: readonly FormTransitionRule[];
+  readonly formIndex?: FormIndex;
+  readonly formRuleDependencyIndex?: DependencyIndex;
+  readonly activeCureTriggers?: readonly string[];
 }
 
 export interface EvaluateBeatGraphResult {
@@ -441,6 +450,44 @@ export function evaluateBeatGraph(
   } = params;
 
   if (!state.capabilities.beats) {
+    if (params.formRules && params.formRules.length > 0 && params.formIndex) {
+      const reactiveRes = evaluateReactiveFormsForState({
+        state,
+        formIndex: params.formIndex,
+        formRules: params.formRules,
+        dependencyIndex: params.formRuleDependencyIndex,
+        changedPaths: inputChangedPaths,
+        activeCureTriggers: params.activeCureTriggers,
+        recentTranscriptLines,
+        reducerOptions,
+      });
+      if (reactiveRes.ok) {
+        return {
+          nextState: reactiveRes.value.nextState,
+          nextLedger: ledger,
+          transitions: [],
+          triggeredScripts: [],
+          injectedLorePaths: [],
+          liveNudges: [],
+          activeAmbient: [],
+          auditEntries: reactiveRes.value.auditEntries,
+          changedPaths: reactiveRes.value.changedPaths,
+          warnings: reactiveRes.value.warnings,
+        };
+      }
+      return {
+        nextState: state,
+        nextLedger: ledger,
+        transitions: [],
+        triggeredScripts: [],
+        injectedLorePaths: [],
+        liveNudges: [],
+        activeAmbient: [],
+        auditEntries: [],
+        changedPaths: new Set<string>(),
+        warnings: reactiveRes.error,
+      };
+    }
     return {
       nextState: state,
       nextLedger: ledger,
@@ -879,6 +926,48 @@ export function evaluateBeatGraph(
   }
   nextLedger.activeAmbientIds = nextActiveAmbientIds;
 
+  if (params.formRules && params.formRules.length > 0 && params.formIndex) {
+    const formOps = evaluateFormTransitionRules(currentState, params.formIndex, params.formRules, {
+      dependencyIndex: params.formRuleDependencyIndex,
+      changedPaths: changedPaths.size > 0 ? changedPaths : undefined,
+      activeCureTriggers: params.activeCureTriggers,
+      beatStatuses: statusMap,
+      recentTranscriptLines,
+      warnings,
+    });
+    if (formOps.length > 0) {
+      const formBatchRes = applyPatchBatch(
+        currentState,
+        {
+          eventId: `form-rules:${currentState.meta.turn}`,
+          source: 'engine',
+          operations: formOps,
+          reason: 'reactive form rule evaluation',
+        },
+        {
+          ...params.reducerOptions,
+          formIndex: params.formIndex,
+          formRules: params.formRules,
+          auditSeqStart: nextAuditSeq,
+        }
+      );
+      if (formBatchRes.ok) {
+        currentState = formBatchRes.value.nextState;
+        for (const entry of formBatchRes.value.auditEntries) {
+          auditEntries.push(entry);
+        }
+        nextAuditSeq += formBatchRes.value.auditEntries.length;
+        for (const path of formBatchRes.value.changedPaths) {
+          changedPaths.add(path);
+        }
+      } else {
+        for (const errItem of formBatchRes.error) {
+          warnings.push(errItem);
+        }
+      }
+    }
+  }
+
   return {
     nextState: currentState,
     nextLedger,
@@ -891,6 +980,80 @@ export function evaluateBeatGraph(
     changedPaths,
     warnings,
   };
+}
+
+export interface EvaluateReactiveFormsParams {
+  readonly state: WorldState;
+  readonly formIndex: FormIndex;
+  readonly formRules: readonly FormTransitionRule[];
+  readonly dependencyIndex?: DependencyIndex;
+  readonly changedPaths?: ReadonlySet<string>;
+  readonly activeCureTriggers?: readonly string[];
+  readonly beatStatuses?: ReadonlyMap<string, BeatStatus> | Readonly<Record<string, BeatStatus>>;
+  readonly recentTranscriptLines?: readonly string[];
+  readonly reducerOptions?: ReducerOptions;
+}
+
+export interface EvaluateReactiveFormsResult {
+  readonly nextState: WorldState;
+  readonly operations: PatchOperation[];
+  readonly auditEntries: AuditEntry[];
+  readonly changedPaths: Set<string>;
+  readonly warnings: ValidationError[];
+}
+
+/**
+ * Deterministically evaluate {@link FormTransitionRule}s against a {@link WorldState}
+ * and commit any resulting `form_transform` patches via {@link applyPatchBatch}.
+ */
+export function evaluateReactiveFormsForState(
+  params: EvaluateReactiveFormsParams
+): Result<EvaluateReactiveFormsResult, ValidationError[]> {
+  const warnings: ValidationError[] = [];
+  const operations = evaluateFormTransitionRules(params.state, params.formIndex, params.formRules, {
+    dependencyIndex: params.dependencyIndex,
+    changedPaths: params.changedPaths,
+    activeCureTriggers: params.activeCureTriggers,
+    beatStatuses: params.beatStatuses,
+    recentTranscriptLines: params.recentTranscriptLines,
+    warnings,
+  });
+
+  if (operations.length === 0) {
+    return ok({
+      nextState: params.state,
+      operations: [],
+      auditEntries: [],
+      changedPaths: new Set<string>(),
+      warnings,
+    });
+  }
+
+  const batchRes = applyPatchBatch(
+    params.state,
+    {
+      eventId: `form-rules:${params.state.meta.turn}`,
+      source: 'engine',
+      operations,
+      reason: 'reactive form rule evaluation',
+    },
+    {
+      ...params.reducerOptions,
+      formIndex: params.formIndex,
+      formRules: params.formRules,
+    }
+  );
+  if (!batchRes.ok) {
+    return err(batchRes.error);
+  }
+
+  return ok({
+    nextState: batchRes.value.nextState,
+    operations,
+    auditEntries: batchRes.value.auditEntries,
+    changedPaths: batchRes.value.changedPaths,
+    warnings,
+  });
 }
 
 /**
