@@ -40,6 +40,7 @@ import {
   validateGameSystemModule,
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
+import { validateCharacterCardSheet } from '../state/character-card-sheet.js';
 import { type FormDefinition } from '../state/forms.js';
 import { type LocationEntity } from '../state/spatial-topology.js';
 import {
@@ -105,6 +106,7 @@ export interface CartridgeBundle {
   loreFiles: Record<string, string>;
   endingPromptFiles: Record<string, string>;
   scriptFiles: Record<string, string>;
+  binaryAssets?: Record<string, Uint8Array>;
 }
 
 const FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
@@ -213,6 +215,59 @@ export function getSafeProperty<T>(
     return undefined;
   }
   return Object.getOwnPropertyDescriptor(record, key)?.value as T | undefined;
+}
+
+export function isSafeAssetPath(assetPath: string): boolean {
+  if (typeof assetPath !== 'string' || assetPath.length === 0) {
+    return false;
+  }
+  if (assetPath.includes('\\') || assetPath.startsWith('/') || /^[a-zA-Z]:/.test(assetPath)) {
+    return false;
+  }
+  if (!assetPath.startsWith('assets/')) {
+    return false;
+  }
+  const segments = assetPath.split('/');
+  if (segments.length < 2) {
+    return false;
+  }
+  for (const seg of segments) {
+    if (seg.length === 0 || seg === '.' || seg === '..' || isUnsafeRecordKey(seg)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateBinaryAssetsField(
+  rawAssets: unknown,
+  acc: ErrorAccumulator
+): void {
+  if (rawAssets === undefined) {
+    return;
+  }
+  if (!isPlainObject(rawAssets)) {
+    acc.add('', 'INVALID_TYPE', 'binaryAssets must be a plain object');
+    return;
+  }
+  for (const key of Object.getOwnPropertyNames(rawAssets)) {
+    if (isUnsafeRecordKey(key)) {
+      acc.add(key, 'UNSAFE_PROPERTY_KEY', `Forbidden key "${key}" in binaryAssets`);
+      continue;
+    }
+    if (!isSafeAssetPath(key)) {
+      acc.add(
+        key,
+        'UNSAFE_ASSET_PATH',
+        `Binary asset path "${key}" must be a safe relative path under "assets/"`
+      );
+      continue;
+    }
+    const val = Object.getOwnPropertyDescriptor(rawAssets, key)?.value;
+    if (!(val instanceof Uint8Array)) {
+      acc.add(key, 'INVALID_TYPE', `binaryAssets["${key}"] must be a Uint8Array`);
+    }
+  }
 }
 
 export function scanObjectForUnsafeKeys(
@@ -958,6 +1013,15 @@ function validateInitialEntitiesSection(
             validateStringArray(rawChar[arrField], entryAcc.scope(arrField), arrField);
           }
         }
+        if (rawChar['cardSheet'] !== undefined) {
+          const sheetRes = validateCharacterCardSheet(rawChar['cardSheet']);
+          if (!sheetRes.ok) {
+            entryAcc.scope('cardSheet').addAll(sheetRes.error);
+          }
+        }
+        if (rawChar['portraitAsset'] !== undefined && typeof rawChar['portraitAsset'] !== 'string') {
+          entryAcc.add('portraitAsset', 'INVALID_TYPE', 'portraitAsset must be a string');
+        }
         for (const strField of ['agenda', 'allegiance', 'mood'] as const) {
           if (rawChar[strField] !== undefined && typeof rawChar[strField] !== 'string') {
             entryAcc.add(strField, 'INVALID_TYPE', `${strField} must be a string`);
@@ -1682,6 +1746,7 @@ export function validateCartridgeStructure(
     'endingPromptFiles'
   );
   validateStringRecordField(bundle.scriptFiles, acc.scope('scriptFiles'), 'scriptFiles');
+  validateBinaryAssetsField(bundle.binaryAssets, acc.scope('binaryAssets'));
 
   return acc.toResult(bundle);
 }

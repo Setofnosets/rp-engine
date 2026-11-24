@@ -207,6 +207,62 @@ async function collectFilesWithExtension(
   return result;
 }
 
+async function collectBinaryAssets(
+  rootDir: string,
+  acc: ErrorAccumulator
+): Promise<Record<string, Uint8Array>> {
+  const result: Record<string, Uint8Array> = {};
+  const startDir = path.join(rootDir, 'assets');
+
+  const walk = async (currentAbsDir: string, currentRelDir: string): Promise<void> => {
+    let entries;
+    try {
+      entries = await readdir(currentAbsDir, { withFileTypes: true });
+    } catch (error) {
+      if (isEnoentError(error)) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : 'Unable to read directory';
+      acc.add('binaryAssets', 'DIRECTORY_READ_ERROR', `Failed to read "${currentAbsDir}": ${message}`);
+      return;
+    }
+
+    const sortedEntries = [...entries].sort((a, b) =>
+      compareStringsDeterministic(a.name, b.name)
+    );
+
+    for (const entry of sortedEntries) {
+      if (isUnsafeRecordKey(entry.name)) {
+        acc.add(
+          `binaryAssets.${entry.name}`,
+          'UNSAFE_PROPERTY_KEY',
+          `Forbidden filename "${entry.name}"`
+        );
+        continue;
+      }
+      const absPath = path.join(currentAbsDir, entry.name);
+      const relPath = `${currentRelDir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await walk(absPath, relPath);
+      } else if (entry.isFile()) {
+        if (currentRelDir === 'assets/endings' && entry.name.endsWith('.md')) {
+          continue;
+        }
+        try {
+          const bytes = await readFile(absPath);
+          setSafeProperty(result, relPath, new Uint8Array(bytes));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Unable to read file';
+          acc.add(relPath, 'FILE_READ_ERROR', `Failed to read "${absPath}": ${message}`);
+        }
+      }
+    }
+  };
+
+  await walk(startDir, 'assets');
+  return result;
+}
+
 async function tryLoadExplicitRelativeMarkdown(
   rootDir: string,
   refPath: string,
@@ -313,11 +369,12 @@ export async function loadCartridgeFromDirectory(
     readOptionalJsonFile(path.join(dirPath, 'endings.json'), 'endings', acc),
   ]);
 
-  // 3. Asset directories (lore/*.md, scripts/*.js, assets/endings/*.md)
-  const [loreFiles, scriptFiles, endingPromptFiles] = await Promise.all([
+  // 3. Asset directories (lore/*.md, scripts/*.js, assets/endings/*.md, assets/** binary files)
+  const [loreFiles, scriptFiles, endingPromptFiles, binaryAssets] = await Promise.all([
     collectFilesWithExtension(dirPath, 'lore', '.md', acc, 'loreFiles'),
     collectFilesWithExtension(dirPath, 'scripts', '.js', acc, 'scriptFiles'),
     collectFilesWithExtension(dirPath, 'assets/endings', '.md', acc, 'endingPromptFiles'),
+    collectBinaryAssets(dirPath, acc),
   ]);
 
   if (acc.hasErrors()) {
@@ -399,6 +456,7 @@ export async function loadCartridgeFromDirectory(
     loreFiles,
     endingPromptFiles,
     scriptFiles,
+    ...(Object.keys(binaryAssets).length > 0 ? { binaryAssets } : {}),
   };
 
   const structRes = validateCartridgeStructure(bundle);
