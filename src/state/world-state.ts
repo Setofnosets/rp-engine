@@ -15,7 +15,19 @@ import {
   cloneSystemCapabilities,
   validateSystemCapabilities,
 } from '../schema/tracker-module.js';
-import type { LocationEntity } from './spatial-topology.js';
+import {
+  type AssetKnowledgeTier,
+  type ConnectionMeta,
+  type ConnectionStateKind,
+  type DiscoveryState,
+  type HiddenAssetCanonStatus,
+  type HiddenAssetKind,
+  type HiddenSiteAsset,
+  type LocationEntity,
+  type LocationGeometry,
+  type LocationMapAssets,
+  cloneLocationEntity,
+} from './spatial-topology.js';
 
 export const WORLD_STATE_SCHEMA_VERSION = 2 as const;
 
@@ -424,20 +436,6 @@ function cloneThreatEntity(threat: ThreatEntity): ThreatEntity {
     locationId: threat.locationId,
     sourceFactionId: threat.sourceFactionId,
     agenda: threat.agenda,
-  };
-}
-
-function cloneLocationEntity(location: LocationEntity): LocationEntity {
-  return {
-    id: location.id,
-    name: location.name,
-    kind: location.kind,
-    status: location.status,
-    controllingFactionId: location.controllingFactionId,
-    connectedLocations: [...location.connectedLocations],
-    discovered: location.discovered,
-    tags: [...location.tags],
-    notes: location.notes,
   };
 }
 
@@ -1360,7 +1358,7 @@ export function validateWorldState(
         const tags = validateStringArrayField(rawLoc.tags, `${locPath}.tags`, errors, warnings);
         const notes = validateStringWithDefault(rawLoc.notes, '', `${locPath}.notes`, errors, warnings);
 
-        setRecordEntry(locations, key, {
+        const locEntity: LocationEntity = {
           id,
           name,
           kind,
@@ -1370,7 +1368,9 @@ export function validateWorldState(
           discovered,
           tags,
           notes,
-        });
+        };
+        attachValidatedLocationV2Fields(rawLoc, locEntity, locPath, errors);
+        setRecordEntry(locations, key, locEntity);
       }
     }
 
@@ -2183,4 +2183,211 @@ export function validateWorldState(
     state: normalizedState,
     warnings: [...warnings.errors],
   });
+}
+
+const DISCOVERY_STATES: ReadonlySet<string> = new Set<DiscoveryState>([
+  'unknown',
+  'rumored',
+  'discovered',
+  'visited',
+]);
+
+const CONNECTION_STATE_KINDS: ReadonlySet<string> = new Set<ConnectionStateKind>([
+  'open',
+  'closed',
+  'locked',
+  'blocked',
+  'destroyed',
+  'secret',
+]);
+
+const HIDDEN_ASSET_KINDS: ReadonlySet<string> = new Set<HiddenAssetKind>([
+  'trap',
+  'hazard',
+  'loot',
+  'barrier',
+  'subdungeon',
+  'subinterior',
+  'clue',
+]);
+
+const ASSET_KNOWLEDGE_TIERS: ReadonlySet<string> = new Set<AssetKnowledgeTier>([
+  'unrevealed',
+  'suspected',
+  'known',
+]);
+
+const HIDDEN_ASSET_CANON_STATUSES: ReadonlySet<string> = new Set<HiddenAssetCanonStatus>([
+  'intact',
+  'triggered',
+  'disarmed',
+  'taken',
+  'destroyed',
+  'cleared',
+]);
+
+const FORBIDDEN_LOCATION_KEYS: ReadonlySet<string> = new Set([
+  '__proto__',
+  'constructor',
+  'prototype',
+]);
+
+function isSafeLocationRecordKey(key: string): boolean {
+  return key.length > 0 && !FORBIDDEN_LOCATION_KEYS.has(key);
+}
+
+function attachValidatedLocationV2Fields(
+  rawLoc: Record<string, unknown>,
+  locEntity: LocationEntity,
+  locPath: string,
+  errors: { add: (path: string, code: string, message: string) => void }
+): void {
+  if (rawLoc.discoveryState !== undefined) {
+    if (typeof rawLoc.discoveryState !== 'string' || !DISCOVERY_STATES.has(rawLoc.discoveryState)) {
+      errors.add(
+        `${locPath}.discoveryState`,
+        'INVALID_ENUM',
+        'discoveryState must be unknown, rumored, discovered, or visited'
+      );
+    } else {
+      locEntity.discoveryState = rawLoc.discoveryState as DiscoveryState;
+    }
+  }
+
+  if (rawLoc.geometry !== undefined) {
+    if (!isPlainObject(rawLoc.geometry)) {
+      errors.add(`${locPath}.geometry`, 'INVALID_TYPE', 'geometry must be an object');
+    } else {
+      const g = rawLoc.geometry;
+      if (typeof g.x !== 'number' || !Number.isFinite(g.x) || typeof g.y !== 'number' || !Number.isFinite(g.y)) {
+        errors.add(`${locPath}.geometry`, 'INVALID_TYPE', 'geometry.x and geometry.y must be finite numbers');
+      } else {
+        const geom: LocationGeometry = {
+          x: g.x === 0 ? 0 : g.x,
+          y: g.y === 0 ? 0 : g.y,
+        };
+        if (typeof g.districtId === 'string') geom.districtId = g.districtId;
+        if (typeof g.regionId === 'string') geom.regionId = g.regionId;
+        if (Array.isArray(g.polygon)) {
+          const poly: [number, number][] = [];
+          let validPoly = true;
+          for (const pt of g.polygon) {
+            if (
+              Array.isArray(pt) &&
+              pt.length === 2 &&
+              typeof pt[0] === 'number' &&
+              Number.isFinite(pt[0]) &&
+              typeof pt[1] === 'number' &&
+              Number.isFinite(pt[1])
+            ) {
+              poly.push([pt[0] === 0 ? 0 : pt[0], pt[1] === 0 ? 0 : pt[1]]);
+            } else {
+              validPoly = false;
+              break;
+            }
+          }
+          if (!validPoly) {
+            errors.add(`${locPath}.geometry.polygon`, 'INVALID_TYPE', 'polygon must be an array of [number, number] pairs');
+          } else {
+            geom.polygon = poly;
+          }
+        }
+        if (isPlainObject(g.mapRef) && typeof g.mapRef.layer === 'string' && typeof g.mapRef.id === 'string') {
+          geom.mapRef = { layer: g.mapRef.layer, id: g.mapRef.id };
+        }
+        locEntity.geometry = geom;
+      }
+    }
+  }
+
+  if (rawLoc.mapAssets !== undefined) {
+    if (!isPlainObject(rawLoc.mapAssets)) {
+      errors.add(`${locPath}.mapAssets`, 'INVALID_TYPE', 'mapAssets must be an object');
+    } else {
+      const ma = rawLoc.mapAssets;
+      const assets: LocationMapAssets = {};
+      if (typeof ma.imagePath === 'string') assets.imagePath = ma.imagePath;
+      if (typeof ma.geoJsonPath === 'string') assets.geoJsonPath = ma.geoJsonPath;
+      if (typeof ma.svgPath === 'string') assets.svgPath = ma.svgPath;
+      if (typeof ma.width === 'number' && Number.isFinite(ma.width)) {
+        assets.width = ma.width === 0 ? 0 : ma.width;
+      }
+      if (typeof ma.height === 'number' && Number.isFinite(ma.height)) {
+        assets.height = ma.height === 0 ? 0 : ma.height;
+      }
+      locEntity.mapAssets = assets;
+    }
+  }
+
+  if (rawLoc.connectionsMeta !== undefined) {
+    if (!isPlainObject(rawLoc.connectionsMeta)) {
+      errors.add(`${locPath}.connectionsMeta`, 'INVALID_TYPE', 'connectionsMeta must be an object');
+    } else {
+      const meta: Record<string, ConnectionMeta> = {};
+      for (const [targetId, rawConn] of Object.entries(rawLoc.connectionsMeta)) {
+        if (!isSafeLocationRecordKey(targetId)) {
+          errors.add(`${locPath}.connectionsMeta`, 'FORBIDDEN_KEY', `Forbidden key "${targetId}"`);
+          continue;
+        }
+        if (!isPlainObject(rawConn) || typeof rawConn.state !== 'string' || !CONNECTION_STATE_KINDS.has(rawConn.state)) {
+          errors.add(`${locPath}.connectionsMeta.${targetId}`, 'INVALID_TYPE', 'Invalid connection metadata');
+          continue;
+        }
+        const entry: ConnectionMeta = { state: rawConn.state as ConnectionStateKind };
+        if (Array.isArray(rawConn.travelModes)) {
+          entry.travelModes = rawConn.travelModes.filter((m): m is string => typeof m === 'string');
+        }
+        if (typeof rawConn.keyItemId === 'string') {
+          entry.keyItemId = rawConn.keyItemId;
+        }
+        setRecordEntry(meta, targetId, entry);
+      }
+      locEntity.connectionsMeta = meta;
+    }
+  }
+
+  if (rawLoc.hiddenAssets !== undefined) {
+    if (!isPlainObject(rawLoc.hiddenAssets)) {
+      errors.add(`${locPath}.hiddenAssets`, 'INVALID_TYPE', 'hiddenAssets must be an object');
+    } else {
+      const hidden: Record<string, HiddenSiteAsset> = {};
+      for (const [assetId, rawAsset] of Object.entries(rawLoc.hiddenAssets)) {
+        if (!isSafeLocationRecordKey(assetId)) {
+          errors.add(`${locPath}.hiddenAssets`, 'FORBIDDEN_KEY', `Forbidden key "${assetId}"`);
+          continue;
+        }
+        if (
+          !isPlainObject(rawAsset) ||
+          typeof rawAsset.id !== 'string' ||
+          typeof rawAsset.kind !== 'string' ||
+          !HIDDEN_ASSET_KINDS.has(rawAsset.kind) ||
+          typeof rawAsset.name !== 'string' ||
+          typeof rawAsset.knowledgeTier !== 'string' ||
+          !ASSET_KNOWLEDGE_TIERS.has(rawAsset.knowledgeTier) ||
+          typeof rawAsset.canonStatus !== 'string' ||
+          !HIDDEN_ASSET_CANON_STATUSES.has(rawAsset.canonStatus) ||
+          typeof rawAsset.canonLocked !== 'boolean'
+        ) {
+          errors.add(`${locPath}.hiddenAssets.${assetId}`, 'INVALID_TYPE', 'Invalid HiddenSiteAsset');
+          continue;
+        }
+        const entry: HiddenSiteAsset = {
+          id: rawAsset.id,
+          kind: rawAsset.kind as HiddenAssetKind,
+          name: rawAsset.name,
+          knowledgeTier: rawAsset.knowledgeTier as AssetKnowledgeTier,
+          canonStatus: rawAsset.canonStatus as HiddenAssetCanonStatus,
+          canonLocked: rawAsset.canonLocked,
+        };
+        if (typeof rawAsset.description === 'string') {
+          entry.description = rawAsset.description;
+        }
+        if (typeof rawAsset.linkedLocationId === 'string') {
+          entry.linkedLocationId = rawAsset.linkedLocationId;
+        }
+        setRecordEntry(hidden, assetId, entry);
+      }
+      locEntity.hiddenAssets = hidden;
+    }
+  }
 }

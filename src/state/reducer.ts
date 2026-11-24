@@ -885,6 +885,84 @@ function validateEntityFieldValue(
           return isStringArray(value)
             ? ok([...value])
             : err([validationError(path, 'INVALID_TYPE', `${path} must be string[]`)]);
+        case 'discoveryState': {
+          if (
+            value !== 'unknown' &&
+            value !== 'rumored' &&
+            value !== 'discovered' &&
+            value !== 'visited'
+          ) {
+            return err([
+              validationError(
+                path,
+                'INVALID_ENUM',
+                `${path} must be unknown, rumored, discovered, or visited`
+              ),
+            ]);
+          }
+          return ok(value);
+        }
+        case 'geometry': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          if (
+            typeof value.x !== 'number' ||
+            !Number.isFinite(value.x) ||
+            typeof value.y !== 'number' ||
+            !Number.isFinite(value.y)
+          ) {
+            return err([
+              validationError(path, 'INVALID_TYPE', `${path}.x and ${path}.y must be finite numbers`),
+            ]);
+          }
+          return ok(value);
+        }
+        case 'mapAssets': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          return ok(value);
+        }
+        case 'connectionsMeta': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          for (const key of Object.keys(value)) {
+            if (!isSafeKey(key)) {
+              return err([validationError(path, 'FORBIDDEN_KEY', `Forbidden key "${key}"`)]);
+            }
+          }
+          return ok(value);
+        }
+        case 'hiddenAssets': {
+          if (!isPlainObject(value)) {
+            return err([validationError(path, 'INVALID_TYPE', `${path} must be an object`)]);
+          }
+          const existingLoc = entity as LocationEntity;
+          const existingAssets = existingLoc.hiddenAssets ?? {};
+          for (const [assetId, rawAsset] of Object.entries(value)) {
+            if (!isSafeKey(assetId)) {
+              return err([validationError(path, 'FORBIDDEN_KEY', `Forbidden key "${assetId}"`)]);
+            }
+            if (!isPlainObject(rawAsset)) {
+              return err([
+                validationError(`${path}.${assetId}`, 'INVALID_TYPE', 'HiddenSiteAsset must be an object'),
+              ]);
+            }
+            const prevAsset = Object.hasOwn(existingAssets, assetId) ? existingAssets[assetId] : undefined;
+            if (prevAsset?.canonLocked && rawAsset.canonStatus === 'intact') {
+              return err([
+                validationError(
+                  `${path}.${assetId}.canonStatus`,
+                  'CANON_LOCKED',
+                  `HiddenSiteAsset "${assetId}" is canonLocked and cannot revert to "intact"`
+                ),
+              ]);
+            }
+          }
+          return ok(value);
+        }
         default:
           return err([
             validationError(path, 'INVALID_PATH', `Unknown LocationEntity field "${field}"`),
@@ -1496,6 +1574,24 @@ function resolveWorldStateTarget(
         validateValue: (v) => validateEntityFieldValue(collection, entity, field, v, path, state),
         write: (v) => {
           setOwn(entity, field, v);
+          if (collection === 'locations') {
+            const loc = entity as LocationEntity;
+            if (field === 'discovered') {
+              if (v === true) {
+                if (
+                  loc.discoveryState === undefined ||
+                  loc.discoveryState === 'unknown' ||
+                  loc.discoveryState === 'rumored'
+                ) {
+                  loc.discoveryState = 'discovered';
+                }
+              } else {
+                loc.discoveryState = 'unknown';
+              }
+            } else if (field === 'discoveryState') {
+              loc.discovered = v === 'discovered' || v === 'visited';
+            }
+          }
           return ok(undefined);
         },
       });
@@ -2428,6 +2524,7 @@ function applySingleOperation(
       const targetLoc = getOwn(ctx.nextState.entities.locations, targetId) as LocationEntity;
       const wasDiscovered = targetLoc.discovered;
       targetLoc.discovered = true;
+      targetLoc.discoveryState = 'visited';
       ctx.nextState.scene.locationId = targetId;
       ctx.nextState.scene.location = travelRes.value.targetName;
       ctx.nextState.player.locationId = targetId;

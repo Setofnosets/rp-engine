@@ -46,7 +46,11 @@ export type PredicateAst =
   | { custom_field: string; target?: 'global' | 'player' | string; op: ComparisonOp; value: unknown }
   | { clock: 'day' | 'story_turn' | 'turn' | string; op: ComparisonOp; value: number }
   | { slot: string }
-  | { at: string }
+  | {
+      at: string;
+      discoveryState?: 'unknown' | 'rumored' | 'discovered' | 'visited';
+      districtId?: string;
+    }
   | { relation: readonly [string, string]; field: RelationField; op: ComparisonOp; value: unknown }
   | { entity: readonly [EntityCollection, string, string]; op: ComparisonOp; value: unknown }
   | { any_entity: EntityCollection; where: Record<string, unknown> }
@@ -327,8 +331,24 @@ function validatePredicateInto(value: unknown, acc: ErrorAccumulator): void {
     }
 
     case 'at': {
-      checkAllowedKeys(value, ['at'], acc);
+      checkAllowedKeys(value, ['at', 'discoveryState', 'districtId'], acc);
       validateSafeString(value.at, 'at', 'INVALID_LOCATION_NAME', acc);
+      if (
+        value.discoveryState !== undefined &&
+        value.discoveryState !== 'unknown' &&
+        value.discoveryState !== 'rumored' &&
+        value.discoveryState !== 'discovered' &&
+        value.discoveryState !== 'visited'
+      ) {
+        acc.add(
+          'discoveryState',
+          'INVALID_DISCOVERY_STATE',
+          'discoveryState must be unknown, rumored, discovered, or visited'
+        );
+      }
+      if (value.districtId !== undefined) {
+        validateSafeString(value.districtId, 'districtId', 'INVALID_DISTRICT_ID', acc);
+      }
       break;
     }
 
