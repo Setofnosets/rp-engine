@@ -1,7 +1,7 @@
 import { type ValidationError } from '../core/errors.js';
 import { ErrorAccumulator, type Result, err, ok } from '../core/result.js';
 import type { GridCoord, TacticalGrid } from './grid-types.js';
-import type { PassiveDefinition } from './passives-and-willpower.js';
+import type { PassiveDefinition, WillpowerBreakOutcome } from './passives-and-willpower.js';
 import type { SkillDefinition, SkillRegistry } from './skill-registry.js';
 import { chebyshevDistance, evaluateLineOfSight, findShortestPath, getTileAt } from './spatial-math.js';
 import type { ActiveStatusEffect } from './status-effects.js';
@@ -32,11 +32,24 @@ export interface CombatantState {
   passives: PassiveDefinition[];
   willpower: number;
   maxWillpower: number;
+  formationRow?: 'front' | 'back';
+  willpowerOutcome?: WillpowerBreakOutcome;
+  isSummon?: boolean;
+  summonerId?: string;
+  summonRemainingTurns?: number;
+  activeTransform?: {
+    loadoutId: string;
+    remainingTurns: number | null;
+    tempHp: number;
+    revertOnZeroTempHp: boolean;
+    preTransformSnapshot: Record<string, unknown>;
+  };
 }
 
 export interface CombatState {
   active: boolean;
   mode: 'tactical_grid' | 'traditional';
+  turnStyle?: 'initiative' | 'phased';
   round: number;
   turnIndex: number;
   initiativeOrder: string[];
@@ -49,7 +62,9 @@ export interface CombatState {
 export type ProposedCombatAction =
   | { type: 'move'; path?: readonly GridCoord[]; to?: GridCoord }
   | { type: 'skill'; skillId: string; targetId?: string; targetCoord?: GridCoord }
+  | { type: 'item'; itemId: string; targetId?: string; targetCoord?: GridCoord }
   | { type: 'defend' }
+  | { type: 'flee' }
   | { type: 'end_turn' };
 
 export interface ValidatedCombatActionPayload {
@@ -710,6 +725,105 @@ function validateSkillAction(
       }
       break;
     }
+
+    case 'single_tile': {
+      if (combat.mode === 'tactical_grid') {
+        if (combat.grid === null) {
+          acc.add('combat.grid', 'MISSING_GRID', 'Tactical grid mode requires a valid grid');
+          break;
+        }
+        if (action.targetCoord === undefined || !isValidGridCoord(action.targetCoord)) {
+          acc.add('action.targetCoord', 'MISSING_TARGET_COORD', 'single_tile requires a valid targetCoord');
+          break;
+        }
+        if (getTileAt(combat.grid, action.targetCoord) === undefined) {
+          acc.add('action.targetCoord', 'OUT_OF_BOUNDS', 'Target coordinate is outside the grid');
+          break;
+        }
+        const dist = chebyshevDistance(actor.coord, action.targetCoord);
+        if (dist < targeting.minRange || dist > targeting.maxRange) {
+          acc.add(
+            'action',
+            'OUT_OF_RANGE',
+            `Tile distance ${dist} outside skill range [${targeting.minRange}, ${targeting.maxRange}]`
+          );
+        }
+        if (targeting.requiresLos) {
+          const los = evaluateLineOfSight(combat.grid, actor.coord, action.targetCoord);
+          if (!los.visible) {
+            acc.add('action', 'NO_LINE_OF_SIGHT', 'No line of sight to target tile');
+          }
+        }
+      }
+      break;
+    }
+
+    case 'all_enemies':
+    case 'all_allies': {
+      const limit = targeting.maxTargets ?? Number.POSITIVE_INFINITY;
+      for (const id of getSafeCombatantIds(combat)) {
+        if (resolvedTargetIds.length >= limit) {
+          break;
+        }
+        const candidate = getSafeCombatant(combat, id);
+        if (candidate === undefined || !candidate.alive || candidate.hp <= 0) {
+          continue;
+        }
+        if (targeting.shape === 'all_enemies' && areTeamsHostile(actor.team, candidate.team)) {
+          resolvedTargetIds.push(id);
+        } else if (targeting.shape === 'all_allies' && candidate.team === actor.team) {
+          resolvedTargetIds.push(id);
+        }
+      }
+      break;
+    }
+
+    case 'splash': {
+      if (action.targetId !== undefined) {
+        if (typeof action.targetId !== 'string' || !isSafeKey(action.targetId)) {
+          acc.add('action.targetId', 'INVALID_TARGET_ID', 'Invalid targetId');
+          break;
+        }
+        const target = getSafeCombatant(combat, action.targetId);
+        if (target === undefined) {
+          acc.add('action.targetId', 'TARGET_NOT_FOUND', `Target "${action.targetId}" not found`);
+          break;
+        }
+        if (!target.alive || target.hp <= 0) {
+          acc.add('action.targetId', 'TARGET_DEAD', `Target "${action.targetId}" is dead and cannot be targeted`);
+          break;
+        }
+        resolvedTargetIds.push(target.id);
+      }
+      const splashRadius = targeting.radius ?? 1;
+      const limit = targeting.maxTargets ?? Number.POSITIVE_INFINITY;
+      const anchor =
+        resolvedTargetIds.length > 0
+          ? getSafeCombatant(combat, resolvedTargetIds[0] as string)?.coord ?? actor.coord
+          : action.targetCoord ?? actor.coord;
+      for (const id of getSafeCombatantIds(combat)) {
+        if (resolvedTargetIds.length >= limit) {
+          break;
+        }
+        if (resolvedTargetIds.includes(id)) {
+          continue;
+        }
+        const candidate = getSafeCombatant(combat, id);
+        if (candidate === undefined || !candidate.alive || candidate.hp <= 0) {
+          continue;
+        }
+        if (!areTeamsHostile(actor.team, candidate.team)) {
+          continue;
+        }
+        if (
+          combat.mode === 'traditional' ||
+          chebyshevDistance(anchor, candidate.coord) <= splashRadius
+        ) {
+          resolvedTargetIds.push(id);
+        }
+      }
+      break;
+    }
   }
 
   if (acc.hasErrors()) {
@@ -799,6 +913,43 @@ export function validateSingleCombatAction(
         ...(defendSkill !== undefined ? { skill: defendSkill } : {}),
         resolvedTargetIds: [actorId],
       });
+    }
+
+    case 'item': {
+      const rawItemId = Object.getOwnPropertyDescriptor(action, 'itemId')?.value;
+      if (typeof rawItemId !== 'string' || rawItemId.trim().length === 0 || !isSafeKey(rawItemId.trim())) {
+        acc.add('action.itemId', 'INVALID_ITEM_ID', 'Item action requires a valid non-empty itemId');
+        return err([...acc.errors]);
+      }
+      const itemTargetIds: string[] = [];
+      const rawTargetId = Object.getOwnPropertyDescriptor(action, 'targetId')?.value;
+      if (rawTargetId !== undefined) {
+        if (typeof rawTargetId !== 'string' || !isSafeKey(rawTargetId)) {
+          acc.add('action.targetId', 'INVALID_TARGET_ID', 'Invalid targetId');
+          return err([...acc.errors]);
+        }
+        const target = getSafeCombatant(combat, rawTargetId);
+        if (target === undefined) {
+          acc.add('action.targetId', 'TARGET_NOT_FOUND', `Target "${rawTargetId}" not found`);
+          return err([...acc.errors]);
+        }
+        if (!target.alive || target.hp <= 0) {
+          acc.add('action.targetId', 'TARGET_DEAD', `Target "${rawTargetId}" is dead`);
+          return err([...acc.errors]);
+        }
+        itemTargetIds.push(target.id);
+      } else {
+        itemTargetIds.push(actorId);
+      }
+      return ok({ resolvedTargetIds: itemTargetIds });
+    }
+
+    case 'flee': {
+      if (actor.remainingActions.action <= 0) {
+        acc.add('action', 'INSUFFICIENT_ACTION', 'Actor has no remaining action points to flee');
+        return err([...acc.errors]);
+      }
+      return ok({});
     }
 
     case 'end_turn': {
