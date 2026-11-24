@@ -5,6 +5,7 @@ import type { PassiveDefinition, WillpowerBreakOutcome } from './passives-and-wi
 import type { SkillDefinition, SkillRegistry } from './skill-registry.js';
 import { chebyshevDistance, evaluateLineOfSight, findShortestPath, getTileAt } from './spatial-math.js';
 import type { ActiveStatusEffect } from './status-effects.js';
+import { resolveTraditionalTargetIds } from './traditional-theater.js';
 
 export type CombatTeam = 'ally' | 'enemy' | 'neutral';
 
@@ -546,6 +547,31 @@ function validateSkillAction(
   const resolvedTargetIds: string[] = [];
   const targeting = skill.targeting;
 
+  if (combat.mode === 'traditional') {
+    if (targeting.shape !== 'single_tile') {
+      const tradRes = resolveTraditionalTargetIds({
+        combatState: combat,
+        actorId,
+        skill,
+        ...(action.targetId !== undefined ? { primaryTargetId: action.targetId } : {}),
+      });
+      if (!tradRes.ok) {
+        acc.add('action.targetId', tradRes.code, tradRes.reason);
+      } else {
+        resolvedTargetIds.push(...tradRes.targetIds);
+      }
+    }
+
+    if (acc.hasErrors()) {
+      return {};
+    }
+
+    return {
+      skill,
+      resolvedTargetIds,
+    };
+  }
+
   switch (targeting.shape) {
     case 'self': {
       if (action.targetId !== undefined && action.targetId !== actorId) {
@@ -628,24 +654,6 @@ function validateSkillAction(
           );
           break;
         }
-      }
-
-      if (combat.mode === 'traditional') {
-        const restorative = isRestorativeOnlySkill(skill);
-        for (const id of getSafeCombatantIds(combat)) {
-          const candidate = getSafeCombatant(combat, id);
-          if (candidate === undefined || !candidate.alive || candidate.hp <= 0) {
-            continue;
-          }
-          if (restorative) {
-            if (candidate.team === actor.team) {
-              resolvedTargetIds.push(id);
-            }
-          } else if (areTeamsHostile(actor.team, candidate.team)) {
-            resolvedTargetIds.push(id);
-          }
-        }
-        break;
       }
 
       if (combat.grid === null) {
@@ -736,7 +744,7 @@ function validateSkillAction(
           acc.add('action.targetCoord', 'MISSING_TARGET_COORD', 'single_tile requires a valid targetCoord');
           break;
         }
-        if (getTileAt(combat.grid, action.targetCoord) === undefined) {
+        if (getTileAt(combat.grid, action.targetCoord) === null) {
           acc.add('action.targetCoord', 'OUT_OF_BOUNDS', 'Target coordinate is outside the grid');
           break;
         }
@@ -815,10 +823,7 @@ function validateSkillAction(
         if (!areTeamsHostile(actor.team, candidate.team)) {
           continue;
         }
-        if (
-          combat.mode === 'traditional' ||
-          chebyshevDistance(anchor, candidate.coord) <= splashRadius
-        ) {
+        if (chebyshevDistance(anchor, candidate.coord) <= splashRadius) {
           resolvedTargetIds.push(id);
         }
       }
@@ -916,11 +921,16 @@ export function validateSingleCombatAction(
     }
 
     case 'item': {
+      if (actor.remainingActions.action <= 0) {
+        acc.add('action', 'INSUFFICIENT_ACTION', 'Actor has no remaining action points to use item');
+        return err([...acc.errors]);
+      }
       const rawItemId = Object.getOwnPropertyDescriptor(action, 'itemId')?.value;
       if (typeof rawItemId !== 'string' || rawItemId.trim().length === 0 || !isSafeKey(rawItemId.trim())) {
         acc.add('action.itemId', 'INVALID_ITEM_ID', 'Item action requires a valid non-empty itemId');
         return err([...acc.errors]);
       }
+      const trimmedItemId = rawItemId.trim();
       const itemTargetIds: string[] = [];
       const rawTargetId = Object.getOwnPropertyDescriptor(action, 'targetId')?.value;
       if (rawTargetId !== undefined) {
@@ -941,7 +951,11 @@ export function validateSingleCombatAction(
       } else {
         itemTargetIds.push(actorId);
       }
-      return ok({ resolvedTargetIds: itemTargetIds });
+      const itemSkill = resolveSkillDefinition(trimmedItemId, registry);
+      return ok({
+        ...(itemSkill !== undefined ? { skill: itemSkill } : {}),
+        resolvedTargetIds: itemTargetIds,
+      });
     }
 
     case 'flee': {
